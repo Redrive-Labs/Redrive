@@ -22,18 +22,39 @@ export async function GET(): Promise<Response> {
 
 export async function POST(request: Request): Promise<Response> {
   let input: unknown;
+  let isNativeFormSubmission = false;
 
   try {
-    input = await request.json();
+    const contentType = request.headers.get("content-type") ?? "";
+    const isFormEncoded =
+      contentType.startsWith("application/x-www-form-urlencoded") ||
+      contentType.startsWith("multipart/form-data");
+
+    if (isFormEncoded) {
+      const formData = await request.formData();
+      isNativeFormSubmission = true;
+      input = {
+        provider: formData.get("provider"),
+        externalDeliveryId: formData.get("externalDeliveryId"),
+        repositoryId: formData.get("repositoryId"),
+      };
+    } else {
+      input = await request.json();
+    }
   } catch {
     return NextResponse.json(
-      { error: "Request body must be valid JSON." },
+      { error: "Request body must be valid JSON or form data." },
       { status: 400 },
     );
   }
 
   try {
     const incident = await createIncident(input);
+
+    if (isNativeFormSubmission) {
+      return NextResponse.redirect(new URL("/", request.url), 303);
+    }
+
     return NextResponse.json({ incident }, { status: 201 });
   } catch (error) {
     if (error instanceof IncidentValidationError) {

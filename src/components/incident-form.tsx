@@ -51,7 +51,9 @@ export function IncidentForm() {
 
   return (
     <form
+      action="/api/incidents"
       className="grid gap-4"
+      method="post"
       onSubmit={handleSubmit}
       aria-describedby={error ? "incident-form-error" : undefined}
     >
