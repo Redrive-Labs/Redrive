@@ -56,8 +56,8 @@ export default async function Home() {
             SQLite metadata
           </p>
           <p className="mt-1 text-sm leading-6 text-[var(--muted)]">
-            {incidents.length} {incidents.length === 1 ? "incident" : "incidents"}{" "}
-            persisted locally
+            {incidents.length} recent{" "}
+            {incidents.length === 1 ? "incident" : "incidents"} shown
           </p>
         </aside>
       </section>

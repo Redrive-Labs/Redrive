@@ -116,6 +116,9 @@ directory and schema are created automatically on first use.
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
 `REDRIVE_DATABASE_PATH`.
 
+For remote or Tailscale development, optionally set the comma-separated
+`NEXT_ALLOWED_DEV_ORIGINS` hostnames in `.env.local`.
+
 ```bash
 npm run lint
 npm run typecheck
