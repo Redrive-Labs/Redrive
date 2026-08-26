@@ -10,6 +10,8 @@ import {
 } from "@/server/database";
 import { getServerConfig } from "@/server/config";
 
+export const INCIDENT_LIST_LIMIT = 50;
+
 const incidentColumns = `
   id,
   provider,
@@ -77,6 +79,7 @@ export function createIncidentService(database: SqliteDatabase) {
     SELECT ${incidentColumns}
     FROM incidents
     ORDER BY created_at DESC, id DESC
+    LIMIT ${INCIDENT_LIST_LIMIT}
   `;
 
   function getById(id: string): Incident | null {

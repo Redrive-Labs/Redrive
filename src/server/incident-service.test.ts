@@ -10,7 +10,10 @@ import {
   openDatabase,
   type SqliteDatabase,
 } from "@/server/database";
-import { createIncidentService } from "@/server/incident-service";
+import {
+  createIncidentService,
+  INCIDENT_LIST_LIMIT,
+} from "@/server/incident-service";
 
 describe("incident persistence", () => {
   let testDirectory: string;
@@ -116,6 +119,57 @@ describe("incident persistence", () => {
         repositoryId: "sample/consumer",
       }),
     ).toThrow(IncidentValidationError);
+  });
+
+  it("bounds incident lists while retaining newest-first ordering", () => {
+    const totalIncidents = INCIDENT_LIST_LIMIT + 5;
+
+    for (let index = 0; index < totalIncidents; index += 1) {
+      const createdAt = new Date(
+        Date.UTC(2025, 0, 1, 0, 0, index),
+      ).toISOString();
+
+      database.run(
+        `
+          INSERT INTO incidents (
+            id,
+            provider,
+            external_delivery_id,
+            repository_id,
+            status,
+            created_at,
+            updated_at
+          ) VALUES (
+            @id,
+            @provider,
+            @externalDeliveryId,
+            @repositoryId,
+            @status,
+            @createdAt,
+            @updatedAt
+          )
+        `,
+        {
+          id: `incident-${index.toString().padStart(3, "0")}`,
+          provider: "test",
+          externalDeliveryId: `delivery-${index}`,
+          repositoryId: "test/receiver",
+          status: "OPEN",
+          createdAt,
+          updatedAt: createdAt,
+        },
+      );
+    }
+
+    const incidents = service.list();
+
+    expect(incidents).toHaveLength(INCIDENT_LIST_LIMIT);
+    expect(incidents.map((incident) => incident.externalDeliveryId)).toEqual(
+      Array.from(
+        { length: INCIDENT_LIST_LIMIT },
+        (_, index) => `delivery-${totalIncidents - index - 1}`,
+      ),
+    );
   });
 
   it("keeps the incident after a new database connection and service are created", async () => {

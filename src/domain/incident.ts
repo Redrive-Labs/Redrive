@@ -18,6 +18,12 @@ export interface CreateIncidentInput {
   repositoryId: string;
 }
 
+export const INCIDENT_INPUT_LIMITS = {
+  provider: 128,
+  externalDeliveryId: 512,
+  repositoryId: 255,
+} as const;
+
 export type IncidentValidationIssues = Record<string, string>;
 
 export class IncidentValidationError extends Error {
@@ -34,12 +40,17 @@ function readRequiredString(
   input: Record<string, unknown>,
   field: keyof CreateIncidentInput,
   issues: IncidentValidationIssues,
+  maxLength: number,
 ): string {
   const value = input[field];
 
   if (typeof value !== "string" || value.trim().length === 0) {
     issues[field] = "Must be a non-empty string.";
     return "";
+  }
+
+  if (value.length > maxLength) {
+    issues[field] = `Must be at most ${maxLength} characters.`;
   }
 
   return value;
@@ -56,13 +67,24 @@ export function parseCreateIncidentInput(
 
   const record = input as Record<string, unknown>;
   const issues: IncidentValidationIssues = {};
-  const provider = readRequiredString(record, "provider", issues);
+  const provider = readRequiredString(
+    record,
+    "provider",
+    issues,
+    INCIDENT_INPUT_LIMITS.provider,
+  );
   const externalDeliveryId = readRequiredString(
     record,
     "externalDeliveryId",
     issues,
+    INCIDENT_INPUT_LIMITS.externalDeliveryId,
   );
-  const repositoryId = readRequiredString(record, "repositoryId", issues);
+  const repositoryId = readRequiredString(
+    record,
+    "repositoryId",
+    issues,
+    INCIDENT_INPUT_LIMITS.repositoryId,
+  );
 
   if (Object.keys(issues).length > 0) {
     throw new IncidentValidationError(issues);

@@ -1,7 +1,19 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import {
+  ModuleKind,
+  ScriptTarget,
+  transpileModule,
+} from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   closeConfiguredDatabase,
@@ -67,6 +79,13 @@ interface ConcurrentWriterResult {
   code?: string;
 }
 
+interface DatabaseOpenerResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  stdout: string;
+}
+
 function runConcurrentWriter(
   databasePath: string,
   index: number,
@@ -94,6 +113,78 @@ function runConcurrentWriter(
       if (code !== 0) {
         reject(new Error(`Concurrent writer exited with code ${code}.`));
       }
+    });
+  });
+}
+
+function compileDatabaseModule(
+  databaseModulePath: string,
+  outputDirectory: string,
+): string {
+  const source = readFileSync(databaseModulePath, "utf8");
+  const compiled = transpileModule(source, {
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ModuleKind.CommonJS,
+      target: ScriptTarget.ES2022,
+    },
+  });
+  const compiledModulePath = path.join(
+    outputDirectory,
+    ".database-race.cjs",
+  );
+
+  writeFileSync(compiledModulePath, compiled.outputText);
+  return compiledModulePath;
+}
+
+function runIndependentDatabaseOpener(
+  compiledModulePath: string,
+  databasePath: string,
+): Promise<DatabaseOpenerResult> {
+  const source = `
+    const { openDatabase } = require(process.argv[1]);
+    const database = openDatabase(process.argv[2]);
+
+    try {
+      process.stdout.write(JSON.stringify({
+        migrationVersions: database
+          .all("SELECT version FROM schema_migrations ORDER BY version")
+          .map((row) => row.version),
+        incidentCount: database
+          .get("SELECT COUNT(*) AS count FROM incidents")
+          .count,
+      }));
+    } finally {
+      database.close();
+    }
+  `;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "-e",
+      source,
+      compiledModulePath,
+      databasePath,
+    ], {
+      env: {
+        ...process.env,
+        NODE_PATH: path.join(process.cwd(), "node_modules"),
+        NODE_NO_WARNINGS: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      resolve({ code, signal, stderr, stdout });
     });
   });
 }
@@ -197,6 +288,65 @@ describe("native SQLite persistence", () => {
         "SELECT COUNT(*) AS count FROM incidents",
       )?.count,
     ).toBe(0);
+  });
+
+  it("serializes migration initialization across independent processes", async () => {
+    const freshDatabasePath = path.join(
+      testDirectory,
+      "fresh-shared.sqlite",
+    );
+    expect(existsSync(freshDatabasePath)).toBe(false);
+
+    const compiledModulePath = compileDatabaseModule(
+      path.join(process.cwd(), "src", "server", "database.ts"),
+      testDirectory,
+    );
+    const openerCount = 8;
+
+    const results = await Promise.all(
+      Array.from({ length: openerCount }, () =>
+        runIndependentDatabaseOpener(
+          compiledModulePath,
+          freshDatabasePath,
+        ),
+      ),
+    );
+
+    expect(
+      results.map((result) => ({
+        code: result.code,
+        signal: result.signal,
+      })),
+    ).toEqual(
+      Array.from({ length: openerCount }, () => ({
+        code: 0,
+        signal: null,
+      })),
+    );
+    expect(
+      results.map((result) => JSON.parse(result.stdout)),
+    ).toEqual(
+      Array.from({ length: openerCount }, () => ({
+        migrationVersions: [1],
+        incidentCount: 0,
+      })),
+    );
+
+    const verificationDatabase = openDatabase(freshDatabasePath);
+    try {
+      expect(
+        verificationDatabase.all<{ version: number }>(
+          "SELECT version FROM schema_migrations ORDER BY version",
+        ),
+      ).toEqual([{ version: 1 }]);
+      expect(
+        verificationDatabase.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      verificationDatabase.close();
+    }
   });
 
   it("preserves all writes from concurrent native SQLite writers", async () => {

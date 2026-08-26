@@ -6,6 +6,7 @@ type SqliteValue = bigint | Buffer | null | number | string;
 type SqliteParameters =
   | readonly SqliteValue[]
   | Record<string, SqliteValue>;
+type SqliteTransactionMode = "deferred" | "immediate";
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
@@ -93,9 +94,16 @@ export class SqliteDatabase {
     return statement.run(parameters);
   }
 
-  transaction<T>(operation: () => T): T {
+  transaction<T>(
+    operation: () => T,
+    mode: SqliteTransactionMode = "deferred",
+  ): T {
     this.assertOpen();
-    return this.connection.transaction(operation)();
+    const transaction = this.connection.transaction(operation);
+
+    return mode === "immediate"
+      ? transaction.immediate()
+      : transaction();
   }
 
   pragma(
@@ -123,31 +131,34 @@ export class SqliteDatabase {
 }
 
 export function initializeDatabase(database: SqliteDatabase): void {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY NOT NULL,
-      applied_at TEXT NOT NULL
-    );
-  `);
+  // BEGIN IMMEDIATE obtains SQLite's write reservation before any migration
+  // state is read. Every opener therefore re-checks state after waiting for
+  // the previous opener to commit.
+  database.transaction(() => {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
 
-  for (const migration of migrations) {
-    const applied = database.get<{ version: number }>(
-      "SELECT version FROM schema_migrations WHERE version = ?",
-      [migration.version],
-    );
+    for (const migration of migrations) {
+      const applied = database.get<{ version: number }>(
+        "SELECT version FROM schema_migrations WHERE version = ?",
+        [migration.version],
+      );
 
-    if (applied !== undefined) {
-      continue;
-    }
+      if (applied !== undefined) {
+        continue;
+      }
 
-    database.transaction(() => {
       database.exec(migration.sql);
       database.run(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
         [migration.version, new Date().toISOString()],
       );
-    });
-  }
+    }
+  }, "immediate");
 }
 
 export function openDatabase(databasePath: string): SqliteDatabase {

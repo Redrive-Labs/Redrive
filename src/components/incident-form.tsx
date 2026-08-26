@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { INCIDENT_INPUT_LIMITS } from "@/domain/incident";
 
 interface ErrorResponse {
   error?: string;
@@ -67,6 +68,7 @@ export function IncidentForm() {
         <input
           className="min-h-11 border border-[var(--line)] bg-[var(--paper-bright)] px-3.5 text-sm text-[var(--ink)] transition-colors placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
           id="provider"
+          maxLength={INCIDENT_INPUT_LIMITS.provider}
           name="provider"
           placeholder="development"
           required
@@ -83,6 +85,7 @@ export function IncidentForm() {
         <input
           className="mono-type min-h-11 border border-[var(--line)] bg-[var(--paper-bright)] px-3.5 text-sm text-[var(--ink)] transition-colors placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
           id="externalDeliveryId"
+          maxLength={INCIDENT_INPUT_LIMITS.externalDeliveryId}
           name="externalDeliveryId"
           placeholder="delivery-001"
           required
@@ -99,6 +102,7 @@ export function IncidentForm() {
         <input
           className="min-h-11 border border-[var(--line)] bg-[var(--paper-bright)] px-3.5 text-sm text-[var(--ink)] transition-colors placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
           id="repositoryId"
+          maxLength={INCIDENT_INPUT_LIMITS.repositoryId}
           name="repositoryId"
           placeholder="owner/receiver"
           required

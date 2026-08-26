@@ -6,7 +6,10 @@ import {
   closeConfiguredDatabase,
   openDatabase,
 } from "@/server/database";
-import { POST } from "./route";
+import {
+  MAX_INCIDENT_REQUEST_BODY_BYTES,
+  POST,
+} from "./route";
 
 describe("incident route", () => {
   let testDirectory: string;
@@ -143,5 +146,69 @@ describe("incident route", () => {
         status: "OPEN",
       },
     });
+  });
+
+  it("rejects an oversized JSON body without creating a row", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          provider: "github",
+          externalDeliveryId: "x".repeat(
+            MAX_INCIDENT_REQUEST_BODY_BYTES,
+          ),
+          repositoryId: "example/receiver",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(413);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects an oversized native form body without creating a row", async () => {
+    const form = new URLSearchParams({
+      provider: "github",
+      externalDeliveryId: "x".repeat(
+        MAX_INCIDENT_REQUEST_BODY_BYTES,
+      ),
+      repositoryId: "example/receiver",
+    });
+
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: form,
+      }),
+    );
+
+    expect(response.status).toBe(413);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
   });
 });
