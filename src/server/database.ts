@@ -1,22 +1,13 @@
-import initSqlJs, {
-  type Database as SqlJsDatabase,
-  type Statement,
-} from "sql.js";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import BetterSqlite3 from "better-sqlite3";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 
-type SqliteValue = number | string | Uint8Array | null;
+type SqliteValue = bigint | Buffer | null | number | string;
 type SqliteParameters =
-  | SqliteValue[]
-  | Record<string, SqliteValue>
-  | null;
+  | readonly SqliteValue[]
+  | Record<string, SqliteValue>;
 
-let sqlJsPromise: ReturnType<typeof initSqlJs> | undefined;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 interface Migration {
   version: number;
@@ -43,33 +34,76 @@ const migrations: Migration[] = [
   },
 ];
 
-async function loadSqlJs() {
-  sqlJsPromise ??= initSqlJs({
-    locateFile: (file) =>
-      path.join(process.cwd(), "node_modules", "sql.js", "dist", file),
-  });
-
-  return sqlJsPromise;
-}
-
 export class SqliteDatabase {
   private isClosed = false;
 
   constructor(
-    private readonly connection: SqlJsDatabase,
-    private readonly databasePath: string,
+    private readonly connection: BetterSqlite3.Database,
+    readonly databasePath: string,
   ) {}
 
-  exec(sql: string, parameters?: SqliteParameters) {
-    return this.connection.exec(sql, parameters);
+  get isOpen(): boolean {
+    return !this.isClosed && this.connection.open;
   }
 
-  prepare(sql: string): Statement {
-    return this.connection.prepare(sql);
+  exec(sql: string): void {
+    this.assertOpen();
+    this.connection.exec(sql);
   }
 
-  run(sql: string, parameters?: SqliteParameters): void {
-    this.connection.run(sql, parameters);
+  get<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    parameters?: SqliteParameters | null,
+  ): Row | undefined {
+    this.assertOpen();
+    const statement = this.connection.prepare(sql);
+
+    if (parameters === undefined || parameters === null) {
+      return statement.get() as Row | undefined;
+    }
+
+    return statement.get(parameters) as Row | undefined;
+  }
+
+  all<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    parameters?: SqliteParameters | null,
+  ): Row[] {
+    this.assertOpen();
+    const statement = this.connection.prepare(sql);
+
+    if (parameters === undefined || parameters === null) {
+      return statement.all() as Row[];
+    }
+
+    return statement.all(parameters) as Row[];
+  }
+
+  run(
+    sql: string,
+    parameters?: SqliteParameters | null,
+  ): BetterSqlite3.RunResult {
+    this.assertOpen();
+    const statement = this.connection.prepare(sql);
+
+    if (parameters === undefined || parameters === null) {
+      return statement.run();
+    }
+
+    return statement.run(parameters);
+  }
+
+  transaction<T>(operation: () => T): T {
+    this.assertOpen();
+    return this.connection.transaction(operation)();
+  }
+
+  pragma(
+    statement: string,
+    options?: BetterSqlite3.PragmaOptions,
+  ): unknown {
+    this.assertOpen();
+    return this.connection.pragma(statement, options);
   }
 
   close(): void {
@@ -77,20 +111,14 @@ export class SqliteDatabase {
       return;
     }
 
-    try {
-      this.persist();
-    } finally {
-      this.connection.close();
-      this.isClosed = true;
-    }
+    this.connection.close();
+    this.isClosed = true;
   }
 
-  persist(): void {
-    if (this.databasePath === ":memory:") {
-      return;
+  private assertOpen(): void {
+    if (!this.isOpen) {
+      throw new Error("The SQLite database is closed.");
     }
-
-    writeFileSync(this.databasePath, this.connection.export());
   }
 }
 
@@ -103,59 +131,125 @@ export function initializeDatabase(database: SqliteDatabase): void {
   `);
 
   for (const migration of migrations) {
-    const applied = database.exec(
-      "SELECT 1 FROM schema_migrations WHERE version = ?",
+    const applied = database.get<{ version: number }>(
+      "SELECT version FROM schema_migrations WHERE version = ?",
       [migration.version],
     );
 
-    if (applied.length > 0) {
+    if (applied !== undefined) {
       continue;
     }
 
-    database.exec("BEGIN");
-
-    try {
+    database.transaction(() => {
       database.exec(migration.sql);
       database.run(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
         [migration.version, new Date().toISOString()],
       );
-      database.exec("COMMIT");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 }
 
-export async function openDatabase(
-  databasePath: string,
-): Promise<SqliteDatabase> {
+export function openDatabase(databasePath: string): SqliteDatabase {
   if (databasePath.trim().length === 0) {
     throw new Error("A SQLite database path is required.");
   }
 
-  if (databasePath !== ":memory:") {
-    mkdirSync(path.dirname(path.resolve(databasePath)), { recursive: true });
+  const resolvedDatabasePath =
+    databasePath === ":memory:"
+      ? databasePath
+      : path.resolve(databasePath);
+
+  if (resolvedDatabasePath !== ":memory:") {
+    mkdirSync(path.dirname(resolvedDatabasePath), { recursive: true });
   }
 
-  const SqlJs = await loadSqlJs();
-  const databaseData =
-    databasePath !== ":memory:" && existsSync(databasePath)
-      ? new Uint8Array(readFileSync(databasePath))
-      : undefined;
-  const database = new SqliteDatabase(
-    new SqlJs.Database(databaseData),
-    databasePath,
-  );
+  const connection = new BetterSqlite3(resolvedDatabasePath, {
+    timeout: SQLITE_BUSY_TIMEOUT_MS,
+  });
+  const database = new SqliteDatabase(connection, resolvedDatabasePath);
 
   try {
-    database.exec("PRAGMA foreign_keys = ON");
+    // WAL lets readers continue while another process/thread holds the write
+    // lock; timeout lets SQLite wait for that short-lived writer lock.
+    database.pragma("journal_mode = WAL");
+    // This is connection-local and keeps future relational migrations safe.
+    database.pragma("foreign_keys = ON");
     initializeDatabase(database);
-    database.persist();
     return database;
   } catch (error) {
     database.close();
     throw error;
   }
+}
+
+interface ConfiguredDatabaseState {
+  databasePath: string;
+  database: SqliteDatabase;
+}
+
+interface RedriveGlobalState {
+  __redriveConfiguredDatabase?: ConfiguredDatabaseState;
+}
+
+const redriveGlobalState = globalThis as typeof globalThis &
+  RedriveGlobalState;
+
+function normalizeDatabasePath(databasePath: string): string {
+  if (databasePath.trim().length === 0) {
+    throw new Error("A SQLite database path is required.");
+  }
+
+  return databasePath === ":memory:"
+    ? databasePath
+    : path.resolve(databasePath);
+}
+
+/**
+ * The application uses one native handle for its configured path. Keeping the
+ * state on globalThis prevents Next.js development re-evaluation from opening
+ * another handle for the same process and path.
+ */
+export function getConfiguredDatabase(
+  databasePath: string,
+): SqliteDatabase {
+  const normalizedDatabasePath = normalizeDatabasePath(databasePath);
+  const current = redriveGlobalState.__redriveConfiguredDatabase;
+
+  if (
+    current?.database.isOpen &&
+    current.databasePath === normalizedDatabasePath
+  ) {
+    return current.database;
+  }
+
+  if (current !== undefined) {
+    current.database.close();
+  }
+
+  const database = openDatabase(normalizedDatabasePath);
+  redriveGlobalState.__redriveConfiguredDatabase = {
+    databasePath: normalizedDatabasePath,
+    database,
+  };
+
+  return database;
+}
+
+export function closeConfiguredDatabase(databasePath?: string): void {
+  const current = redriveGlobalState.__redriveConfiguredDatabase;
+
+  if (current === undefined) {
+    return;
+  }
+
+  if (
+    databasePath !== undefined &&
+    normalizeDatabasePath(databasePath) !== current.databasePath
+  ) {
+    return;
+  }
+
+  current.database.close();
+  redriveGlobalState.__redriveConfiguredDatabase = undefined;
 }

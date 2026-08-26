@@ -86,6 +86,20 @@ describe("incident persistence", () => {
     );
   });
 
+  it("round-trips the required giant external delivery identifier exactly", () => {
+    const externalDeliveryId = "900719925474099312345678901234567890";
+
+    const created = service.create({
+      provider: "github",
+      externalDeliveryId,
+      repositoryId: "Redrive-Labs/redrive-demo-receiver",
+    });
+
+    expect(service.getById(created.id)?.externalDeliveryId).toBe(
+      externalDeliveryId,
+    );
+  });
+
   it("rejects clearly invalid creation input", () => {
     expect(() =>
       service.create({

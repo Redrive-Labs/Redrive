@@ -2,7 +2,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { openDatabase } from "@/server/database";
+import {
+  closeConfiguredDatabase,
+  openDatabase,
+} from "@/server/database";
 import { POST } from "./route";
 
 describe("incident route", () => {
@@ -19,6 +22,8 @@ describe("incident route", () => {
   });
 
   afterEach(() => {
+    closeConfiguredDatabase(databasePath);
+
     if (originalDatabasePath === undefined) {
       delete process.env.REDRIVE_DATABASE_PATH;
     } else {
@@ -61,17 +66,22 @@ describe("incident route", () => {
 
     const database = await openDatabase(databasePath);
     try {
-      const result = database.exec(
+      const rows = database.all<{
+        provider: string;
+        external_delivery_id: string;
+        repository_id: string;
+        status: string;
+      }>(
         "SELECT provider, external_delivery_id, repository_id, status FROM incidents",
       );
 
-      expect(result[0]?.values).toEqual([
-        [
-          "github",
-          externalDeliveryId,
-          "Redrive-Labs/redrive-demo-receiver",
-          "OPEN",
-        ],
+      expect(rows).toEqual([
+        {
+          provider: "github",
+          external_delivery_id: externalDeliveryId,
+          repository_id: "Redrive-Labs/redrive-demo-receiver",
+          status: "OPEN",
+        },
       ]);
     } finally {
       database.close();
@@ -99,13 +109,39 @@ describe("incident route", () => {
 
     const database = await openDatabase(databasePath);
     try {
-      const result = database.exec(
+      const row = database.get<{ count: number }>(
         "SELECT COUNT(*) AS count FROM incidents",
       );
 
-      expect(result[0]?.values).toEqual([[0]]);
+      expect(row?.count).toBe(0);
     } finally {
       database.close();
     }
+  });
+
+  it("accepts JSON POST requests and returns the created incident", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          provider: "github",
+          externalDeliveryId: "json-delivery-001",
+          repositoryId: "example/receiver",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      incident: {
+        provider: "github",
+        externalDeliveryId: "json-delivery-001",
+        repositoryId: "example/receiver",
+        status: "OPEN",
+      },
+    });
   });
 });

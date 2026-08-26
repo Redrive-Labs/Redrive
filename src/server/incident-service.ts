@@ -4,7 +4,10 @@ import {
   type Incident,
   parseCreateIncidentInput,
 } from "@/domain/incident";
-import { openDatabase, type SqliteDatabase } from "@/server/database";
+import {
+  getConfiguredDatabase,
+  type SqliteDatabase,
+} from "@/server/database";
 import { getServerConfig } from "@/server/config";
 
 const incidentColumns = `
@@ -77,17 +80,8 @@ export function createIncidentService(database: SqliteDatabase) {
   `;
 
   function getById(id: string): Incident | null {
-    const statement = database.prepare(getIncident);
-
-    try {
-      if (!statement.bind([id]) || !statement.step()) {
-        return null;
-      }
-
-      return mapIncidentRow(statement.getAsObject());
-    } finally {
-      statement.free();
-    }
+    const row = database.get<Record<string, unknown>>(getIncident, [id]);
+    return row === undefined ? null : mapIncidentRow(row);
   }
 
   return {
@@ -98,8 +92,15 @@ export function createIncidentService(database: SqliteDatabase) {
 
       database.run(
         insertIncident,
-        [id, values.provider, values.externalDeliveryId, values.repositoryId,
-          INCIDENT_STATUS, now, now],
+        {
+          id,
+          provider: values.provider,
+          externalDeliveryId: values.externalDeliveryId,
+          repositoryId: values.repositoryId,
+          status: INCIDENT_STATUS,
+          createdAt: now,
+          updatedAt: now,
+        },
       );
 
       const incident = getById(id);
@@ -112,18 +113,9 @@ export function createIncidentService(database: SqliteDatabase) {
     },
     getById,
     list(): Incident[] {
-      const statement = database.prepare(listIncidentRows);
-      const incidents: Incident[] = [];
-
-      try {
-        while (statement.step()) {
-          incidents.push(mapIncidentRow(statement.getAsObject()));
-        }
-
-        return incidents;
-      } finally {
-        statement.free();
-      }
+      return database
+        .all<Record<string, unknown>>(listIncidentRows)
+        .map(mapIncidentRow);
     },
   };
 }
@@ -133,13 +125,8 @@ type IncidentService = ReturnType<typeof createIncidentService>;
 async function withConfiguredService<T>(
   operation: (service: IncidentService) => T,
 ): Promise<T> {
-  const database = await openDatabase(getServerConfig().databasePath);
-
-  try {
-    return operation(createIncidentService(database));
-  } finally {
-    database.close();
-  }
+  const database = getConfiguredDatabase(getServerConfig().databasePath);
+  return operation(createIncidentService(database));
 }
 
 export async function createIncident(input: unknown): Promise<Incident> {
