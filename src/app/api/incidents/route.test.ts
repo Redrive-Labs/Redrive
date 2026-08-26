@@ -10,11 +10,16 @@ import {
   MAX_INCIDENT_REQUEST_BODY_BYTES,
   POST,
 } from "./route";
+import { GET as GETProviderEvidence } from "./[incidentId]/provider-evidence/route";
 
 describe("incident route", () => {
   let testDirectory: string;
   let databasePath: string;
   const originalDatabasePath = process.env.REDRIVE_DATABASE_PATH;
+  const originalMcpUrl = process.env.REDRIVE_GITHUB_MCP_URL;
+  const originalMcpToken = process.env.REDRIVE_GITHUB_MCP_TOKEN;
+  const originalHookId = process.env.REDRIVE_GITHUB_HOOK_ID;
+  const originalHookIds = process.env.REDRIVE_GITHUB_HOOK_IDS;
 
   beforeEach(() => {
     testDirectory = mkdtempSync(
@@ -22,6 +27,10 @@ describe("incident route", () => {
     );
     databasePath = path.join(testDirectory, "incidents.sqlite");
     process.env.REDRIVE_DATABASE_PATH = databasePath;
+    delete process.env.REDRIVE_GITHUB_MCP_URL;
+    delete process.env.REDRIVE_GITHUB_MCP_TOKEN;
+    delete process.env.REDRIVE_GITHUB_HOOK_ID;
+    delete process.env.REDRIVE_GITHUB_HOOK_IDS;
   });
 
   afterEach(() => {
@@ -31,6 +40,19 @@ describe("incident route", () => {
       delete process.env.REDRIVE_DATABASE_PATH;
     } else {
       process.env.REDRIVE_DATABASE_PATH = originalDatabasePath;
+    }
+
+    for (const [key, value] of [
+      ["REDRIVE_GITHUB_MCP_URL", originalMcpUrl],
+      ["REDRIVE_GITHUB_MCP_TOKEN", originalMcpToken],
+      ["REDRIVE_GITHUB_HOOK_ID", originalHookId],
+      ["REDRIVE_GITHUB_HOOK_IDS", originalHookIds],
+    ] as const) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
 
     const resolvedDirectory = path.resolve(testDirectory);
@@ -396,6 +418,53 @@ describe("incident route", () => {
       expect(
         database.get<{ count: number }>(
           "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
+  it("returns not found before attempting provider configuration for a missing incident", async () => {
+    const response = await GETProviderEvidence(
+      new Request("http://localhost/api/incidents/missing/provider-evidence"),
+      { params: Promise.resolve({ incidentId: "missing" }) },
+    );
+
+    expect(response.status).toBe(404);
+  });
+
+  it("fails closed when GitHub provider inspection is not configured", async () => {
+    const createResponse = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          provider: "github",
+          externalDeliveryId: "delivery-for-inspection",
+          repositoryId: "example/receiver",
+        }),
+      }),
+    );
+    const { incident } = (await createResponse.json()) as {
+      incident: { id: string };
+    };
+
+    const response = await GETProviderEvidence(
+      new Request(
+        `http://localhost/api/incidents/${incident.id}/provider-evidence`,
+      ),
+      { params: Promise.resolve({ incidentId: incident.id }) },
+    );
+
+    expect(response.status).toBe(503);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM provider_evidence",
         )?.count,
       ).toBe(0);
     } finally {

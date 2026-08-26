@@ -110,11 +110,21 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The development capture
-form records minimal incident metadata in `.local/redrive.sqlite`. The database
-directory and schema are created automatically on first use.
+form records minimal incident metadata in `.local/redrive.sqlite`. Each incident
+can use the control-plane action to inspect one GitHub delivery through the
+configured read-only MCP bridge. The normalized evidence is stored in the same
+SQLite database. The database directory and schema are created automatically on
+first use.
 
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
 `REDRIVE_DATABASE_PATH`.
+
+Provider inspection requires a bridge exposing the proven
+`get_webhook_delivery` MCP tool. Set `REDRIVE_GITHUB_MCP_URL`, then configure an
+explicit repository-to-hook mapping with `REDRIVE_GITHUB_HOOK_IDS` (or set the
+single-receiver `REDRIVE_GITHUB_HOOK_ID`). Redrive sends `hook_id` and the
+incident's exact `externalDeliveryId` as `delivery_id`; it never derives a hook
+ID from `repositoryId` and never calls GitHub REST directly.
 
 For remote or Tailscale development, optionally set the comma-separated
 `NEXT_ALLOWED_DEV_ORIGINS` hostnames in `.env.local`.

@@ -1,4 +1,5 @@
 import { IncidentForm } from "@/components/incident-form";
+import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 import { listIncidents } from "@/server/incident-service";
 
 export const dynamic = "force-dynamic";
@@ -29,7 +30,7 @@ export default async function Home() {
           </div>
         </div>
         <span className="mono-type hidden text-[10px] uppercase tracking-[0.16em] text-[var(--muted)] sm:block">
-          Foundation / 001
+          Foundation / 002A
         </span>
       </header>
 
@@ -43,8 +44,8 @@ export default async function Home() {
           </h1>
           <p className="mt-7 max-w-xl text-base leading-7 text-[var(--muted)] sm:text-lg">
             Redrive is the control plane for investigating ambiguous webhook
-            failures before anything consequential happens. This first slice
-            stores incident identity only.
+            failures before anything consequential happens. Inspect a captured
+            GitHub delivery before any consequential recovery action.
           </p>
         </div>
 
@@ -53,7 +54,7 @@ export default async function Home() {
             Current foundation
           </p>
           <p className="mt-2 text-xl font-semibold tracking-tight">
-            SQLite metadata
+            SQLite + provider evidence
           </p>
           <p className="mt-1 text-sm leading-6 text-[var(--muted)]">
             {incidents.length} recent{" "}
@@ -100,6 +101,7 @@ export default async function Home() {
                     <p className="mt-2 text-sm text-[var(--muted)]">
                       {incident.repositoryId}
                     </p>
+                    <ProviderEvidencePanel incidentId={incident.id} />
                   </div>
                   <time
                     className="text-xs text-[var(--muted)] sm:text-right"
@@ -115,9 +117,8 @@ export default async function Home() {
           <div className="border border-dashed border-[var(--line)] bg-[rgba(251,250,245,0.55)] px-5 py-12 sm:px-8">
             <p className="display-type text-3xl">No incidents recorded yet.</p>
             <p className="mt-3 max-w-md text-sm leading-6 text-[var(--muted)]">
-              Use the development capture below to prove the local
-              persistence path. It records metadata and does not contact a
-              provider.
+              Use the development capture below to record an incident identity.
+              Inspecting provider evidence is a separate read-only action.
             </p>
           </div>
         )}
@@ -132,9 +133,9 @@ export default async function Home() {
             Record an incident identity.
           </h2>
           <p className="mt-5 max-w-lg text-sm leading-6 text-[var(--muted)]">
-            This small form is only a foundation seam for the application
-            boundary. It creates a local Redrive record; it does not claim
-            provider delivery evidence or start recovery work.
+            This small form creates a local Redrive record. It does not claim
+            provider delivery evidence or start recovery work until you inspect
+            the linked GitHub delivery.
           </p>
         </div>
         <IncidentForm />
