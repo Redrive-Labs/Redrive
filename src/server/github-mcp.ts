@@ -87,6 +87,7 @@ function isUnsafeIntegerLiteral(literal: string): boolean {
 }
 
 function parseProvenDeliveryJson(text: string): unknown {
+  const unsafeIntegerSentinel = randomUUID();
   const unsafeIntegers: string[] = [];
   let protectedText = "";
   let inString = false;
@@ -119,12 +120,11 @@ function parseProvenDeliveryJson(text: string): unknown {
       );
       if (match !== null) {
         const literal = match[0];
-        const numericValue = Number(literal);
-        if (
-          isUnsafeIntegerLiteral(literal)
-        ) {
-          const markerIndex = unsafeIntegers.push(literal) - 1;
-          protectedText += `{"__redriveUnsafeInteger":${markerIndex}}`;
+        if (isUnsafeIntegerLiteral(literal)) {
+          unsafeIntegers.push(literal);
+          protectedText += `{"__redriveUnsafeInteger":${JSON.stringify(
+            unsafeIntegerSentinel,
+          )}}`;
         } else {
           protectedText += literal;
         }
@@ -155,7 +155,9 @@ function parseProvenDeliveryJson(text: string): unknown {
   if (
     unsafeIntegers.length !== 1 ||
     body === null ||
-    marker?.__redriveUnsafeInteger !== 0
+    marker === null ||
+    Object.keys(marker).length !== 1 ||
+    marker.__redriveUnsafeInteger !== unsafeIntegerSentinel
   ) {
     throw new GithubMcpError(
       "GitHub MCP returned an unsafe integer outside full.body.id.",

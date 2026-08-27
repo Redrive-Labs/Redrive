@@ -10,7 +10,7 @@ interface ProviderEvidenceResponse {
 
 interface ProviderEvidencePanelProps {
   incidentId: string;
-  initialEvidence?: ProviderEvidence | null;
+  initialCaptured?: boolean;
 }
 
 function formatPayload(payload: unknown): string {
@@ -19,21 +19,21 @@ function formatPayload(payload: unknown): string {
 
 export function ProviderEvidencePanel({
   incidentId,
-  initialEvidence = null,
+  initialCaptured = false,
 }: ProviderEvidencePanelProps) {
-  const [evidence, setEvidence] =
-    useState<ProviderEvidence | null>(initialEvidence);
-  const [isInspecting, setIsInspecting] = useState(false);
+  const [evidence, setEvidence] = useState<ProviderEvidence | null>(null);
+  const [hasCaptured, setHasCaptured] = useState(initialCaptured);
+  const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function inspectDelivery() {
+  async function loadEvidence() {
     setError(null);
-    setIsInspecting(true);
+    setIsLoading(true);
 
     try {
       const response = await fetch(
         `/api/incidents/${encodeURIComponent(incidentId)}/provider-evidence`,
-        { method: "POST", cache: "no-store" },
+        { method: hasCaptured ? "GET" : "POST", cache: "no-store" },
       );
       const result = (await response.json().catch(() => null)) as
         | ProviderEvidenceResponse
@@ -44,11 +44,12 @@ export function ProviderEvidencePanel({
         return;
       }
 
-      setEvidence(result.evidence);
+      setEvidence(result.evidence ?? null);
+      setHasCaptured(result.evidence !== null);
     } catch {
       setError("Provider evidence could not be loaded. Try again.");
     } finally {
-      setIsInspecting(false);
+      setIsLoading(false);
     }
   }
 
@@ -56,11 +57,17 @@ export function ProviderEvidencePanel({
     <div className="mt-5 border-t border-[var(--line)] pt-4">
       <button
         className="inline-flex min-h-10 items-center border border-[var(--ink)] px-3 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--ink)] transition-colors hover:bg-[var(--ink)] hover:text-[var(--paper-bright)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-wait disabled:opacity-60"
-        disabled={isInspecting}
-        onClick={inspectDelivery}
+        disabled={isLoading}
+        onClick={loadEvidence}
         type="button"
       >
-        {isInspecting ? "Inspecting…" : "Inspect provider delivery"}
+        {isLoading
+          ? hasCaptured
+            ? "Loading…"
+            : "Inspecting…"
+          : hasCaptured
+            ? "View captured evidence"
+            : "Inspect provider delivery"}
       </button>
 
       {error ? (

@@ -146,6 +146,24 @@ export function createProviderEvidenceService(
     return row === undefined ? null : mapProviderEvidenceRow(row, incidentId);
   }
 
+  function getCapturedIncidentIds(incidentIds: readonly string[]): Set<string> {
+    if (incidentIds.length === 0) {
+      return new Set();
+    }
+
+    const placeholders = incidentIds.map(() => "?").join(", ");
+    const rows = database.all<{ incidentId: string }>(
+      `
+        SELECT incident_id AS incidentId
+        FROM provider_evidence
+        WHERE incident_id IN (${placeholders})
+      `,
+      incidentIds,
+    );
+
+    return new Set(rows.map((row) => row.incidentId));
+  }
+
   async function inspectForIncident(
     incidentId: string,
   ): Promise<ProviderEvidence> {
@@ -241,6 +259,7 @@ export function createProviderEvidenceService(
 
   return {
     getByIncidentId,
+    getCapturedIncidentIds,
     inspectForIncident,
   };
 }
@@ -279,5 +298,13 @@ export async function getProviderEvidenceByIncidentId(
 ): Promise<ProviderEvidence | null> {
   return withConfiguredProviderEvidenceService((service) =>
     service.getByIncidentId(incidentId),
+  );
+}
+
+export async function getProviderEvidenceCaptureStatus(
+  incidentIds: readonly string[],
+): Promise<Set<string>> {
+  return withConfiguredProviderEvidenceService((service) =>
+    service.getCapturedIncidentIds(incidentIds),
   );
 }

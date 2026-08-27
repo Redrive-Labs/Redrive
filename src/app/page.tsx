@@ -1,9 +1,7 @@
 import { IncidentForm } from "@/components/incident-form";
 import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 import { listIncidents } from "@/server/incident-service";
-import {
-  getProviderEvidenceByIncidentId,
-} from "@/server/provider-evidence-service";
+import { getProviderEvidenceCaptureStatus } from "@/server/provider-evidence-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,13 +15,8 @@ function formatDate(value: string): string {
 
 export default async function Home() {
   const incidents = await listIncidents();
-  const evidenceByIncidentId = new Map(
-    await Promise.all(
-      incidents.map(async (incident) => [
-        incident.id,
-        await getProviderEvidenceByIncidentId(incident.id),
-      ] as const),
-    ),
+  const capturedIncidentIds = await getProviderEvidenceCaptureStatus(
+    incidents.map((incident) => incident.id),
   );
 
   return (
@@ -114,9 +107,7 @@ export default async function Home() {
                     </p>
                     <ProviderEvidencePanel
                       incidentId={incident.id}
-                      initialEvidence={
-                        evidenceByIncidentId.get(incident.id) ?? null
-                      }
+                      initialCaptured={capturedIncidentIds.has(incident.id)}
                     />
                   </div>
                   <time

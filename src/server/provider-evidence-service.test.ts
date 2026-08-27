@@ -116,6 +116,56 @@ describe("provider evidence persistence", () => {
   });
 
 
+  it("returns captured incident IDs without loading evidence snapshots", () => {
+    const incidents = createIncidentService(database);
+    const first = incidents.create({
+      provider: "github",
+      externalDeliveryId: "projection-delivery-1",
+      repositoryId: "example/receiver",
+    }).incident;
+    const second = incidents.create({
+      provider: "github",
+      externalDeliveryId: "projection-delivery-2",
+      repositoryId: "example/receiver",
+    }).incident;
+
+    database.run(
+      `
+        INSERT INTO provider_evidence (
+          incident_id,
+          schema_version,
+          provider,
+          provider_delivery_id,
+          delivery_guid,
+          outcome_status,
+          status_code,
+          delivered_at,
+          canonical_payload_sha256,
+          evidence_json,
+          captured_at
+        ) VALUES (?, 1, 'github', ?, ?, 'Delivered', 200, ?, ?, ?, ?)
+      `,
+      [
+        first.id,
+        "projection-provider-delivery",
+        "projection-guid",
+        "2026-08-25T09:56:40.78Z",
+        "projection-hash",
+        '{"large":"not loaded"}',
+        "2026-08-25T10:00:00.000Z",
+      ],
+    );
+
+    const service = createProviderEvidenceService(
+      database,
+      createReader(null),
+    );
+
+    expect(service.getCapturedIncidentIds([first.id, second.id])).toEqual(
+      new Set([first.id]),
+    );
+  });
+
   it("normalizes, persists, and reloads one evidence snapshot", async () => {
     let receivedLookup: GithubWebhookDeliveryLookup | undefined;
     const incidentService = createProviderEvidenceService(
