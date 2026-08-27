@@ -104,6 +104,44 @@ describe("incident route", () => {
     }
   });
 
+  it("decodes percent-encoded Unicode and plus-separated form values", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body:
+          "provider=github+ops" +
+          "&externalDeliveryId=%E9%85%8D%E9%80%81-%F0%9F%9A%9A+001" +
+          "&repositoryId=example%2Freceiver",
+      }),
+    );
+
+    expect(response.status).toBe(303);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.all<{
+          provider: string;
+          external_delivery_id: string;
+          repository_id: string;
+        }>(
+          "SELECT provider, external_delivery_id, repository_id FROM incidents",
+        ),
+      ).toEqual([
+        {
+          provider: "github ops",
+          external_delivery_id: "配送-🚚 001",
+          repository_id: "example/receiver",
+        },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
   it("returns a 400 for invalid form input without creating a row", async () => {
     const form = new URLSearchParams({
       provider: "github",
@@ -271,6 +309,34 @@ describe("incident route", () => {
     await expect(response.json()).resolves.toMatchObject({
       incident: input,
     });
+  });
+
+  it("rejects percent-encoded malformed UTF-8 in URL-encoded forms", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body:
+          "provider=github" +
+          "&externalDeliveryId=%C3%28" +
+          "&repositoryId=example%2Freceiver",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
   });
 
   it("rejects an oversized JSON body without creating a row", async () => {

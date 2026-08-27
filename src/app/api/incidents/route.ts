@@ -24,6 +24,55 @@ class MalformedUtf8Error extends Error {
   }
 }
 
+class MalformedFormEncodingError extends Error {
+  constructor() {
+    super("Request body contains malformed form encoding.");
+    this.name = "MalformedFormEncodingError";
+  }
+}
+
+function decodeFormComponent(component: string): string {
+  try {
+    return decodeURIComponent(component.replace(/\+/g, " "));
+  } catch (error) {
+    if (error instanceof URIError) {
+      throw new MalformedFormEncodingError();
+    }
+
+    throw error;
+  }
+}
+
+function parseUrlEncodedForm(body: string): {
+  provider: string | null;
+  externalDeliveryId: string | null;
+  repositoryId: string | null;
+} {
+  const fields = new Map<string, string>();
+
+  for (const pair of body.split("&")) {
+    if (pair.length === 0) {
+      continue;
+    }
+
+    const separator = pair.indexOf("=");
+    const encodedName = separator === -1 ? pair : pair.slice(0, separator);
+    const encodedValue = separator === -1 ? "" : pair.slice(separator + 1);
+    const name = decodeFormComponent(encodedName);
+    const value = decodeFormComponent(encodedValue);
+
+    if (!fields.has(name)) {
+      fields.set(name, value);
+    }
+  }
+
+  return {
+    provider: fields.get("provider") ?? null,
+    externalDeliveryId: fields.get("externalDeliveryId") ?? null,
+    repositoryId: fields.get("repositoryId") ?? null,
+  };
+}
+
 function decodeStrictUtf8(requestBody: Uint8Array): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(requestBody);
@@ -124,9 +173,12 @@ export async function POST(request: Request): Promise<Response> {
   let input: unknown;
   let isNativeFormSubmission = false;
   const contentType = request.headers.get("content-type") ?? "";
-  const isFormEncoded =
-    contentType.startsWith("application/x-www-form-urlencoded") ||
-    contentType.startsWith("multipart/form-data");
+  const isUrlEncodedForm = contentType.startsWith(
+    "application/x-www-form-urlencoded",
+  );
+  const isUnsupportedMultipartForm = contentType.startsWith(
+    "multipart/form-data",
+  );
   let requestBody: Uint8Array;
 
   try {
@@ -141,6 +193,10 @@ export async function POST(request: Request): Promise<Response> {
       { error: "Unable to read incident request body." },
       { status: 500 },
     );
+  }
+
+  if (isUnsupportedMultipartForm) {
+    return invalidRequestBodyResponse();
   }
 
   let decodedRequestBody: string;
@@ -159,20 +215,11 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  if (isFormEncoded) {
-    const parseHeaders = new Headers(request.headers);
-    parseHeaders.delete("content-length");
-    const parseRequest = new Request(request.url, {
-      body: Buffer.from(requestBody) as unknown as BodyInit,
-      headers: parseHeaders,
-      method: request.method,
-    });
-    let formData: FormData;
-
+  if (isUrlEncodedForm) {
     try {
-      formData = await parseRequest.formData();
+      input = parseUrlEncodedForm(decodedRequestBody);
     } catch (error) {
-      if (error instanceof TypeError || error instanceof SyntaxError) {
+      if (error instanceof MalformedFormEncodingError) {
         return invalidRequestBodyResponse();
       }
 
@@ -184,11 +231,6 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     isNativeFormSubmission = true;
-    input = {
-      provider: formData.get("provider"),
-      externalDeliveryId: formData.get("externalDeliveryId"),
-      repositoryId: formData.get("repositoryId"),
-    };
   } else {
     try {
       input = JSON.parse(decodedRequestBody);
