@@ -43,6 +43,28 @@ const migrations: Migration[] = [
         ON incidents (provider, repository_id, external_delivery_id);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE provider_evidence (
+        incident_id TEXT PRIMARY KEY NOT NULL,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        provider TEXT NOT NULL CHECK (provider = 'github'),
+        provider_delivery_id TEXT NOT NULL,
+        delivery_guid TEXT NOT NULL,
+        outcome_status TEXT NOT NULL,
+        status_code INTEGER,
+        delivered_at TEXT NOT NULL,
+        canonical_payload_sha256 TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX provider_evidence_delivery_idx
+        ON provider_evidence (provider_delivery_id);
+    `,
+  },
 ];
 
 export class SqliteDatabase {
