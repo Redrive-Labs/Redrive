@@ -187,6 +187,45 @@ describe("GitHub MCP boundary", () => {
     }
   });
 
+  it("bounds exponent handling without expanding numeric literals", async () => {
+    const cases = [
+      ["0e100000000", 0],
+      ["1e100000000", "1e100000000"],
+      ["9007199254740993e0", "9007199254740993e0"],
+      ["9.007199254740993e15", "9.007199254740993e15"],
+      ["1e-100000000", 0],
+      ["9007199254740991", 9007199254740991],
+      ["100.00e-2", 1],
+      ["1e3", 1000],
+      ["1e-3", 0.001],
+    ] as const;
+
+    for (const [literal, expectedId] of cases) {
+      const toolText = `{"full":{"http_status":200,"body":{"id":${literal}}}}`;
+      const callTool = createGithubMcpToolCaller({
+        endpoint: "https://mcp.example.test/mcp",
+        fetchImplementation: vi.fn(async (_input, init) =>
+          new Response(
+            envelope(toolText, (JSON.parse(String(init?.body)) as { id: string }).id),
+            {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+        ),
+      });
+
+      await expect(
+        callTool("get_webhook_delivery", { hook_id: "hook", delivery_id: "123" }),
+      ).resolves.toEqual({
+        full: {
+          http_status: 200,
+          body: { id: expectedId },
+        },
+      });
+    }
+  });
+
   it("times out one bounded request without leaking details", async () => {
     vi.useFakeTimers();
     try {

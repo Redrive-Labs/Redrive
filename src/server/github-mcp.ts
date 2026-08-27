@@ -66,24 +66,31 @@ function isUnsafeIntegerLiteral(literal: string): boolean {
   const match = literal.match(/^(-?)([0-9]+)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$/);
   if (match === null) return false;
 
-  const [, sign, whole, fraction = "", exponentText = "0"] = match;
+  const [, , whole, fraction = "", exponentText = "0"] = match;
   const digits = `${whole}${fraction}`.replace(/^0+(?=[0-9])/, "");
-  const exponent = Number(exponentText) - fraction.length;
-  if (exponent >= 0) {
-    return BigInt(`${sign === "-" ? "-" : ""}${digits}${"0".repeat(exponent)}`) >
-      BigInt(Number.MAX_SAFE_INTEGER) ||
-      BigInt(`${sign === "-" ? "-" : ""}${digits}${"0".repeat(exponent)}`) <
-      BigInt(Number.MIN_SAFE_INTEGER);
+  if (digits === "0") return false;
+
+  const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
+  const maxSafeIntegerDigits = String(Number.MAX_SAFE_INTEGER).length;
+  const exponent = BigInt(exponentText) - BigInt(fraction.length);
+  if (exponent >= BigInt(0)) {
+    const integerDigitCount = BigInt(digits.length) + exponent;
+    if (integerDigitCount > BigInt(maxSafeIntegerDigits)) return true;
+
+    const integer = BigInt(digits.padEnd(Number(integerDigitCount), "0"));
+    return integer > maxSafeInteger;
   }
 
   const decimalPlaces = -exponent;
-  if (digits.length <= decimalPlaces) return false;
-  const split = digits.length - decimalPlaces;
+  if (decimalPlaces >= BigInt(digits.length)) return false;
+  const decimalPlacesNumber = Number(decimalPlaces);
+  const split = digits.length - decimalPlacesNumber;
   const trailing = digits.slice(split);
   if (/[^0]/.test(trailing)) return false;
-  const integer = BigInt(`${sign === "-" ? "-" : ""}${digits.slice(0, split)}`);
-  return integer > BigInt(Number.MAX_SAFE_INTEGER) ||
-    integer < BigInt(Number.MIN_SAFE_INTEGER);
+
+  const integerDigits = digits.slice(0, split);
+  if (integerDigits.length > maxSafeIntegerDigits) return true;
+  return BigInt(integerDigits) > maxSafeInteger;
 }
 
 function parseProvenDeliveryJson(text: string): unknown {
