@@ -1,6 +1,9 @@
 import { IncidentForm } from "@/components/incident-form";
 import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 import { listIncidents } from "@/server/incident-service";
+import {
+  getProviderEvidenceByIncidentId,
+} from "@/server/provider-evidence-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -14,6 +17,14 @@ function formatDate(value: string): string {
 
 export default async function Home() {
   const incidents = await listIncidents();
+  const evidenceByIncidentId = new Map(
+    await Promise.all(
+      incidents.map(async (incident) => [
+        incident.id,
+        await getProviderEvidenceByIncidentId(incident.id),
+      ] as const),
+    ),
+  );
 
   return (
     <main className="mx-auto min-h-screen w-full max-w-6xl px-5 py-6 sm:px-8 sm:py-10">
@@ -101,7 +112,12 @@ export default async function Home() {
                     <p className="mt-2 text-sm text-[var(--muted)]">
                       {incident.repositoryId}
                     </p>
-                    <ProviderEvidencePanel incidentId={incident.id} />
+                    <ProviderEvidencePanel
+                      incidentId={incident.id}
+                      initialEvidence={
+                        evidenceByIncidentId.get(incident.id) ?? null
+                      }
+                    />
                   </div>
                   <time
                     className="text-xs text-[var(--muted)] sm:text-right"

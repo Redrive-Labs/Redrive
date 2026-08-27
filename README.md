@@ -126,6 +126,22 @@ single-receiver `REDRIVE_GITHUB_HOOK_ID`). Redrive sends `hook_id` and the
 incident's exact `externalDeliveryId` as `delivery_id`; it never derives a hook
 ID from `repositoryId` and never calls GitHub REST directly.
 
+`externalDeliveryId` and normalized `providerDeliveryId` identify the exact
+GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook
+identity (`guid`) carried by `X-GitHub-Delivery`, which receivers should use for
+idempotency. Capture fails closed if those identities, the request header, or
+the configured repository evidence contradict each other.
+
+`GET /api/incidents/:incidentId/provider-evidence` reads only the persisted
+snapshot and returns `{ "evidence": null }` before capture. `POST` performs the
+bounded read-only MCP inspection. The first normalized snapshot is immutable;
+later capture requests return it without contacting GitHub again. MCP reads
+time out after 12 seconds and reject responses larger than 1 MiB.
+
+The stored `canonicalPayloadSha256` is SHA-256 of Redrive's canonical JSON
+representation of the provider-returned payload. It is not a hash of the
+original webhook request-body bytes, which Redrive does not possess here.
+
 For remote or Tailscale development, optionally set the comma-separated
 `NEXT_ALLOWED_DEV_ORIGINS` hostnames in `.env.local`.
 

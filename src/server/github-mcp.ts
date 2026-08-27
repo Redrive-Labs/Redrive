@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 export const GITHUB_WEBHOOK_DELIVERY_TOOL = "get_webhook_delivery" as const;
+export const GITHUB_MCP_TIMEOUT_MS = 12_000;
+export const GITHUB_MCP_MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
 
 export interface GithubWebhookDeliveryLookup {
   repositoryId: string;
@@ -25,6 +27,20 @@ export class GithubMcpError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "GithubMcpError";
+  }
+}
+
+export class GithubMcpTimeoutError extends GithubMcpError {
+  constructor() {
+    super("GitHub MCP request timed out.");
+    this.name = "GithubMcpTimeoutError";
+  }
+}
+
+export class GithubMcpResponseTooLargeError extends GithubMcpError {
+  constructor() {
+    super("GitHub MCP response is too large.");
+    this.name = "GithubMcpResponseTooLargeError";
   }
 }
 
@@ -113,7 +129,7 @@ function parseMcpResponse(text: string): unknown {
     throw new GithubMcpError("GitHub MCP returned an empty response.");
   }
 
-  if (!trimmed.startsWith("event:")) {
+  if (!trimmed.startsWith("event:") && !trimmed.startsWith("data:")) {
     return parseJsonPreservingOpaqueIntegers(trimmed);
   }
 
@@ -171,6 +187,78 @@ function unwrapMcpToolResult(envelope: unknown): unknown {
   return result;
 }
 
+async function readChunkWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("The operation was aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function readResponseBody(response: Response, signal: AbortSignal): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > GITHUB_MCP_MAX_RESPONSE_BYTES) {
+      throw new GithubMcpResponseTooLargeError();
+    }
+  }
+
+  if (response.body === null) {
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      // The request's AbortController also aborts a pending stream read.
+      const chunk = await readChunkWithAbort(reader, signal);
+      if (chunk.done) {
+        text += decoder.decode();
+        return text;
+      }
+      bytes += chunk.value.byteLength;
+      if (bytes > GITHUB_MCP_MAX_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The size error is the useful, bounded failure even if cancellation fails.
+        }
+        throw new GithubMcpResponseTooLargeError();
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (signal.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read may keep the lock while abort is propagating.
+    }
+  }
+}
+
 export function createGithubMcpToolCaller(options: {
   endpoint: string;
   token?: string;
@@ -194,50 +282,64 @@ export function createGithubMcpToolCaller(options: {
   const fetchImplementation = options.fetchImplementation ?? fetch;
 
   return async (_toolName, input) => {
-    let response: Response;
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, GITHUB_MCP_TIMEOUT_MS);
 
     try {
-      response = await fetchImplementation(endpoint, {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          ...(options.token === undefined || options.token.length === 0
-            ? {}
-            : { Authorization: `Bearer ${options.token}` }),
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: randomUUID(),
-          method: "tools/call",
-          params: {
-            name: GITHUB_WEBHOOK_DELIVERY_TOOL,
-            arguments: input,
+      let response: Response;
+      try {
+        response = await fetchImplementation(endpoint, {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            ...(options.token === undefined || options.token.length === 0
+              ? {}
+              : { Authorization: `Bearer ${options.token}` }),
           },
-        }),
-      });
-    } catch (error) {
-      throw new GithubMcpError("GitHub MCP request failed.", {
-        cause: error,
-      });
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: randomUUID(),
+            method: "tools/call",
+            params: {
+              name: GITHUB_WEBHOOK_DELIVERY_TOOL,
+              arguments: input,
+            },
+          }),
+          signal: controller.signal,
+        });
+      } catch {
+        if (timedOut) throw new GithubMcpTimeoutError();
+        throw new GithubMcpError("GitHub MCP request failed.");
+      }
+
+      let responseText: string;
+      try {
+        responseText = await readResponseBody(response, controller.signal);
+      } catch (error) {
+        if (timedOut || (error instanceof DOMException && error.name === "AbortError")) {
+          throw new GithubMcpTimeoutError();
+        }
+        throw error instanceof GithubMcpResponseTooLargeError
+          ? error
+          : new GithubMcpError("GitHub MCP response could not be read.");
+      }
+
+      if (!response.ok) {
+        throw new GithubMcpError(
+          `GitHub MCP request failed with HTTP ${response.status}.`,
+        );
+      }
+
+      return unwrapMcpToolResult(parseMcpResponse(responseText));
+    } finally {
+      clearTimeout(timeout);
     }
 
-    let responseText: string;
-    try {
-      responseText = await response.text();
-    } catch (error) {
-      throw new GithubMcpError("GitHub MCP response could not be read.", {
-        cause: error,
-      });
-    }
-
-    if (!response.ok) {
-      throw new GithubMcpError(
-        `GitHub MCP request failed with HTTP ${response.status}.`,
-      );
-    }
-
-    return unwrapMcpToolResult(parseMcpResponse(responseText));
   };
 }
 

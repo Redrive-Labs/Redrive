@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
-  computeProviderPayloadSha256,
+  computeCanonicalProviderPayloadSha256,
+  parseProviderEvidence,
   type ProviderEvidence,
 } from "./provider-evidence";
 import {
@@ -40,9 +42,7 @@ function makeResult(
       },
     },
     response: {
-      headers: {
-        "content-type": "text/plain",
-      },
+      headers: { "content-type": "text/plain" },
       payload: "receiver failed",
     },
     ignoredBodyField: "ignored",
@@ -50,141 +50,121 @@ function makeResult(
   };
 
   return {
-    id: lookup.deliveryId,
-    guid: "guid-001",
-    event: "push",
-    status_code: 500,
-    delivered_at: "2026-08-25T09:56:40.78Z",
-    redelivery: false,
     duration: 0.21,
     ignoredRootField: "ignored",
-    full: {
-      http_status: 200,
-      body,
-    },
+    full: { http_status: 200, body },
   };
 }
 
-describe("GitHub provider evidence normalizer", () => {
-  it("normalizes the proven MCP wrapper and maps response.payload to response.body", () => {
-    const evidence = normalizeGithubWebhookDelivery(
-      makeResult(),
-      lookup,
-      "2026-08-25T10:00:00.000Z",
-    );
+function normalize(
+  result = makeResult(),
+  requested = lookup,
+): ProviderEvidence {
+  return normalizeGithubWebhookDelivery(
+    result,
+    requested,
+    "2026-08-25T10:00:00.000Z",
+  );
+}
 
-    const expected: ProviderEvidence = {
+describe("GitHub provider evidence normalizer", () => {
+  it("keeps the provider attempt ID and logical delivery GUID separate", () => {
+    const evidence = normalize();
+
+    expect(evidence).toMatchObject({
       schemaVersion: 1,
       provider: "github",
       repositoryId: lookup.repositoryId,
-      deliveryId: lookup.deliveryId,
+      providerDeliveryId: lookup.deliveryId,
+      deliveryGuid: "guid-001",
       event: "push",
-      deliveredAt: "2026-08-25T09:56:40.78Z",
-      outcome: {
-        status: "Invalid HTTP Response: 500",
-        statusCode: 500,
-      },
-      request: {
-        headers: {
-          "X-Github-Delivery": "guid-001",
-          "X-Github-Event": "push",
-        },
-        payload: {
-          repository: {
-            id: 1345932290,
-            full_name: "example/receiver",
-          },
-          ref: "refs/heads/main",
-        },
-        payloadSha256: computeProviderPayloadSha256({
-          repository: {
-            id: 1345932290,
-            full_name: "example/receiver",
-          },
-          ref: "refs/heads/main",
-        }),
-      },
-      response: {
-        headers: {
-          "content-type": "text/plain",
-        },
-        body: "receiver failed",
-      },
-      redelivery: false,
-      capturedAt: "2026-08-25T10:00:00.000Z",
-    };
-
-    expect(evidence).toEqual(expected);
+      outcome: { statusCode: 500 },
+      response: { body: "receiver failed" },
+    });
+    expect(evidence.request.canonicalPayloadSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(evidence).not.toHaveProperty("deliveryId");
     expect(evidence).not.toHaveProperty("ignoredRootField");
     expect(evidence).not.toHaveProperty("full");
   });
 
-  it("matches the proven numeric GitHub delivery ID without stringifying a rounded number", () => {
-    const spikeLookup: GithubWebhookDeliveryLookup = {
-      repositoryId: "example/receiver",
-      deliveryId: "3838953010386436096",
-    };
+  it("represents later provider attempts with the same logical GUID", () => {
+    const firstLookup = { ...lookup, deliveryId: "123" };
+    const secondLookup = { ...lookup, deliveryId: "456" };
+    const first = normalize(makeResult({ id: "123", guid: "abc", request: {
+      headers: { "x-github-delivery": "abc" },
+      payload: { repository: { full_name: lookup.repositoryId } },
+    } }), firstLookup);
+    const second = normalize(makeResult({ id: "456", guid: "abc", request: {
+      headers: { "X-GITHUB-DELIVERY": "abc" },
+      payload: { repository: { full_name: lookup.repositoryId } },
+    } }), secondLookup);
+
+    expect([first.providerDeliveryId, second.providerDeliveryId]).toEqual(["123", "456"]);
+    expect([first.deliveryGuid, second.deliveryGuid]).toEqual(["abc", "abc"]);
+  });
+
+  it("preserves a provider attempt ID beyond Number.MAX_SAFE_INTEGER exactly", () => {
+    expect(normalize().providerDeliveryId).toBe(lookup.deliveryId);
+    expect(() => normalize(makeResult({ id: Number(lookup.deliveryId) }))).toThrow(
+      "safe integer",
+    );
+  });
+
+  it("matches X-GitHub-Delivery case-insensitively", () => {
     const result = makeResult();
     const body = (result.full as { body: Record<string, unknown> }).body;
-    body.id = Number(spikeLookup.deliveryId);
-    body.guid = "other-guid";
     body.request = {
-      headers: { "X-Github-Delivery": "other-guid" },
-      payload: { repository: { full_name: "example/receiver" } },
+      headers: { "x-GITHUB-delivery": "guid-001" },
+      payload: { repository: { full_name: lookup.repositoryId } },
     };
 
-    expect(
-      normalizeGithubWebhookDelivery(result, spikeLookup),
-    ).toMatchObject({ deliveryId: spikeLookup.deliveryId });
+    expect(normalize(result).deliveryGuid).toBe("guid-001");
+  });
+
+  it("rejects contradictory GUID and header evidence", () => {
+    expect(() => normalize(makeResult({ guid: "different-guid" }))).toThrow(
+      "does not match the delivery GUID",
+    );
   });
 
   it("rejects a malformed status code", () => {
-    expect(() =>
-      normalizeGithubWebhookDelivery(
-        makeResult({ status_code: "500" }),
-        lookup,
-      ),
-    ).toThrow(GithubDeliveryNormalizationError);
+    expect(() => normalize(makeResult({ status_code: "500" }))).toThrow(
+      GithubDeliveryNormalizationError,
+    );
   });
 
-  it("rejects a delivery ID that does not match the lookup", () => {
-    expect(() =>
-      normalizeGithubWebhookDelivery(
-        makeResult({ id: "different-delivery" }),
-        lookup,
-      ),
-    ).toThrow("does not match the incident delivery ID");
+  it("rejects a provider attempt ID that does not match the lookup", () => {
+    expect(() => normalize(makeResult({ id: "different-delivery" }))).toThrow(
+      "does not match the incident delivery ID",
+    );
   });
 
-  it("rejects a repository identity that does not match the lookup", () => {
-    expect(() =>
-      normalizeGithubWebhookDelivery(
-        makeResult({
-          request: {
-            headers: {
-              "X-Github-Delivery": "guid-001",
-            },
-            payload: {
-              repository: {
-                id: 1345932290,
-                full_name: "other/receiver",
-              },
-            },
-          },
-        }),
-        lookup,
-      ),
-    ).toThrow("does not match the incident repository ID");
+  it("rejects any contradictory repository identity", () => {
+    expect(() => normalize(makeResult({
+      repositoryFullName: lookup.repositoryId,
+      request: {
+        headers: { "X-GitHub-Delivery": "guid-001" },
+        payload: { repository: { full_name: "other/receiver" } },
+      },
+    }))).toThrow("does not match the incident repository ID");
+  });
+
+  it("revalidates GUID/header agreement in normalized stored JSON", () => {
+    const evidence = normalize();
+    expect(() => parseProviderEvidence({
+      ...evidence,
+      deliveryGuid: "tampered-guid",
+    })).toThrow("must match X-GitHub-Delivery");
   });
 });
 
 describe("provider payload hashing", () => {
-  it("is deterministic for equivalent captured payloads", () => {
-    const first = computeProviderPayloadSha256({
+  it("is deterministic for equivalent captured JSON", () => {
+    const first = computeCanonicalProviderPayloadSha256({
       z: ["last", { b: true, a: 1 }],
       a: "first",
     });
-    const second = computeProviderPayloadSha256({
+    const second = computeCanonicalProviderPayloadSha256({
       a: "first",
       z: ["last", { a: 1, b: true }],
     });
@@ -193,8 +173,21 @@ describe("provider payload hashing", () => {
     expect(first).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("hashes a string payload representation exactly", () => {
-    expect(computeProviderPayloadSha256("{\"b\":2,\"a\":1}"))
-      .toBe("3fb75453225c732a76b7899ea2096dda1455189c89817239732182f73fe5a09f");
+  it("does not claim to hash original request-body bytes", () => {
+    const firstRaw = '{"b":2,"a":1}';
+    const secondRaw = '{"a":1,"b":2}';
+    expect(createHash("sha256").update(firstRaw).digest("hex")).not.toBe(
+      createHash("sha256").update(secondRaw).digest("hex"),
+    );
+    expect(computeCanonicalProviderPayloadSha256(JSON.parse(firstRaw))).toBe(
+      computeCanonicalProviderPayloadSha256(JSON.parse(secondRaw)),
+    );
+  });
+
+  it("hashes a string as a canonical JSON string value", () => {
+    const payload = '{"b":2,"a":1}';
+    expect(computeCanonicalProviderPayloadSha256(payload)).toBe(
+      createHash("sha256").update(JSON.stringify(payload)).digest("hex"),
+    );
   });
 });

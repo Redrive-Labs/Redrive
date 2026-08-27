@@ -1,5 +1,5 @@
 import {
-  computeProviderPayloadSha256,
+  computeCanonicalProviderPayloadSha256,
   GITHUB_PROVIDER,
   parseProviderEvidence,
   ProviderEvidenceValidationError,
@@ -18,10 +18,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function requireRecord(
-  value: unknown,
-  field: string,
-): Record<string, unknown> {
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
   if (!isRecord(value)) {
     throw new GithubDeliveryNormalizationError(
       `GitHub delivery field ${field} must be an object.`,
@@ -61,10 +58,7 @@ function requireTimestamp(
   return value;
 }
 
-function requireHeaders(
-  value: unknown,
-  field: string,
-): Record<string, string> {
+function requireHeaders(value: unknown, field: string): Record<string, string> {
   const headersRecord = requireRecord(value, field);
   const headers: Record<string, string> = {};
 
@@ -106,74 +100,51 @@ function requireStatusCode(
   return value;
 }
 
-interface DeliveryIdentityCandidates {
-  values: string[];
-}
-
-function collectDeliveryIdentityCandidates(
-  record: Record<string, unknown>,
-): DeliveryIdentityCandidates {
-  const candidates: string[] = [];
-  const fields = ["deliveryId", "delivery_id", "guid", "id"] as const;
-
-  for (const field of fields) {
-    if (!Object.prototype.hasOwnProperty.call(record, field)) {
-      continue;
-    }
-
-    const value = record[field];
-    if (typeof value === "string") {
-      if (value.length === 0) {
-        throw new GithubDeliveryNormalizationError(
-          `GitHub delivery field ${field} must be a non-empty string.`,
-        );
-      }
-
-      candidates.push(value);
-      continue;
-    }
-
-    if (
-      typeof value === "number" &&
-      Number.isFinite(value) &&
-      Number.isInteger(value)
-    ) {
-      // The proven GitHub response exposes its internal delivery id as a
-      // JSON number. Convert the already-parsed integer to BigInt immediately
-      // for comparison; never use String(number), which can change an opaque
-      // id above Number.MAX_SAFE_INTEGER. The normalized id still comes from
-      // the requested string.
-      candidates.push(BigInt(value).toString());
-      continue;
-    }
-
-    throw new GithubDeliveryNormalizationError(
-      `GitHub delivery field ${field} must be a string identifier.`,
-    );
-  }
-
-  return { values: candidates };
-}
-
-function assertMatchingDeliveryId(
-  body: Record<string, unknown>,
-  requestedDeliveryId: string,
-): void {
-  const candidates = collectDeliveryIdentityCandidates(body);
-
-  if (candidates.values.includes(requestedDeliveryId)) {
-    return;
-  }
-
-  if (candidates.values.length === 0) {
+function readProviderDeliveryId(body: Record<string, unknown>): string {
+  if (!Object.prototype.hasOwnProperty.call(body, "id")) {
     throw new GithubDeliveryNormalizationError(
       "GitHub delivery response does not contain a delivery identifier.",
     );
   }
-
+  const value = body.id;
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value))
+    return String(value);
   throw new GithubDeliveryNormalizationError(
-    "GitHub delivery ID does not match the incident delivery ID.",
+    "GitHub delivery field id must be a non-empty string or safe integer.",
   );
+}
+
+function assertMatchingDeliveryId(
+  body: Record<string, unknown>,
+  requested: string,
+): void {
+  if (readProviderDeliveryId(body) !== requested) {
+    throw new GithubDeliveryNormalizationError(
+      "GitHub delivery ID does not match the incident delivery ID.",
+    );
+  }
+}
+
+function assertGuidHeader(
+  body: Record<string, unknown>,
+  request: Record<string, unknown>,
+): string {
+  const guid = requireNonEmptyString(body, "guid");
+  const headers = requireHeaders(request.headers, "full.body.request.headers");
+  const matches = Object.entries(headers).filter(
+    ([name]) => name.toLowerCase() === "x-github-delivery",
+  );
+  if (matches.length === 0)
+    throw new GithubDeliveryNormalizationError(
+      "GitHub delivery request is missing X-GitHub-Delivery header.",
+    );
+  const values = new Set(matches.map(([, value]) => value));
+  if (values.size !== 1 || !values.has(guid))
+    throw new GithubDeliveryNormalizationError(
+      "X-GitHub-Delivery header does not match the delivery GUID.",
+    );
+  return guid;
 }
 
 function addRepositoryCandidate(
@@ -197,8 +168,6 @@ function addRepositoryCandidate(
     Number.isSafeInteger(value) &&
     Number.isFinite(value)
   ) {
-    // repository_id is a numeric GitHub field in the proven response. It is
-    // compared only when safe; the Redrive-owned identifier remains a string.
     candidates.push(String(value));
     return;
   }
@@ -208,41 +177,62 @@ function addRepositoryCandidate(
   );
 }
 
+interface RepositoryIdentityCandidates {
+  ids: string[];
+  names: string[];
+}
+
 function collectRepositoryCandidates(
   body: Record<string, unknown>,
   payload: unknown,
-): string[] {
-  const candidates: string[] = [];
+): RepositoryIdentityCandidates {
+  const candidates: RepositoryIdentityCandidates = { ids: [], names: [] };
 
-  for (const field of [
-    "repositoryId",
-    "repository_id",
-    "repositoryFullName",
-    "repository_full_name",
-  ] as const) {
+  for (const field of ["repositoryId", "repository_id"] as const) {
     if (Object.prototype.hasOwnProperty.call(body, field)) {
-      addRepositoryCandidate(candidates, body[field], field);
+      addRepositoryCandidate(candidates.ids, body[field], field);
     }
   }
 
-  if (isRecord(payload) && Object.prototype.hasOwnProperty.call(payload, "repository")) {
+  for (const field of ["repositoryFullName", "repository_full_name"] as const) {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      addRepositoryCandidate(candidates.names, body[field], field);
+    }
+  }
+
+  if (
+    isRecord(payload) &&
+    Object.prototype.hasOwnProperty.call(payload, "repository")
+  ) {
     const repository = payload.repository;
     if (typeof repository === "string") {
-      addRepositoryCandidate(candidates, repository, "request.payload.repository");
+      addRepositoryCandidate(
+        candidates.names,
+        repository,
+        "request.payload.repository",
+      );
     } else {
       const repositoryRecord = requireRecord(
         repository,
         "request.payload.repository",
       );
 
-      for (const field of ["full_name", "fullName", "id"] as const) {
+      for (const field of ["full_name", "fullName"] as const) {
         if (Object.prototype.hasOwnProperty.call(repositoryRecord, field)) {
           addRepositoryCandidate(
-            candidates,
+            candidates.names,
             repositoryRecord[field],
             `request.payload.repository.${field}`,
           );
         }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(repositoryRecord, "id")) {
+        addRepositoryCandidate(
+          candidates.ids,
+          repositoryRecord.id,
+          "request.payload.repository.id",
+        );
       }
     }
   }
@@ -256,17 +246,21 @@ function assertMatchingRepositoryId(
   requestedRepositoryId: string,
 ): void {
   const candidates = collectRepositoryCandidates(body, payload);
+  const idValues = new Set(candidates.ids);
+  const nameValues = new Set(candidates.names);
+  const hasContradiction = idValues.size > 1 || nameValues.size > 1;
+  const hasCandidates = idValues.size > 0 || nameValues.size > 0;
+  const hasMatch =
+    idValues.has(requestedRepositoryId) || nameValues.has(requestedRepositoryId);
 
-  if (candidates.length > 0 && !candidates.includes(requestedRepositoryId)) {
+  if (hasContradiction || (hasCandidates && !hasMatch)) {
     throw new GithubDeliveryNormalizationError(
       "GitHub repository identity does not match the incident repository ID.",
     );
   }
 }
 
-function readResponseBody(
-  response: Record<string, unknown>,
-): string | null {
+function readResponseBody(response: Record<string, unknown>): string | null {
   const hasPayload = Object.prototype.hasOwnProperty.call(response, "payload");
   const hasBody = Object.prototype.hasOwnProperty.call(response, "body");
 
@@ -324,6 +318,7 @@ export function normalizeGithubWebhookDelivery(
   }
 
   const request = requireRecord(body.request, "full.body.request");
+  const deliveryGuid = assertGuidHeader(body, request);
   const response = requireRecord(body.response, "full.body.response");
   if (!Object.prototype.hasOwnProperty.call(request, "payload")) {
     throw new GithubDeliveryNormalizationError(
@@ -332,9 +327,9 @@ export function normalizeGithubWebhookDelivery(
   }
 
   const payload = request.payload;
-  let payloadSha256: string;
+  let canonicalPayloadSha256: string;
   try {
-    payloadSha256 = computeProviderPayloadSha256(payload);
+    canonicalPayloadSha256 = computeCanonicalProviderPayloadSha256(payload);
   } catch (error) {
     if (error instanceof ProviderEvidenceValidationError) {
       throw new GithubDeliveryNormalizationError(error.message);
@@ -348,7 +343,8 @@ export function normalizeGithubWebhookDelivery(
     schemaVersion: 1 as const,
     provider: GITHUB_PROVIDER,
     repositoryId: lookup.repositoryId,
-    deliveryId: lookup.deliveryId,
+    providerDeliveryId: lookup.deliveryId,
+    deliveryGuid,
     event: requireNonEmptyString(body, "event"),
     deliveredAt: requireTimestamp(body, "delivered_at"),
     outcome: {
@@ -356,18 +352,12 @@ export function normalizeGithubWebhookDelivery(
       statusCode: requireStatusCode(body, "status_code"),
     },
     request: {
-      headers: requireHeaders(
-        request.headers,
-        "full.body.request.headers",
-      ),
+      headers: requireHeaders(request.headers, "full.body.request.headers"),
       payload,
-      payloadSha256,
+      canonicalPayloadSha256,
     },
     response: {
-      headers: requireHeaders(
-        response.headers,
-        "full.body.response.headers",
-      ),
+      headers: requireHeaders(response.headers, "full.body.response.headers"),
       body: readResponseBody(response),
     },
     redelivery: body.redelivery,

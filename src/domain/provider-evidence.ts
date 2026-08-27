@@ -7,7 +7,10 @@ export interface ProviderEvidence {
   schemaVersion: typeof PROVIDER_EVIDENCE_SCHEMA_VERSION;
   provider: typeof GITHUB_PROVIDER;
   repositoryId: string;
-  deliveryId: string;
+  /** Exact GitHub delivery attempt ID (`id`); matches Incident.externalDeliveryId. */
+  providerDeliveryId: string;
+  /** Logical webhook identity (`guid` / X-GitHub-Delivery) used for idempotency. */
+  deliveryGuid: string;
   event: string;
   deliveredAt: string;
   outcome: {
@@ -17,7 +20,11 @@ export interface ProviderEvidence {
   request: {
     headers: Record<string, string>;
     payload: unknown;
-    payloadSha256: string;
+    /**
+     * SHA-256 of Redrive canonical JSON for the provider-returned payload.
+     * This is not a hash of the original webhook request-body bytes.
+     */
+    canonicalPayloadSha256: string;
   };
   response: {
     headers: Record<string, string>;
@@ -80,10 +87,7 @@ function readNonEmptyString(
   return value;
 }
 
-function readHeaders(
-  value: unknown,
-  field: string,
-): Record<string, string> {
+function readHeaders(value: unknown, field: string): Record<string, string> {
   assertRecord(value, field);
   const headers: Record<string, string> = {};
 
@@ -98,6 +102,25 @@ function readHeaders(
   }
 
   return headers;
+}
+
+function assertDeliveryGuidMatchesHeaders(
+  deliveryGuid: string,
+  headers: Record<string, string>,
+): void {
+  const values = Object.entries(headers)
+    .filter(([name]) => name.toLowerCase() === "x-github-delivery")
+    .map(([, value]) => value);
+
+  if (
+    values.length === 0 ||
+    new Set(values).size !== 1 ||
+    values[0] !== deliveryGuid
+  ) {
+    throw new ProviderEvidenceValidationError(
+      "Provider evidence deliveryGuid must match X-GitHub-Delivery.",
+    );
+  }
 }
 
 function assertJsonValue(value: unknown, field: string): void {
@@ -139,15 +162,11 @@ function assertJsonValue(value: unknown, field: string): void {
 }
 
 /**
- * Canonicalize the payload representation used for its evidence hash.
- * Objects are key-sorted recursively so equivalent captured JSON has one hash.
- * A string payload is already a captured representation and is hashed exactly.
+ * Hash the provider-returned payload using Redrive canonical JSON, not the
+ * original request bytes. Objects are key-sorted recursively so equivalent
+ * captured JSON has one hash. Strings use their JSON-quoted representation.
  */
 export function canonicalizeProviderPayload(payload: unknown): string {
-  if (typeof payload === "string") {
-    return payload;
-  }
-
   function canonicalize(value: unknown, field: string): string {
     assertJsonValue(value, field);
 
@@ -174,9 +193,7 @@ export function canonicalizeProviderPayload(payload: unknown): string {
     }
 
     const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) =>
-        left < right ? -1 : left > right ? 1 : 0,
-      )
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(
         ([key, item]) =>
           `${JSON.stringify(key)}:${canonicalize(item, `${field}.${key}`)}`,
@@ -188,7 +205,9 @@ export function canonicalizeProviderPayload(payload: unknown): string {
   return canonicalize(payload, "request.payload");
 }
 
-export function computeProviderPayloadSha256(payload: unknown): string {
+export function computeCanonicalProviderPayloadSha256(
+  payload: unknown,
+): string {
   return createHash("sha256")
     .update(canonicalizeProviderPayload(payload), "utf8")
     .digest("hex");
@@ -202,7 +221,8 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
       "schemaVersion",
       "provider",
       "repositoryId",
-      "deliveryId",
+      "providerDeliveryId",
+      "deliveryGuid",
       "event",
       "deliveredAt",
       "outcome",
@@ -224,7 +244,8 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
   }
 
   const repositoryId = readNonEmptyString(input, "repositoryId");
-  const deliveryId = readNonEmptyString(input, "deliveryId");
+  const providerDeliveryId = readNonEmptyString(input, "providerDeliveryId");
+  const deliveryGuid = readNonEmptyString(input, "deliveryGuid");
   const event = readNonEmptyString(input, "event");
   const deliveredAt = readNonEmptyString(input, "deliveredAt");
   const capturedAt = readNonEmptyString(input, "capturedAt");
@@ -248,10 +269,11 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
   assertRecord(input.request, "request");
   assertAllowedKeys(
     input.request,
-    ["headers", "payload", "payloadSha256"],
+    ["headers", "payload", "canonicalPayloadSha256"],
     "request",
   );
   const headers = readHeaders(input.request.headers, "request.headers");
+  assertDeliveryGuidMatchesHeaders(deliveryGuid, headers);
   if (!Object.prototype.hasOwnProperty.call(input.request, "payload")) {
     throw new ProviderEvidenceValidationError(
       "Provider evidence request.payload is required.",
@@ -259,20 +281,22 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
   }
   const payload = input.request.payload;
   assertJsonValue(payload, "request.payload");
-  const payloadSha256 = readNonEmptyString(
+  const canonicalPayloadSha256 = readNonEmptyString(
     input.request,
-    "payloadSha256",
+    "canonicalPayloadSha256",
   );
 
-  if (!/^[a-f0-9]{64}$/.test(payloadSha256)) {
+  if (!/^[a-f0-9]{64}$/.test(canonicalPayloadSha256)) {
     throw new ProviderEvidenceValidationError(
-      "Provider evidence request.payloadSha256 is invalid.",
+      "Provider evidence request.canonicalPayloadSha256 is invalid.",
     );
   }
 
-  if (computeProviderPayloadSha256(payload) !== payloadSha256) {
+  if (
+    computeCanonicalProviderPayloadSha256(payload) !== canonicalPayloadSha256
+  ) {
     throw new ProviderEvidenceValidationError(
-      "Provider evidence request.payloadSha256 does not match the payload.",
+      "Provider evidence request.canonicalPayloadSha256 does not match the payload.",
     );
   }
 
@@ -300,7 +324,8 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
     schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
     provider: GITHUB_PROVIDER,
     repositoryId,
-    deliveryId,
+    providerDeliveryId,
+    deliveryGuid,
     event,
     deliveredAt,
     outcome: {
@@ -310,7 +335,7 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
     request: {
       headers,
       payload,
-      payloadSha256,
+      canonicalPayloadSha256,
     },
     response: {
       headers: responseHeaders,

@@ -9,6 +9,7 @@ import type {
   GithubWebhookDeliveryLookup,
   GithubWebhookDeliveryReader,
 } from "@/server/github-mcp";
+import { GithubMcpTimeoutError } from "@/server/github-mcp";
 import {
   openDatabase,
   type SqliteDatabase,
@@ -125,7 +126,7 @@ describe("provider evidence persistence", () => {
       () => "2026-08-25T10:00:00.000Z",
     );
     const incidents = createIncidentService(database);
-    const incident = incidents.create({
+    const { incident } = incidents.create({
       provider: "github",
       externalDeliveryId: deliveryId,
       repositoryId: "example/receiver",
@@ -137,7 +138,8 @@ describe("provider evidence persistence", () => {
     expect(evidence).toMatchObject({
       provider: "github",
       repositoryId: lookup.repositoryId,
-      deliveryId,
+      providerDeliveryId: deliveryId,
+      deliveryGuid: "guid-001",
       event: "push",
       outcome: {
         statusCode: 500,
@@ -167,7 +169,7 @@ describe("provider evidence persistence", () => {
       }),
       () => "2026-08-25T10:00:00.000Z",
     );
-    const incident = createIncidentService(database).create({
+    const { incident } = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId: deliveryId,
       repositoryId: "example/receiver",
@@ -190,7 +192,7 @@ describe("provider evidence persistence", () => {
       database,
       createReader(makeMcpResult({ status_code: "500" })),
     );
-    const incident = createIncidentService(database).create({
+    const { incident } = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId: deliveryId,
       repositoryId: "example/receiver",
@@ -210,7 +212,7 @@ describe("provider evidence persistence", () => {
       database,
       createReader(makeMcpResult({ id: "different-delivery" })),
     );
-    const incident = createIncidentService(database).create({
+    const { incident } = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId: deliveryId,
       repositoryId: "example/receiver",
@@ -230,7 +232,7 @@ describe("provider evidence persistence", () => {
         throw new Error("MCP unavailable");
       },
     });
-    const incident = createIncidentService(database).create({
+    const { incident } = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId: deliveryId,
       repositoryId: "example/receiver",
@@ -244,4 +246,93 @@ describe("provider evidence persistence", () => {
       "SELECT COUNT(*) AS count FROM provider_evidence",
     )?.count).toBe(0);
   });
+
+  it("returns the immutable first capture without a second MCP call", async () => {
+    let calls = 0;
+    let currentResult: unknown = makeMcpResult();
+    const service = createProviderEvidenceService(database, {
+      async getWebhookDelivery() {
+        calls += 1;
+        return currentResult;
+      },
+    }, () => calls === 1
+      ? "2026-08-25T10:00:00.000Z"
+      : "2026-08-25T11:00:00.000Z");
+    const { incident } = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: deliveryId,
+      repositoryId: "example/receiver",
+    });
+
+    const first = await service.inspectForIncident(incident.id);
+    currentResult = makeMcpResult({
+      status: "Delivered",
+      status_code: 200,
+      response: { headers: {}, payload: "conflicting later response" },
+    });
+    const second = await service.inspectForIncident(incident.id);
+
+    expect(calls).toBe(1);
+    expect(second).toEqual(first);
+    expect(second.outcome.statusCode).toBe(500);
+    expect(second.response.body).toBe("receiver failed");
+  });
+
+  it("persists nothing when GUID and X-GitHub-Delivery contradict", async () => {
+    const service = createProviderEvidenceService(
+      database,
+      createReader(makeMcpResult({ guid: "different-guid" })),
+    );
+    const { incident } = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: deliveryId,
+      repositoryId: "example/receiver",
+    });
+
+    await expect(service.inspectForIncident(incident.id)).rejects.toThrow(
+      "does not match the delivery GUID",
+    );
+    expect(service.getByIncidentId(incident.id)).toBeNull();
+  });
+
+  it("fails closed on a typed MCP timeout", async () => {
+    const service = createProviderEvidenceService(database, {
+      async getWebhookDelivery() {
+        throw new GithubMcpTimeoutError();
+      },
+    });
+    const { incident } = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: deliveryId,
+      repositoryId: "example/receiver",
+    });
+
+    await expect(service.inspectForIncident(incident.id)).rejects.toBeInstanceOf(
+      ProviderEvidenceReadError,
+    );
+    expect(service.getByIncidentId(incident.id)).toBeNull();
+  });
+
+  it("rejects indexed columns that disagree with normalized evidence JSON", async () => {
+    const service = createProviderEvidenceService(
+      database,
+      createReader(makeMcpResult()),
+    );
+    const { incident } = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: deliveryId,
+      repositoryId: "example/receiver",
+    });
+    await service.inspectForIncident(incident.id);
+
+    database.run(
+      "UPDATE provider_evidence SET delivery_guid = ? WHERE incident_id = ?",
+      ["tampered-guid", incident.id],
+    );
+
+    expect(() => service.getByIncidentId(incident.id)).toThrow(
+      "does not match its normalized JSON",
+    );
+  });
+
 });

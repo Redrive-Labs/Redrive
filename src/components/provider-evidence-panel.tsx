@@ -10,6 +10,7 @@ interface ProviderEvidenceResponse {
 
 interface ProviderEvidencePanelProps {
   incidentId: string;
+  initialEvidence?: ProviderEvidence | null;
 }
 
 function formatPayload(payload: unknown): string {
@@ -18,8 +19,10 @@ function formatPayload(payload: unknown): string {
 
 export function ProviderEvidencePanel({
   incidentId,
+  initialEvidence = null,
 }: ProviderEvidencePanelProps) {
-  const [evidence, setEvidence] = useState<ProviderEvidence | null>(null);
+  const [evidence, setEvidence] =
+    useState<ProviderEvidence | null>(initialEvidence);
   const [isInspecting, setIsInspecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -30,7 +33,7 @@ export function ProviderEvidencePanel({
     try {
       const response = await fetch(
         `/api/incidents/${encodeURIComponent(incidentId)}/provider-evidence`,
-        { cache: "no-store" },
+        { method: "POST", cache: "no-store" },
       );
       const result = (await response.json().catch(() => null)) as
         | ProviderEvidenceResponse
@@ -76,10 +79,11 @@ export function ProviderEvidencePanel({
               Delivery
             </p>
             <p className="mono-type mt-1 break-all text-sm">
-              {evidence.deliveryId}
+              {evidence.providerDeliveryId}
             </p>
             <p className="mt-1 text-sm text-[var(--muted)]">
-              {evidence.event} · {evidence.outcome.status} · status code {" "}
+              {evidence.deliveryGuid} · {evidence.event} · {evidence.outcome.status} ·
+              status code {" "}
               {evidence.outcome.statusCode ?? "not returned"}
             </p>
           </div>
@@ -89,7 +93,7 @@ export function ProviderEvidencePanel({
             </p>
             <p className="mt-1 text-sm">{evidence.deliveredAt}</p>
             <p className="mt-1 break-all text-xs text-[var(--muted)]">
-              payload sha256: {evidence.request.payloadSha256}
+              canonical JSON sha256: {evidence.request.canonicalPayloadSha256}
             </p>
           </div>
           <div className="sm:col-span-2">

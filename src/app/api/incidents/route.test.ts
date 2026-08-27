@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   closeConfiguredDatabase,
   openDatabase,
@@ -10,7 +10,10 @@ import {
   MAX_INCIDENT_REQUEST_BODY_BYTES,
   POST,
 } from "./route";
-import { GET as GETProviderEvidence } from "./[incidentId]/provider-evidence/route";
+import {
+  GET as GETProviderEvidence,
+  POST as POSTProviderEvidence,
+} from "./[incidentId]/provider-evidence/route";
 
 describe("incident route", () => {
   let testDirectory: string;
@@ -34,6 +37,7 @@ describe("incident route", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     closeConfiguredDatabase(databasePath);
 
     if (originalDatabasePath === undefined) {
@@ -433,7 +437,64 @@ describe("incident route", () => {
     expect(response.status).toBe(404);
   });
 
-  it("fails closed when GitHub provider inspection is not configured", async () => {
+  it("POST captures provider evidence and GET returns the persisted snapshot", async () => {
+    process.env.REDRIVE_GITHUB_MCP_URL = "https://mcp.example.test/mcp";
+    process.env.REDRIVE_GITHUB_HOOK_ID = "670245925";
+    const providerDeliveryId = "900719925474099312345678901234567890";
+    const deliveryGuid = "guid-route-001";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      full: {
+        body: {
+          id: providerDeliveryId,
+          guid: deliveryGuid,
+          event: "push",
+          status: "Invalid HTTP Response: 500",
+          status_code: 500,
+          delivered_at: "2026-08-25T09:56:40.78Z",
+          redelivery: false,
+          request: {
+            headers: { "X-GitHub-Delivery": deliveryGuid },
+            payload: { repository: { full_name: "example/receiver" } },
+          },
+          response: { headers: {}, payload: "receiver failed" },
+        },
+      },
+    }), { status: 200 })));
+
+    const createResponse = await POST(new Request("http://localhost/api/incidents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        provider: "github",
+        externalDeliveryId: providerDeliveryId,
+        repositoryId: "example/receiver",
+      }),
+    }));
+    const { incident } = await createResponse.json() as { incident: { id: string } };
+    const context = { params: Promise.resolve({ incidentId: incident.id }) };
+
+    const captureResponse = await POSTProviderEvidence(
+      new Request(`http://localhost/api/incidents/${incident.id}/provider-evidence`, {
+        method: "POST",
+      }),
+      context,
+    );
+    expect(captureResponse.status).toBe(200);
+    const captured = await captureResponse.json();
+    expect(captured).toMatchObject({
+      evidence: { providerDeliveryId, deliveryGuid },
+    });
+
+    const readResponse = await GETProviderEvidence(
+      new Request(`http://localhost/api/incidents/${incident.id}/provider-evidence`),
+      context,
+    );
+    expect(readResponse.status).toBe(200);
+    await expect(readResponse.json()).resolves.toEqual(captured);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("GET reads persisted state without requiring or contacting MCP", async () => {
     const createResponse = await POST(
       new Request("http://localhost/api/incidents", {
         method: "POST",
@@ -458,7 +519,17 @@ describe("incident route", () => {
       { params: Promise.resolve({ incidentId: incident.id }) },
     );
 
-    expect(response.status).toBe(503);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ evidence: null });
+
+    const captureResponse = await POSTProviderEvidence(
+      new Request(
+        `http://localhost/api/incidents/${incident.id}/provider-evidence`,
+        { method: "POST" },
+      ),
+      { params: Promise.resolve({ incidentId: incident.id }) },
+    );
+    expect(captureResponse.status).toBe(503);
 
     const database = await openDatabase(databasePath);
     try {

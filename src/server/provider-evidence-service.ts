@@ -9,10 +9,7 @@ import {
   type GithubWebhookDeliveryReader,
 } from "@/server/github-mcp";
 import { normalizeGithubWebhookDelivery } from "@/server/github-provider-evidence";
-import {
-  getConfiguredDatabase,
-  type SqliteDatabase,
-} from "@/server/database";
+import { getConfiguredDatabase, type SqliteDatabase } from "@/server/database";
 import { getServerConfig } from "@/server/config";
 import { createIncidentService } from "@/server/incident-service";
 
@@ -41,11 +38,12 @@ interface ProviderEvidenceRow extends Record<string, unknown> {
   incidentId: unknown;
   schemaVersion: unknown;
   provider: unknown;
-  deliveryId: unknown;
+  providerDeliveryId: unknown;
+  deliveryGuid: unknown;
   outcomeStatus: unknown;
   statusCode: unknown;
   deliveredAt: unknown;
-  payloadSha256: unknown;
+  canonicalPayloadSha256: unknown;
   evidenceJson: unknown;
   capturedAt: unknown;
 }
@@ -70,9 +68,7 @@ function readIntegerOrNull(
       !Number.isFinite(value) ||
       !Number.isInteger(value))
   ) {
-    throw new Error(
-      `Provider evidence row has an invalid ${field} value.`,
-    );
+    throw new Error(`Provider evidence row has an invalid ${field} value.`);
   }
 
   return value;
@@ -100,14 +96,17 @@ function mapProviderEvidenceRow(
   if (
     row.schemaVersion !== evidence.schemaVersion ||
     row.provider !== evidence.provider ||
-    row.deliveryId !== evidence.deliveryId ||
+    row.providerDeliveryId !== evidence.providerDeliveryId ||
+    row.deliveryGuid !== evidence.deliveryGuid ||
     row.outcomeStatus !== evidence.outcome.status ||
     readIntegerOrNull(row, "statusCode") !== evidence.outcome.statusCode ||
     row.deliveredAt !== evidence.deliveredAt ||
-    row.payloadSha256 !== evidence.request.payloadSha256 ||
+    row.canonicalPayloadSha256 !== evidence.request.canonicalPayloadSha256 ||
     row.capturedAt !== evidence.capturedAt
   ) {
-    throw new Error("Provider evidence row does not match its normalized JSON.");
+    throw new Error(
+      "Provider evidence row does not match its normalized JSON.",
+    );
   }
 
   return evidence;
@@ -117,11 +116,12 @@ const providerEvidenceColumns = `
   incident_id AS incidentId,
   schema_version AS schemaVersion,
   provider,
-  delivery_id AS deliveryId,
+  provider_delivery_id AS providerDeliveryId,
+  delivery_guid AS deliveryGuid,
   outcome_status AS outcomeStatus,
   status_code AS statusCode,
   delivered_at AS deliveredAt,
-  payload_sha256 AS payloadSha256,
+  canonical_payload_sha256 AS canonicalPayloadSha256,
   evidence_json AS evidenceJson,
   captured_at AS capturedAt
 `;
@@ -143,9 +143,7 @@ export function createProviderEvidenceService(
       [incidentId],
     );
 
-    return row === undefined
-      ? null
-      : mapProviderEvidenceRow(row, incidentId);
+    return row === undefined ? null : mapProviderEvidenceRow(row, incidentId);
   }
 
   async function inspectForIncident(
@@ -156,6 +154,9 @@ export function createProviderEvidenceService(
     if (incident === null) {
       throw new IncidentNotFoundError(incidentId);
     }
+
+    const existing = getByIncidentId(incidentId);
+    if (existing !== null) return existing;
 
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
@@ -192,52 +193,50 @@ export function createProviderEvidenceService(
             incident_id,
             schema_version,
             provider,
-            delivery_id,
+            provider_delivery_id,
+            delivery_guid,
             outcome_status,
             status_code,
             delivered_at,
-            payload_sha256,
+            canonical_payload_sha256,
             evidence_json,
             captured_at
           ) VALUES (
             @incidentId,
             @schemaVersion,
             @provider,
-            @deliveryId,
+            @providerDeliveryId,
+            @deliveryGuid,
             @outcomeStatus,
             @statusCode,
             @deliveredAt,
-            @payloadSha256,
+            @canonicalPayloadSha256,
             @evidenceJson,
             @capturedAt
           )
-          ON CONFLICT (incident_id) DO UPDATE SET
-            schema_version = excluded.schema_version,
-            provider = excluded.provider,
-            delivery_id = excluded.delivery_id,
-            outcome_status = excluded.outcome_status,
-            status_code = excluded.status_code,
-            delivered_at = excluded.delivered_at,
-            payload_sha256 = excluded.payload_sha256,
-            evidence_json = excluded.evidence_json,
-            captured_at = excluded.captured_at
+          ON CONFLICT (incident_id) DO NOTHING
         `,
         {
           incidentId,
           schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
           provider: GITHUB_PROVIDER,
-          deliveryId: evidence.deliveryId,
+          providerDeliveryId: evidence.providerDeliveryId,
+          deliveryGuid: evidence.deliveryGuid,
           outcomeStatus: evidence.outcome.status,
           statusCode: evidence.outcome.statusCode,
           deliveredAt: evidence.deliveredAt,
-          payloadSha256: evidence.request.payloadSha256,
+          canonicalPayloadSha256: evidence.request.canonicalPayloadSha256,
           evidenceJson,
           capturedAt: evidence.capturedAt,
         },
       );
     }, "immediate");
 
-    return evidence;
+    const persisted = getByIncidentId(incidentId);
+    if (persisted === null) {
+      throw new Error("Provider evidence insert did not produce a persisted snapshot.");
+    }
+    return persisted;
   }
 
   return {
@@ -263,10 +262,7 @@ function withConfiguredProviderEvidenceService<T>(
 ): T {
   const database = getConfiguredDatabase(getServerConfig().databasePath);
   return operation(
-    createProviderEvidenceService(
-      database,
-      createLazyConfiguredGithubReader(),
-    ),
+    createProviderEvidenceService(database, createLazyConfiguredGithubReader()),
   );
 }
 
