@@ -15,16 +15,16 @@ const lookup = {
   deliveryId: "900719925474099312345678901234567890",
 };
 
-function envelope(toolText: string): string {
+function envelope(toolText: string, requestId = "call-1"): string {
   return JSON.stringify({
     jsonrpc: "2.0",
-    id: "call-1",
+    id: requestId,
     result: { content: [{ type: "text", text: toolText }] },
   });
 }
 
-function jsonResponse(toolResult: unknown): Response {
-  return new Response(envelope(JSON.stringify(toolResult)), {
+function jsonResponse(toolResult: unknown, requestId: string): Response {
+  return new Response(envelope(JSON.stringify(toolResult), requestId), {
     status: 200,
     headers: { "content-type": "application/json" },
   });
@@ -63,7 +63,11 @@ describe("GitHub MCP boundary", () => {
     const fetchImplementation: typeof fetch = vi.fn(
       async (_input: RequestInfo | URL, init?: RequestInit) => {
         receivedRequest = init;
-        return jsonResponse({ full: { http_status: 200, body: { id: "123" } } });
+        const request = JSON.parse(String(init?.body)) as { id: string };
+        return jsonResponse(
+          { full: { http_status: 200, body: { id: "123" } } },
+          request.id,
+        );
       },
     );
     const callTool = createGithubMcpToolCaller({
@@ -82,6 +86,38 @@ describe("GitHub MCP boundary", () => {
     expect(receivedRequest?.headers).toMatchObject({
       Authorization: "Bearer secret",
     });
+  });
+
+  it("rejects a JSON-RPC response with a different response id", async () => {
+    const callTool = createGithubMcpToolCaller({
+      endpoint: "https://mcp.example.test/mcp",
+      fetchImplementation: vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: "not-the-request-id",
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    full: { http_status: 200, body: { id: "123" } },
+                  }),
+                },
+              ],
+            },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      ),
+    });
+
+    await expect(
+      callTool("get_webhook_delivery", { hook_id: "hook", delivery_id: "123" }),
+    ).rejects.toThrow("response ID");
   });
 
   it("rejects unproved structured-content and direct-result shapes", async () => {
@@ -109,8 +145,10 @@ describe("GitHub MCP boundary", () => {
     const toolText = `{"full":{"http_status":200,"body":{"id":${unsafeId},"payload":{"count":1}}}}`;
     const callTool = createGithubMcpToolCaller({
       endpoint: "https://mcp.example.test/mcp",
-      fetchImplementation: vi.fn(async () =>
-        new Response(envelope(toolText), {
+      fetchImplementation: vi.fn(async (_input, init) =>
+        new Response(
+          envelope(toolText, (JSON.parse(String(init?.body)) as { id: string }).id),
+          {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -128,12 +166,15 @@ describe("GitHub MCP boundary", () => {
   });
 
   it("rejects an unrelated unsafe payload integer instead of changing its type", async () => {
-    const unsafeValue = "9007199254740993";
-    const toolText = `{"full":{"http_status":200,"body":{"id":"123","request":{"payload":{"count":${unsafeValue}}}}}}`;
+    const unsafeValues = ["9007199254740993", "9007199254740993.0", "9.007199254740993e15"];
+    for (const unsafeValue of unsafeValues) {
+      const toolText = `{"full":{"http_status":200,"body":{"id":"123","request":{"payload":{"count":${unsafeValue}}}}}}`;
     const callTool = createGithubMcpToolCaller({
       endpoint: "https://mcp.example.test/mcp",
-      fetchImplementation: vi.fn(async () =>
-        new Response(envelope(toolText), {
+      fetchImplementation: vi.fn(async (_input, init) =>
+        new Response(
+          envelope(toolText, (JSON.parse(String(init?.body)) as { id: string }).id),
+          {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -142,7 +183,8 @@ describe("GitHub MCP boundary", () => {
 
     await expect(
       callTool("get_webhook_delivery", { hook_id: "hook", delivery_id: "123" }),
-    ).rejects.toThrow("unsafe integer outside full.body.id");
+      ).rejects.toThrow("unsafe integer outside full.body.id");
+    }
   });
 
   it("times out one bounded request without leaking details", async () => {
@@ -243,16 +285,22 @@ describe("GitHub MCP boundary", () => {
     const body = `event: message
 data: ${envelope(JSON.stringify({
       full: { http_status: 200, body: { id: "123" } },
-    }))}
+    })).replace("call-1", "PLACEHOLDER_REQUEST_ID")}
 
 `;
     const callTool = createGithubMcpToolCaller({
       endpoint: "https://mcp.example.test/mcp",
-      fetchImplementation: vi.fn(async () =>
-        new Response(body, {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
-        }),
+      fetchImplementation: vi.fn(async (_input, init) =>
+        new Response(
+          body.replace(
+            "PLACEHOLDER_REQUEST_ID",
+            (JSON.parse(String(init?.body)) as { id: string }).id,
+          ),
+          {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          },
+        ),
       ),
     });
 

@@ -62,6 +62,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * it is the provider attempt ID at `full.body.id`. Any other unsafe integer is
  * rejected because JSON.parse would silently round webhook payload data.
  */
+function isUnsafeIntegerLiteral(literal: string): boolean {
+  const match = literal.match(/^(-?)([0-9]+)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$/);
+  if (match === null) return false;
+
+  const [, sign, whole, fraction = "", exponentText = "0"] = match;
+  const digits = `${whole}${fraction}`.replace(/^0+(?=[0-9])/, "");
+  const exponent = Number(exponentText) - fraction.length;
+  if (exponent >= 0) {
+    return BigInt(`${sign === "-" ? "-" : ""}${digits}${"0".repeat(exponent)}`) >
+      BigInt(Number.MAX_SAFE_INTEGER) ||
+      BigInt(`${sign === "-" ? "-" : ""}${digits}${"0".repeat(exponent)}`) <
+      BigInt(Number.MIN_SAFE_INTEGER);
+  }
+
+  const decimalPlaces = -exponent;
+  if (digits.length <= decimalPlaces) return false;
+  const split = digits.length - decimalPlaces;
+  const trailing = digits.slice(split);
+  if (/[^0]/.test(trailing)) return false;
+  const integer = BigInt(`${sign === "-" ? "-" : ""}${digits.slice(0, split)}`);
+  return integer > BigInt(Number.MAX_SAFE_INTEGER) ||
+    integer < BigInt(Number.MIN_SAFE_INTEGER);
+}
+
 function parseProvenDeliveryJson(text: string): unknown {
   const unsafeIntegers: string[] = [];
   let protectedText = "";
@@ -97,8 +121,7 @@ function parseProvenDeliveryJson(text: string): unknown {
         const literal = match[0];
         const numericValue = Number(literal);
         if (
-          /^-?(?:0|[1-9][0-9]*)$/.test(literal) &&
-          !Number.isSafeInteger(numericValue)
+          isUnsafeIntegerLiteral(literal)
         ) {
           const markerIndex = unsafeIntegers.push(literal) - 1;
           protectedText += `{"__redriveUnsafeInteger":${markerIndex}}`;
@@ -143,7 +166,7 @@ function parseProvenDeliveryJson(text: string): unknown {
   return parsed;
 }
 
-function parseJsonRpcEnvelope(text: string): unknown {
+function parseJsonRpcEnvelope(text: string, requestId: string): unknown {
   let envelope: unknown;
   try {
     envelope = JSON.parse(text) as unknown;
@@ -157,6 +180,10 @@ function parseJsonRpcEnvelope(text: string): unknown {
     typeof envelope.id !== "string"
   ) {
     throw new GithubMcpError("GitHub MCP returned an invalid JSON-RPC envelope.");
+  }
+
+  if (envelope.id !== requestId) {
+    throw new GithubMcpError("GitHub MCP returned a response ID that does not match the request ID.");
   }
 
   if (Object.prototype.hasOwnProperty.call(envelope, "error")) {
@@ -182,7 +209,11 @@ function parseJsonRpcEnvelope(text: string): unknown {
   return parseProvenDeliveryJson(item.text);
 }
 
-function parseTransportResponse(response: Response, text: string): unknown {
+function parseTransportResponse(
+  response: Response,
+  text: string,
+  requestId: string,
+): unknown {
   const mediaType = response.headers
     .get("content-type")
     ?.split(";", 1)[0]
@@ -190,7 +221,7 @@ function parseTransportResponse(response: Response, text: string): unknown {
     .toLowerCase();
 
   if (mediaType === "application/json") {
-    return parseJsonRpcEnvelope(text.trim());
+    return parseJsonRpcEnvelope(text.trim(), requestId);
   }
 
   if (mediaType === "text/event-stream") {
@@ -201,7 +232,7 @@ function parseTransportResponse(response: Response, text: string): unknown {
         "GitHub MCP event stream does not match the proven bridge format.",
       );
     }
-    return parseJsonRpcEnvelope(match[1]);
+    return parseJsonRpcEnvelope(match[1], requestId);
   }
 
   throw new GithubMcpError("GitHub MCP returned an unsupported media type.");
@@ -303,6 +334,7 @@ export function createGithubMcpToolCaller(options: {
 
   return async (_toolName, input) => {
     const controller = new AbortController();
+    const requestId = randomUUID();
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -323,7 +355,7 @@ export function createGithubMcpToolCaller(options: {
           },
           body: JSON.stringify({
             jsonrpc: "2.0",
-            id: randomUUID(),
+            id: requestId,
             method: "tools/call",
             params: {
               name: GITHUB_WEBHOOK_DELIVERY_TOOL,
@@ -355,7 +387,7 @@ export function createGithubMcpToolCaller(options: {
         );
       }
 
-      return parseTransportResponse(response, responseText);
+      return parseTransportResponse(response, responseText, requestId);
     } finally {
       clearTimeout(timeout);
     }

@@ -467,16 +467,19 @@ describe("incident route", () => {
         },
       },
     };
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-      jsonrpc: "2.0",
-      id: "call-route-1",
-      result: {
-        content: [{ type: "text", text: JSON.stringify(toolResult) }],
-      },
-    }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    })));
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as { id: string };
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          content: [{ type: "text", text: JSON.stringify(toolResult) }],
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
 
     const createResponse = await POST(new Request("http://localhost/api/incidents", {
       method: "POST",
