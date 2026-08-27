@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 
 export const GITHUB_WEBHOOK_DELIVERY_TOOL = "get_webhook_delivery" as const;
 export const GITHUB_MCP_TIMEOUT_MS = 12_000;
-export const GITHUB_MCP_MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
+// GitHub caps webhook payloads at 25 MB. The proven bridge wraps the tool's
+// JSON text inside a JSON-RPC envelope, which can nearly double its byte size.
+export const GITHUB_MCP_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 export interface GithubWebhookDeliveryLookup {
   repositoryId: string;
@@ -56,11 +58,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * JSON.parse rounds integers before a reviver can inspect them. Protect integer
- * literals that cannot be represented safely so opaque provider IDs stay
- * strings at the MCP boundary instead of becoming different numbers.
+ * The proven tool result is `full.body`. Preserve an unsafe integer only when
+ * it is the provider attempt ID at `full.body.id`. Any other unsafe integer is
+ * rejected because JSON.parse would silently round webhook payload data.
  */
-function parseJsonPreservingOpaqueIntegers(text: string): unknown {
+function parseProvenDeliveryJson(text: string): unknown {
+  const unsafeIntegers: string[] = [];
   let protectedText = "";
   let inString = false;
   let escaped = false;
@@ -70,7 +73,6 @@ function parseJsonPreservingOpaqueIntegers(text: string): unknown {
 
     if (inString) {
       protectedText += character;
-
       if (escaped) {
         escaped = false;
       } else if (character === "\\") {
@@ -78,7 +80,6 @@ function parseJsonPreservingOpaqueIntegers(text: string): unknown {
       } else if (character === '"') {
         inString = false;
       }
-
       continue;
     }
 
@@ -89,24 +90,21 @@ function parseJsonPreservingOpaqueIntegers(text: string): unknown {
     }
 
     if (character === "-" || /[0-9]/.test(character)) {
-      const remaining = text.slice(index);
-      const match = remaining.match(
+      const match = text.slice(index).match(
         /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/,
       );
-
       if (match !== null) {
         const literal = match[0];
-        const numberValue = Number(literal);
-
+        const numericValue = Number(literal);
         if (
           /^-?(?:0|[1-9][0-9]*)$/.test(literal) &&
-          !Number.isSafeInteger(numberValue)
+          !Number.isSafeInteger(numericValue)
         ) {
-          protectedText += `"${literal}"`;
+          const markerIndex = unsafeIntegers.push(literal) - 1;
+          protectedText += `{"__redriveUnsafeInteger":${markerIndex}}`;
         } else {
           protectedText += literal;
         }
-
         index += literal.length - 1;
         continue;
       }
@@ -115,76 +113,98 @@ function parseJsonPreservingOpaqueIntegers(text: string): unknown {
     protectedText += character;
   }
 
+  let parsed: unknown;
   try {
-    return JSON.parse(protectedText) as unknown;
+    parsed = JSON.parse(protectedText) as unknown;
   } catch {
     throw new GithubMcpError("GitHub MCP returned invalid JSON.");
   }
+
+  if (unsafeIntegers.length === 0) {
+    return parsed;
+  }
+
+  const root = isRecord(parsed) ? parsed : null;
+  const full = root !== null && isRecord(root.full) ? root.full : null;
+  const body = full !== null && isRecord(full.body) ? full.body : null;
+  const marker = body !== null && isRecord(body.id) ? body.id : null;
+
+  if (
+    unsafeIntegers.length !== 1 ||
+    body === null ||
+    marker?.__redriveUnsafeInteger !== 0
+  ) {
+    throw new GithubMcpError(
+      "GitHub MCP returned an unsafe integer outside full.body.id.",
+    );
+  }
+
+  body.id = unsafeIntegers[0];
+  return parsed;
 }
 
-function parseMcpResponse(text: string): unknown {
-  const trimmed = text.trim();
-
-  if (trimmed.length === 0) {
-    throw new GithubMcpError("GitHub MCP returned an empty response.");
+function parseJsonRpcEnvelope(text: string): unknown {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(text) as unknown;
+  } catch {
+    throw new GithubMcpError("GitHub MCP returned invalid JSON-RPC.");
   }
 
-  if (!trimmed.startsWith("event:") && !trimmed.startsWith("data:")) {
-    return parseJsonPreservingOpaqueIntegers(trimmed);
+  if (
+    !isRecord(envelope) ||
+    envelope.jsonrpc !== "2.0" ||
+    typeof envelope.id !== "string"
+  ) {
+    throw new GithubMcpError("GitHub MCP returned an invalid JSON-RPC envelope.");
   }
 
-  const dataLines = trimmed
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice("data:".length).trim())
-    .filter((line) => line.length > 0 && line !== "[DONE]");
-
-  const lastDataLine = dataLines.at(-1);
-  if (lastDataLine === undefined) {
-    throw new GithubMcpError("GitHub MCP returned an empty event stream.");
-  }
-
-  return parseJsonPreservingOpaqueIntegers(lastDataLine);
-}
-
-function unwrapMcpToolResult(envelope: unknown): unknown {
-  if (!isRecord(envelope)) {
-    return envelope;
-  }
-
-  if (isRecord(envelope.error)) {
+  if (Object.prototype.hasOwnProperty.call(envelope, "error")) {
     throw new GithubMcpError("GitHub MCP returned a tool error.");
-  }
-
-  if (!Object.prototype.hasOwnProperty.call(envelope, "result")) {
-    return envelope;
   }
 
   const result = envelope.result;
-  if (!isRecord(result)) {
-    return result;
-  }
-
-  if (result.isError === true) {
+  if (!isRecord(result) || result.isError === true) {
     throw new GithubMcpError("GitHub MCP returned a tool error.");
   }
 
-  if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
-    return result.structuredContent;
-  }
-
-  if (Array.isArray(result.content)) {
-    const textContent = result.content.find(
-      (item): item is Record<string, unknown> =>
-        isRecord(item) && item.type === "text" && typeof item.text === "string",
+  if (!Array.isArray(result.content) || result.content.length !== 1) {
+    throw new GithubMcpError(
+      "GitHub MCP result must contain exactly one text item.",
     );
-
-    if (textContent !== undefined) {
-      return parseMcpResponse(textContent.text as string);
-    }
   }
 
-  return result;
+  const item = result.content[0];
+  if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") {
+    throw new GithubMcpError("GitHub MCP result text item is invalid.");
+  }
+
+  return parseProvenDeliveryJson(item.text);
+}
+
+function parseTransportResponse(response: Response, text: string): unknown {
+  const mediaType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+
+  if (mediaType === "application/json") {
+    return parseJsonRpcEnvelope(text.trim());
+  }
+
+  if (mediaType === "text/event-stream") {
+    const normalized = text.replace(/\r\n/g, "\n");
+    const match = normalized.match(/^event: message\ndata: ([^\n]+)\n\n$/);
+    if (match === null) {
+      throw new GithubMcpError(
+        "GitHub MCP event stream does not match the proven bridge format.",
+      );
+    }
+    return parseJsonRpcEnvelope(match[1]);
+  }
+
+  throw new GithubMcpError("GitHub MCP returned an unsupported media type.");
 }
 
 async function readChunkWithAbort(
@@ -335,7 +355,7 @@ export function createGithubMcpToolCaller(options: {
         );
       }
 
-      return unwrapMcpToolResult(parseMcpResponse(responseText));
+      return parseTransportResponse(response, responseText);
     } finally {
       clearTimeout(timeout);
     }

@@ -92,11 +92,15 @@ describe("GitHub provider evidence normalizer", () => {
     const secondLookup = { ...lookup, deliveryId: "456" };
     const first = normalize(makeResult({ id: "123", guid: "abc", request: {
       headers: { "x-github-delivery": "abc" },
-      payload: { repository: { full_name: lookup.repositoryId } },
+      payload: {
+        repository: { id: 1345932290, full_name: lookup.repositoryId },
+      },
     } }), firstLookup);
     const second = normalize(makeResult({ id: "456", guid: "abc", request: {
       headers: { "X-GITHUB-DELIVERY": "abc" },
-      payload: { repository: { full_name: lookup.repositoryId } },
+      payload: {
+        repository: { id: 1345932290, full_name: lookup.repositoryId },
+      },
     } }), secondLookup);
 
     expect([first.providerDeliveryId, second.providerDeliveryId]).toEqual(["123", "456"]);
@@ -115,7 +119,9 @@ describe("GitHub provider evidence normalizer", () => {
     const body = (result.full as { body: Record<string, unknown> }).body;
     body.request = {
       headers: { "x-GITHUB-delivery": "guid-001" },
-      payload: { repository: { full_name: lookup.repositoryId } },
+      payload: {
+        repository: { id: 1345932290, full_name: lookup.repositoryId },
+      },
     };
 
     expect(normalize(result).deliveryGuid).toBe("guid-001");
@@ -144,9 +150,26 @@ describe("GitHub provider evidence normalizer", () => {
       repositoryFullName: lookup.repositoryId,
       request: {
         headers: { "X-GitHub-Delivery": "guid-001" },
-        payload: { repository: { full_name: "other/receiver" } },
+        payload: {
+          repository: { id: 1345932290, full_name: "other/receiver" },
+        },
       },
     }))).toThrow("does not match the incident repository ID");
+  });
+
+  it("rejects unproved delivery response aliases and wrapper status", () => {
+    const aliasedResponse = makeResult({
+      response: { headers: {}, body: "receiver failed" },
+    });
+    expect(() => normalize(aliasedResponse)).toThrow(
+      "response payload is required",
+    );
+
+    const badWrapper = makeResult();
+    (badWrapper.full as Record<string, unknown>).http_status = 201;
+    expect(() => normalize(badWrapper)).toThrow(
+      "full.http_status must be 200",
+    );
   });
 
   it("revalidates GUID/header agreement in normalized stored JSON", () => {

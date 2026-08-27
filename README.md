@@ -136,7 +136,9 @@ the configured repository evidence contradict each other.
 snapshot and returns `{ "evidence": null }` before capture. `POST` performs the
 bounded read-only MCP inspection. The first normalized snapshot is immutable;
 later capture requests return it without contacting GitHub again. MCP reads
-time out after 12 seconds and reject responses larger than 1 MiB.
+time out after 12 seconds and reject transport responses larger than 64 MiB.
+GitHub caps webhook payloads at 25 MB; the higher transport limit allows for
+the proven bridge's escaped JSON-RPC text envelope while remaining bounded.
 
 The stored `canonicalPayloadSha256` is SHA-256 of Redrive's canonical JSON
 representation of the provider-returned payload. It is not a hash of the

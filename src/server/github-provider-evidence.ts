@@ -147,97 +147,21 @@ function assertGuidHeader(
   return guid;
 }
 
-function addRepositoryCandidate(
-  candidates: string[],
+function readRepositoryIdentifier(
   value: unknown,
   field: string,
-): void {
-  if (typeof value === "string") {
-    if (value.length === 0) {
-      throw new GithubDeliveryNormalizationError(
-        `GitHub repository field ${field} must not be empty.`,
-      );
-    }
-
-    candidates.push(value);
-    return;
+): string {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
   }
 
-  if (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    Number.isFinite(value)
-  ) {
-    candidates.push(String(value));
-    return;
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return String(value);
   }
 
   throw new GithubDeliveryNormalizationError(
-    `GitHub repository field ${field} must be a string or safe integer.`,
+    `GitHub repository field ${field} must be a non-empty string or safe integer.`,
   );
-}
-
-interface RepositoryIdentityCandidates {
-  ids: string[];
-  names: string[];
-}
-
-function collectRepositoryCandidates(
-  body: Record<string, unknown>,
-  payload: unknown,
-): RepositoryIdentityCandidates {
-  const candidates: RepositoryIdentityCandidates = { ids: [], names: [] };
-
-  for (const field of ["repositoryId", "repository_id"] as const) {
-    if (Object.prototype.hasOwnProperty.call(body, field)) {
-      addRepositoryCandidate(candidates.ids, body[field], field);
-    }
-  }
-
-  for (const field of ["repositoryFullName", "repository_full_name"] as const) {
-    if (Object.prototype.hasOwnProperty.call(body, field)) {
-      addRepositoryCandidate(candidates.names, body[field], field);
-    }
-  }
-
-  if (
-    isRecord(payload) &&
-    Object.prototype.hasOwnProperty.call(payload, "repository")
-  ) {
-    const repository = payload.repository;
-    if (typeof repository === "string") {
-      addRepositoryCandidate(
-        candidates.names,
-        repository,
-        "request.payload.repository",
-      );
-    } else {
-      const repositoryRecord = requireRecord(
-        repository,
-        "request.payload.repository",
-      );
-
-      for (const field of ["full_name", "fullName"] as const) {
-        if (Object.prototype.hasOwnProperty.call(repositoryRecord, field)) {
-          addRepositoryCandidate(
-            candidates.names,
-            repositoryRecord[field],
-            `request.payload.repository.${field}`,
-          );
-        }
-      }
-
-      if (Object.prototype.hasOwnProperty.call(repositoryRecord, "id")) {
-        addRepositoryCandidate(
-          candidates.ids,
-          repositoryRecord.id,
-          "request.payload.repository.id",
-        );
-      }
-    }
-  }
-
-  return candidates;
 }
 
 function assertMatchingRepositoryId(
@@ -245,15 +169,31 @@ function assertMatchingRepositoryId(
   payload: unknown,
   requestedRepositoryId: string,
 ): void {
-  const candidates = collectRepositoryCandidates(body, payload);
-  const idValues = new Set(candidates.ids);
-  const nameValues = new Set(candidates.names);
-  const hasContradiction = idValues.size > 1 || nameValues.size > 1;
-  const hasCandidates = idValues.size > 0 || nameValues.size > 0;
-  const hasMatch =
-    idValues.has(requestedRepositoryId) || nameValues.has(requestedRepositoryId);
+  if (!Object.prototype.hasOwnProperty.call(body, "repository_id")) {
+    throw new GithubDeliveryNormalizationError(
+      "GitHub delivery field repository_id is required.",
+    );
+  }
+  const bodyRepositoryId = readRepositoryIdentifier(
+    body.repository_id,
+    "repository_id",
+  );
+  const payloadRecord = requireRecord(payload, "request.payload");
+  const repository = requireRecord(
+    payloadRecord.repository,
+    "request.payload.repository",
+  );
+  const payloadRepositoryId = readRepositoryIdentifier(
+    repository.id,
+    "request.payload.repository.id",
+  );
+  const repositoryFullName = requireNonEmptyString(repository, "full_name");
 
-  if (hasContradiction || (hasCandidates && !hasMatch)) {
+  if (
+    bodyRepositoryId !== payloadRepositoryId ||
+    (requestedRepositoryId !== bodyRepositoryId &&
+      requestedRepositoryId !== repositoryFullName)
+  ) {
     throw new GithubDeliveryNormalizationError(
       "GitHub repository identity does not match the incident repository ID.",
     );
@@ -261,22 +201,13 @@ function assertMatchingRepositoryId(
 }
 
 function readResponseBody(response: Record<string, unknown>): string | null {
-  const hasPayload = Object.prototype.hasOwnProperty.call(response, "payload");
-  const hasBody = Object.prototype.hasOwnProperty.call(response, "body");
-
-  if (!hasPayload && !hasBody) {
+  if (!Object.prototype.hasOwnProperty.call(response, "payload")) {
     throw new GithubDeliveryNormalizationError(
-      "GitHub delivery response body is required.",
+      "GitHub delivery response payload is required.",
     );
   }
 
-  if (hasPayload && hasBody && response.payload !== response.body) {
-    throw new GithubDeliveryNormalizationError(
-      "GitHub delivery response has conflicting body fields.",
-    );
-  }
-
-  const value = hasPayload ? response.payload : response.body;
+  const value = response.payload;
   if (value !== null && typeof value !== "string") {
     throw new GithubDeliveryNormalizationError(
       "GitHub delivery response payload must be a string or null.",
@@ -289,6 +220,11 @@ function readResponseBody(response: Record<string, unknown>): string | null {
 function readDeliveryBody(result: unknown): Record<string, unknown> {
   const root = requireRecord(result, "root");
   const full = requireRecord(root.full, "full");
+  if (full.http_status !== 200) {
+    throw new GithubDeliveryNormalizationError(
+      "GitHub delivery field full.http_status must be 200.",
+    );
+  }
   return requireRecord(full.body, "full.body");
 }
 

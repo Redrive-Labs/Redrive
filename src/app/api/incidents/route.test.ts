@@ -442,8 +442,9 @@ describe("incident route", () => {
     process.env.REDRIVE_GITHUB_HOOK_ID = "670245925";
     const providerDeliveryId = "900719925474099312345678901234567890";
     const deliveryGuid = "guid-route-001";
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    const toolResult = {
       full: {
+        http_status: 200,
         body: {
           id: providerDeliveryId,
           guid: deliveryGuid,
@@ -452,14 +453,30 @@ describe("incident route", () => {
           status_code: 500,
           delivered_at: "2026-08-25T09:56:40.78Z",
           redelivery: false,
+          repository_id: 1345932290,
           request: {
             headers: { "X-GitHub-Delivery": deliveryGuid },
-            payload: { repository: { full_name: "example/receiver" } },
+            payload: {
+              repository: {
+                id: 1345932290,
+                full_name: "example/receiver",
+              },
+            },
           },
           response: { headers: {}, payload: "receiver failed" },
         },
       },
-    }), { status: 200 })));
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      id: "call-route-1",
+      result: {
+        content: [{ type: "text", text: JSON.stringify(toolResult) }],
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })));
 
     const createResponse = await POST(new Request("http://localhost/api/incidents", {
       method: "POST",
