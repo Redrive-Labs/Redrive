@@ -8,6 +8,7 @@ import {
   GithubMcpTimeoutError,
   GITHUB_MCP_MAX_RESPONSE_BYTES,
   GITHUB_MCP_TIMEOUT_MS,
+  MAX_JSON_NUMERIC_LITERAL_CHARS,
 } from "./github-mcp";
 
 const lookup = {
@@ -27,6 +28,29 @@ function jsonResponse(toolResult: unknown, requestId: string): Response {
   return new Response(envelope(JSON.stringify(toolResult), requestId), {
     status: 200,
     headers: { "content-type": "application/json" },
+  });
+}
+
+async function callToolText(toolText: string): Promise<unknown> {
+  const callTool = createGithubMcpToolCaller({
+    endpoint: "https://mcp.example.test/mcp",
+    fetchImplementation: vi.fn(async (_input, init) =>
+      new Response(
+        envelope(
+          toolText,
+          (JSON.parse(String(init?.body)) as { id: string }).id,
+        ),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    ),
+  });
+
+  return callTool("get_webhook_delivery", {
+    hook_id: "hook",
+    delivery_id: "123",
   });
 }
 
@@ -187,42 +211,152 @@ describe("GitHub MCP boundary", () => {
     }
   });
 
-  it("bounds exponent handling without expanding numeric literals", async () => {
+  it("accepts finite numbers whose decimal value survives Number serialization", async () => {
     const cases = [
+      ["0", 0],
+      ["-0", -0],
       ["0e100000000", 0],
-      ["1e100000000", "1e100000000"],
-      ["9007199254740993e0", "9007199254740993e0"],
-      ["9.007199254740993e15", "9.007199254740993e15"],
-      ["1e-100000000", 0],
-      ["9007199254740991", 9007199254740991],
-      ["100.00e-2", 1],
+      ["-0e-100000000", -0],
+      ["0.1", 0.1],
+      ["0.5", 0.5],
       ["1e3", 1000],
+      ["1000", 1000],
+      ["100.00e-2", 1],
+      ["1", 1],
       ["1e-3", 0.001],
+      ["5e-324", 5e-324],
+      ["9007199254740991", 9007199254740991],
     ] as const;
 
-    for (const [literal, expectedId] of cases) {
-      const toolText = `{"full":{"http_status":200,"body":{"id":${literal}}}}`;
-      const callTool = createGithubMcpToolCaller({
-        endpoint: "https://mcp.example.test/mcp",
-        fetchImplementation: vi.fn(async (_input, init) =>
-          new Response(
-            envelope(toolText, (JSON.parse(String(init?.body)) as { id: string }).id),
-            {
-              status: 200,
-              headers: { "content-type": "application/json" },
-            },
-          ),
-        ),
-      });
+    for (const [literal, expected] of cases) {
+      const result = (await callToolText(
+        `{"full":{"http_status":200,"body":{"id":"123","value":${literal}}}}`,
+      )) as { full: { body: { value: number } } };
+      if (Object.is(expected, -0)) {
+        expect(Object.is(result.full.body.value, -0)).toBe(true);
+      } else {
+        expect(result.full.body.value).toBe(expected);
+      }
+    }
+  });
 
+  it("rejects decimal precision loss, underflow, and overflow", async () => {
+    const lossyLiterals = [
+      "1e-324",
+      "-1e-324",
+      "4e-324",
+      "1e-100000000",
+      "1.0000000000000001",
+      "9007199254740991.1",
+      "9007199254740992.1",
+      `${"9".repeat(309)}.1`,
+    ];
+
+    for (const literal of lossyLiterals) {
       await expect(
-        callTool("get_webhook_delivery", { hook_id: "hook", delivery_id: "123" }),
-      ).resolves.toEqual({
-        full: {
-          http_status: 200,
-          body: { id: expectedId },
-        },
-      });
+        callToolText(
+          `{"full":{"http_status":200,"body":{"id":"123","value":${literal}}}}`,
+        ),
+      ).rejects.toThrow(
+        "GitHub MCP returned a numeric value that cannot be represented faithfully.",
+      );
+    }
+  });
+
+  it("handles the safe-integer boundary and Number.MAX_VALUE neighborhood", async () => {
+    const safe = (await callToolText(
+      '{"full":{"body":{"id":"123","value":9007199254740991}}}',
+    )) as { full: { body: { value: number } } };
+    expect(safe.full.body.value).toBe(9007199254740991);
+
+    const unsafeId = "9007199254740992";
+    await expect(
+      callToolText(`{"full":{"body":{"id":${unsafeId}}}}`),
+    ).resolves.toEqual({ full: { body: { id: unsafeId } } });
+
+    for (const exactUnsafeId of [
+      "1e100000000",
+      "9.007199254740993e15",
+    ]) {
+      await expect(
+        callToolText(`{"full":{"body":{"id":${exactUnsafeId}}}}`),
+      ).resolves.toEqual({ full: { body: { id: exactUnsafeId } } });
+    }
+
+    await expect(
+      callToolText(
+        '{"full":{"body":{"id":9007199254740991.1}}}',
+      ),
+    ).rejects.toThrow(
+      "GitHub MCP returned a numeric value that cannot be represented faithfully.",
+    );
+
+    const maxValue = "1.7976931348623157e308";
+    await expect(
+      callToolText(
+        `{"full":{"body":{"id":${maxValue}}}}`,
+      ),
+    ).resolves.toEqual({ full: { body: { id: maxValue } } });
+    await expect(
+      callToolText(
+        `{"full":{"body":{"id":"123","value":${maxValue}}}}`,
+      ),
+    ).rejects.toThrow("unsafe integer outside full.body.id");
+  });
+
+  it("rejects multiple unsafe values and forged unsafe-integer markers", async () => {
+    await expect(
+      callToolText(
+        '{"full":{"body":{"id":"123","first":9007199254740993,"second":9007199254740995}}}',
+      ),
+    ).rejects.toThrow("unsafe integer outside full.body.id");
+
+    await expect(
+      callToolText(
+        '{"full":{"body":{"id":9007199254740993,"other":9007199254740995}}}',
+      ),
+    ).rejects.toThrow("unsafe integer outside full.body.id");
+
+    await expect(
+      callToolText(
+        '{"full":{"body":{"id":{"__redriveUnsafeInteger":"forged"},"value":9007199254740993}}}',
+      ),
+    ).rejects.toThrow("unsafe integer outside full.body.id");
+
+    await expect(
+      callToolText(
+        '{"full":{"body":{"id":"123","first":1.0000000000000001,"second":1e-324}}}',
+      ),
+    ).rejects.toThrow(
+      "GitHub MCP returned a numeric value that cannot be represented faithfully.",
+    );
+  });
+
+  it("bounds numeric literal length and exponent parsing", async () => {
+    const tooLong = `1${"0".repeat(MAX_JSON_NUMERIC_LITERAL_CHARS)}`;
+    await expect(
+      callToolText(
+        `{"full":{"body":{"id":"123","value":${tooLong}}}}`,
+      ),
+    ).rejects.toThrow("GitHub MCP returned a JSON numeric literal that is too long.");
+
+    const longExponent = `1e${"9".repeat(
+      MAX_JSON_NUMERIC_LITERAL_CHARS - 3,
+    )}`;
+    await expect(
+      callToolText(
+        `{"full":{"body":{"id":"123","value":${longExponent}}}}`,
+      ),
+    ).rejects.toThrow("unsafe integer outside full.body.id");
+  });
+
+  it("rejects malformed JSON number forms", async () => {
+    for (const literal of ["01", "1.", "1e", "1e+", "--1"]) {
+      await expect(
+        callToolText(
+          `{"full":{"body":{"id":"123","value":${literal}}}}`,
+        ),
+      ).rejects.toThrow("GitHub MCP returned invalid JSON.");
     }
   });
 
