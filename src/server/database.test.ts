@@ -71,10 +71,67 @@ const concurrentWriterSource = `
   }
 `;
 
+const concurrentDuplicateWriterSource = `
+  const { parentPort, workerData } = require("node:worker_threads");
+  const Database = require("better-sqlite3");
+
+  let database;
+
+  try {
+    database = new Database(workerData.databasePath, { timeout: 5000 });
+    const result = database.prepare(\`
+      INSERT INTO incidents (
+        id,
+        provider,
+        external_delivery_id,
+        repository_id,
+        status,
+        created_at,
+        updated_at
+      ) VALUES (
+        @id,
+        @provider,
+        @externalDeliveryId,
+        @repositoryId,
+        @status,
+        @createdAt,
+        @updatedAt
+      )
+      ON CONFLICT (provider, repository_id, external_delivery_id) DO NOTHING
+    \`).run(workerData);
+    const row = database.prepare(\`
+      SELECT id
+      FROM incidents
+      WHERE provider = @provider
+        AND repository_id = @repositoryId
+        AND external_delivery_id = @externalDeliveryId
+    \`).get(workerData);
+
+    parentPort.postMessage({
+      ok: row !== undefined,
+      changes: result.changes,
+      id: row?.id,
+    });
+  } catch (error) {
+    parentPort.postMessage({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      code: error && typeof error === "object" && "code" in error
+        ? error.code
+        : undefined,
+    });
+  } finally {
+    if (database?.open) {
+      database.close();
+    }
+  }
+`;
+
 interface ConcurrentWriterResult {
   ok: boolean;
   changes?: number;
   externalDeliveryId?: string;
+  id?: string;
   error?: string;
   code?: string;
 }
@@ -112,6 +169,37 @@ function runConcurrentWriter(
     worker.once("exit", (code) => {
       if (code !== 0) {
         reject(new Error(`Concurrent writer exited with code ${code}.`));
+      }
+    });
+  });
+}
+
+function runConcurrentDuplicateWriter(
+  databasePath: string,
+  index: number,
+): Promise<ConcurrentWriterResult> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(concurrentDuplicateWriterSource, {
+      eval: true,
+      workerData: {
+        databasePath,
+        id: `duplicate-incident-${index}`,
+        provider: "concurrency-test",
+        externalDeliveryId: "concurrent-shared-delivery",
+        repositoryId: "test/receiver",
+        status: "OPEN",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    worker.once("message", (message: ConcurrentWriterResult) => {
+      resolve(message);
+    });
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Concurrent duplicate writer exited with code ${code}.`));
       }
     });
   });
@@ -273,6 +361,52 @@ describe("native SQLite persistence", () => {
     ).toBe(0);
   });
 
+  it("fails closed without deleting duplicate legacy incidents", () => {
+    database.exec("DROP INDEX incidents_delivery_identity_idx");
+    database.run("DELETE FROM schema_migrations WHERE version = ?", [2]);
+
+    for (const id of ["legacy-incident-a", "legacy-incident-b"]) {
+      database.run(
+        `
+          INSERT INTO incidents (
+            id,
+            provider,
+            external_delivery_id,
+            repository_id,
+            status,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          id,
+          "github",
+          "legacy-duplicate-delivery",
+          "example/receiver",
+          "OPEN",
+          "2025-01-01T00:00:00.000Z",
+          "2025-01-01T00:00:00.000Z",
+        ],
+      );
+    }
+
+    expect(() => openDatabase(databasePath)).toThrow();
+    expect(
+      database.all<{ id: string }>(
+        "SELECT id FROM incidents ORDER BY id",
+      ),
+    ).toEqual([
+      { id: "legacy-incident-a" },
+      { id: "legacy-incident-b" },
+    ]);
+    expect(
+      database.get<{ version: number }>(
+        "SELECT version FROM schema_migrations WHERE version = ?",
+        [2],
+      ),
+    ).toBeUndefined();
+  });
+
   it("is safe to reopen an already-migrated database", () => {
     database.close();
     database = openDatabase(databasePath);
@@ -282,7 +416,7 @@ describe("native SQLite persistence", () => {
       database.all<{ version: number }>(
         "SELECT version FROM schema_migrations ORDER BY version",
       ),
-    ).toEqual([{ version: 1 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }]);
     expect(
       database.get<{ count: number }>(
         "SELECT COUNT(*) AS count FROM incidents",
@@ -327,7 +461,7 @@ describe("native SQLite persistence", () => {
       results.map((result) => JSON.parse(result.stdout)),
     ).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1],
+        migrationVersions: [1, 2],
         incidentCount: 0,
       })),
     );
@@ -338,7 +472,7 @@ describe("native SQLite persistence", () => {
         verificationDatabase.all<{ version: number }>(
           "SELECT version FROM schema_migrations ORDER BY version",
         ),
-      ).toEqual([{ version: 1 }]);
+      ).toEqual([{ version: 1 }, { version: 2 }]);
       expect(
         verificationDatabase.get<{ count: number }>(
           "SELECT COUNT(*) AS count FROM incidents",
@@ -347,6 +481,43 @@ describe("native SQLite persistence", () => {
     } finally {
       verificationDatabase.close();
     }
+  });
+
+  it("converges concurrent duplicate writers from independent connections", async () => {
+    const writerCount = 10;
+    const results = await Promise.all(
+      Array.from({ length: writerCount }, (_, index) =>
+        runConcurrentDuplicateWriter(databasePath, index),
+      ),
+    );
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(results.filter((result) => result.changes === 1)).toHaveLength(1);
+    expect(
+      results.every(
+        (result) => result.changes === 0 || result.changes === 1,
+      ),
+    ).toBe(true);
+
+    const ids = results.map((result) => result.id);
+    expect(new Set(ids).size).toBe(1);
+    expect(ids[0]).toEqual(expect.any(String));
+    expect(
+      database.get<{ count: number }>(
+        `
+          SELECT COUNT(*) AS count
+          FROM incidents
+          WHERE provider = ?
+            AND repository_id = ?
+            AND external_delivery_id = ?
+        `,
+        [
+          "concurrency-test",
+          "test/receiver",
+          "concurrent-shared-delivery",
+        ],
+      )?.count,
+    ).toBe(1);
   });
 
   it("preserves all writes from concurrent native SQLite writers", async () => {

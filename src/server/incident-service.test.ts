@@ -51,7 +51,7 @@ describe("incident persistence", () => {
       provider: "development",
       externalDeliveryId: "delivery-001",
       repositoryId: "example/receiver",
-    });
+    }).incident;
 
     expect(incident).toMatchObject({
       provider: "development",
@@ -64,12 +64,59 @@ describe("incident persistence", () => {
     expect(service.list()).toContainEqual(incident);
   });
 
+  it("converges sequential duplicate creation on the existing incident", () => {
+    const input = {
+      provider: "github",
+      externalDeliveryId: "delivery-duplicate",
+      repositoryId: "example/receiver",
+    };
+
+    const first = service.create(input);
+    const duplicate = service.create(input);
+
+    expect(first.created).toBe(true);
+    expect(duplicate).toEqual({
+      incident: first.incident,
+      created: false,
+    });
+    expect(service.list()).toHaveLength(1);
+  });
+
+  it("allows the same delivery id for a different provider or repository", () => {
+    const externalDeliveryId = "delivery-shared-id";
+    const first = service.create({
+      provider: "github",
+      externalDeliveryId,
+      repositoryId: "example/receiver",
+    });
+    const second = service.create({
+      provider: "gitlab",
+      externalDeliveryId,
+      repositoryId: "example/receiver",
+    });
+    const third = service.create({
+      provider: "github",
+      externalDeliveryId,
+      repositoryId: "other/receiver",
+    });
+
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(true);
+    expect(third.created).toBe(true);
+    expect(new Set([
+      first.incident.id,
+      second.incident.id,
+      third.incident.id,
+    ]).size).toBe(3);
+    expect(service.list()).toHaveLength(3);
+  });
+
   it("retrieves the stored values by incident id", () => {
     const created = service.create({
       provider: "local",
       externalDeliveryId: "retrieval-check",
       repositoryId: "sample/consumer",
-    });
+    }).incident;
 
     expect(service.getById(created.id)).toEqual(created);
     expect(service.getById("missing-incident")).toBeNull();
@@ -82,7 +129,7 @@ describe("incident persistence", () => {
       provider: "opaque-provider",
       externalDeliveryId,
       repositoryId: "sample/consumer",
-    });
+    }).incident;
 
     expect(service.getById(created.id)?.externalDeliveryId).toBe(
       externalDeliveryId,
@@ -96,7 +143,7 @@ describe("incident persistence", () => {
       provider: "github",
       externalDeliveryId,
       repositoryId: "Redrive-Labs/redrive-demo-receiver",
-    });
+    }).incident;
 
     expect(service.getById(created.id)?.externalDeliveryId).toBe(
       externalDeliveryId,
@@ -177,7 +224,7 @@ describe("incident persistence", () => {
       provider: "development",
       externalDeliveryId: "survives-reconnect",
       repositoryId: "sample/consumer",
-    });
+    }).incident;
 
     database.close();
     database = await openDatabase(databasePath);

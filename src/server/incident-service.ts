@@ -12,6 +12,11 @@ import { getServerConfig } from "@/server/config";
 
 export const INCIDENT_LIST_LIMIT = 50;
 
+export interface IncidentCreationResult {
+  incident: Incident;
+  created: boolean;
+}
+
 const incidentColumns = `
   id,
   provider,
@@ -69,11 +74,19 @@ export function createIncidentService(database: SqliteDatabase) {
       @createdAt,
       @updatedAt
     )
+    ON CONFLICT (provider, repository_id, external_delivery_id) DO NOTHING
   `;
   const getIncident = `
     SELECT ${incidentColumns}
     FROM incidents
     WHERE id = ?
+  `;
+  const getIncidentByIdentity = `
+    SELECT ${incidentColumns}
+    FROM incidents
+    WHERE provider = ?
+      AND repository_id = ?
+      AND external_delivery_id = ?
   `;
   const listIncidentRows = `
     SELECT ${incidentColumns}
@@ -88,12 +101,12 @@ export function createIncidentService(database: SqliteDatabase) {
   }
 
   return {
-    create(input: unknown): Incident {
+    create(input: unknown): IncidentCreationResult {
       const values = parseCreateIncidentInput(input);
       const now = new Date().toISOString();
       const id = randomUUID();
 
-      database.run(
+      const insertion = database.run(
         insertIncident,
         {
           id,
@@ -106,13 +119,20 @@ export function createIncidentService(database: SqliteDatabase) {
         },
       );
 
-      const incident = getById(id);
+      const row = database.get<Record<string, unknown>>(
+        getIncidentByIdentity,
+        [values.provider, values.repositoryId, values.externalDeliveryId],
+      );
+      const incident = row === undefined ? null : mapIncidentRow(row);
 
       if (incident === null) {
-        throw new Error("Created incident could not be read back.");
+        throw new Error("Created or existing incident could not be read back.");
       }
 
-      return incident;
+      return {
+        incident,
+        created: insertion.changes === 1,
+      };
     },
     getById,
     list(): Incident[] {
@@ -132,7 +152,9 @@ async function withConfiguredService<T>(
   return operation(createIncidentService(database));
 }
 
-export async function createIncident(input: unknown): Promise<Incident> {
+export async function createIncident(
+  input: unknown,
+): Promise<IncidentCreationResult> {
   return withConfiguredService((service) => service.create(input));
 }
 

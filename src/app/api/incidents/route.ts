@@ -17,6 +17,25 @@ class RequestBodyTooLargeError extends Error {
   }
 }
 
+class MalformedUtf8Error extends Error {
+  constructor() {
+    super("Request body contains malformed UTF-8.");
+    this.name = "MalformedUtf8Error";
+  }
+}
+
+function decodeStrictUtf8(requestBody: Uint8Array): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(requestBody);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new MalformedUtf8Error();
+    }
+
+    throw error;
+  }
+}
+
 async function readBoundedRequestBody(
   request: Request,
 ): Promise<Uint8Array> {
@@ -82,6 +101,13 @@ function requestBodyTooLargeResponse(): Response {
   );
 }
 
+function invalidRequestBodyResponse(): Response {
+  return NextResponse.json(
+    { error: "Request body must be valid JSON or form data." },
+    { status: 400 },
+  );
+}
+
 export async function GET(): Promise<Response> {
   try {
     return NextResponse.json({ incidents: await listIncidents() });
@@ -110,46 +136,86 @@ export async function POST(request: Request): Promise<Response> {
       return requestBodyTooLargeResponse();
     }
 
+    console.error("Unable to read incident request body.", error);
     return NextResponse.json(
-      { error: "Request body must be valid JSON or form data." },
-      { status: 400 },
+      { error: "Unable to read incident request body." },
+      { status: 500 },
     );
   }
 
+  let decodedRequestBody: string;
+
   try {
-    if (isFormEncoded) {
-      const parseHeaders = new Headers(request.headers);
-      parseHeaders.delete("content-length");
-      const parseRequest = new Request(request.url, {
-        body: Buffer.from(requestBody) as unknown as BodyInit,
-        headers: parseHeaders,
-        method: request.method,
-      });
-      const formData = await parseRequest.formData();
-      isNativeFormSubmission = true;
-      input = {
-        provider: formData.get("provider"),
-        externalDeliveryId: formData.get("externalDeliveryId"),
-        repositoryId: formData.get("repositoryId"),
-      };
-    } else {
-      input = JSON.parse(new TextDecoder().decode(requestBody));
+    decodedRequestBody = decodeStrictUtf8(requestBody);
+  } catch (error) {
+    if (error instanceof MalformedUtf8Error) {
+      return invalidRequestBodyResponse();
     }
-  } catch {
+
+    console.error("Unable to decode incident request body.", error);
     return NextResponse.json(
-      { error: "Request body must be valid JSON or form data." },
-      { status: 400 },
+      { error: "Unable to decode incident request body." },
+      { status: 500 },
     );
   }
 
+  if (isFormEncoded) {
+    const parseHeaders = new Headers(request.headers);
+    parseHeaders.delete("content-length");
+    const parseRequest = new Request(request.url, {
+      body: Buffer.from(requestBody) as unknown as BodyInit,
+      headers: parseHeaders,
+      method: request.method,
+    });
+    let formData: FormData;
+
+    try {
+      formData = await parseRequest.formData();
+    } catch (error) {
+      if (error instanceof TypeError || error instanceof SyntaxError) {
+        return invalidRequestBodyResponse();
+      }
+
+      console.error("Unable to parse incident request body.", error);
+      return NextResponse.json(
+        { error: "Unable to parse incident request body." },
+        { status: 500 },
+      );
+    }
+
+    isNativeFormSubmission = true;
+    input = {
+      provider: formData.get("provider"),
+      externalDeliveryId: formData.get("externalDeliveryId"),
+      repositoryId: formData.get("repositoryId"),
+    };
+  } else {
+    try {
+      input = JSON.parse(decodedRequestBody);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return invalidRequestBodyResponse();
+      }
+
+      console.error("Unable to parse incident request body.", error);
+      return NextResponse.json(
+        { error: "Unable to parse incident request body." },
+        { status: 500 },
+      );
+    }
+  }
+
   try {
-    const incident = await createIncident(input);
+    const creation = await createIncident(input);
 
     if (isNativeFormSubmission) {
       return NextResponse.redirect(new URL("/", request.url), 303);
     }
 
-    return NextResponse.json({ incident }, { status: 201 });
+    return NextResponse.json(
+      { incident: creation.incident },
+      { status: creation.created ? 201 : 200 },
+    );
   } catch (error) {
     if (error instanceof IncidentValidationError) {
       return NextResponse.json(

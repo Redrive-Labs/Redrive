@@ -33,6 +33,16 @@ const migrations: Migration[] = [
         ON incidents (created_at DESC, id DESC);
     `,
   },
+  {
+    version: 2,
+    // This fails atomically when a legacy database contains duplicate
+    // delivery identities. The migration transaction preserves those rows and
+    // leaves version 2 unapplied instead of silently choosing one incident.
+    sql: `
+      CREATE UNIQUE INDEX incidents_delivery_identity_idx
+        ON incidents (provider, repository_id, external_delivery_id);
+    `,
+  },
 ];
 
 export class SqliteDatabase {

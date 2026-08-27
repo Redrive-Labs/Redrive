@@ -67,6 +67,19 @@ describe("incident route", () => {
     expect(response.status).toBe(303);
     expect(response.headers.get("location")).toBe("http://localhost/");
 
+    const duplicateResponse = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: form,
+      }),
+    );
+
+    expect(duplicateResponse.status).toBe(303);
+    expect(duplicateResponse.headers.get("location")).toBe("http://localhost/");
+
     const database = await openDatabase(databasePath);
     try {
       const rows = database.all<{
@@ -122,29 +135,141 @@ describe("incident route", () => {
     }
   });
 
-  it("accepts JSON POST requests and returns the created incident", async () => {
+  it("returns 201 for first JSON creation and 200 for a duplicate", async () => {
+    const requestBody = JSON.stringify({
+      provider: "github",
+      externalDeliveryId: "json-delivery-001",
+      repositoryId: "example/receiver",
+    });
     const response = await POST(
       new Request("http://localhost/api/incidents", {
         method: "POST",
         headers: {
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          provider: "github",
-          externalDeliveryId: "json-delivery-001",
-          repositoryId: "example/receiver",
-        }),
+        body: requestBody,
       }),
     );
 
     expect(response.status).toBe(201);
-    await expect(response.json()).resolves.toMatchObject({
+    const firstResult = await response.json();
+    expect(firstResult).toMatchObject({
       incident: {
         provider: "github",
         externalDeliveryId: "json-delivery-001",
         repositoryId: "example/receiver",
         status: "OPEN",
       },
+    });
+
+    const duplicateResponse = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: requestBody,
+      }),
+    );
+
+    expect(duplicateResponse.status).toBe(200);
+    await expect(duplicateResponse.json()).resolves.toEqual(firstResult);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects malformed UTF-8 JSON before validation or persistence", async () => {
+    const malformedBody = Uint8Array.from([
+      0x7b, 0x22, 0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x72,
+      0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d,
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: malformedBody as unknown as BodyInit,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects malformed UTF-8 in URL-encoded forms", async () => {
+    const malformedBody = Uint8Array.from([
+      ...new TextEncoder().encode("provider=github&externalDeliveryId="),
+      0xc3,
+      0x28,
+      ...new TextEncoder().encode("&repositoryId=example%2Freceiver"),
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: malformedBody as unknown as BodyInit,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+
+    const database = await openDatabase(databasePath);
+    try {
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM incidents",
+        )?.count,
+      ).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("accepts Unicode input encoded as valid UTF-8", async () => {
+    const input = {
+      provider: "github-日本語",
+      externalDeliveryId: "配送-🚚-001",
+      repositoryId: "例/receiver",
+    };
+    const body = new TextEncoder().encode(JSON.stringify(input));
+
+    const response = await POST(
+      new Request("http://localhost/api/incidents", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: body as unknown as BodyInit,
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      incident: input,
     });
   });
 
