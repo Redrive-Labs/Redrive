@@ -173,7 +173,7 @@ export async function POST(request: Request): Promise<Response> {
   let input: unknown;
   let isNativeFormSubmission = false;
   const contentType = request.headers.get("content-type") ?? "";
-  const isUrlEncodedForm = contentType.startsWith(
+  const isUrlEncodedForm = contentType.toLowerCase().startsWith(
     "application/x-www-form-urlencoded",
   );
   const isUnsupportedMultipartForm = contentType.startsWith(
