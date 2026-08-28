@@ -9,13 +9,25 @@
                            ▼
                   Provider Investigator
                            │
-                           │ evidence
+                           │ provider evidence
                            ▼
                     Recovery Coordinator
                            ▲
-                           │ evidence
+                           │ receiver evidence
                            │
                   Receiver Investigator
+                           │
+                           │ Receiver Ops MCP
+                           ▼
+                  Receiver Connector
+                           │
+                    customer-approved
+                    operational evidence
+                           │
+                           ▼
+                    customer environment
+
+                    Recovery Coordinator
                            │
                            ▼
                 Reproduction Laboratory
@@ -68,6 +80,22 @@ External provider
       ▼
 TrueForge / Redrive control plane
       │
+      │ narrow authenticated MCP
+      ▼
+Receiver Connector
+      │
+      │ customer-approved credentials/capabilities
+      ▼
+Customer environment
+```
+
+The Receiver Connector may observe approved production evidence, but Redrive
+agents and Daytona do not receive its underlying database, log, deployment, or
+infrastructure credentials.
+
+```text
+TrueForge / Redrive control plane
+      │
       │ sandbox tool
       ▼
 Daytona
@@ -80,7 +108,7 @@ generated candidate
 
 verified candidate
       │
-      │ TrueForge approval
+      │ DeployPermit + TrueForge approval
       ▼
 production deployment
 
@@ -88,7 +116,7 @@ production deployment
 
 verified deployment
       │
-      │ second TrueForge approval
+      │ RedrivePermit + second TrueForge approval
       ▼
 provider redelivery
 ```
@@ -104,7 +132,7 @@ One recovery incident should correspond to one persistent TrueForge session.
 An incident contains references to:
 
 - provider delivery identity;
-- captured request;
+- captured provider request evidence;
 - provider response;
 - receiver repository;
 - failing revision;
@@ -113,7 +141,7 @@ An incident contains references to:
 - repair candidates;
 - verification results;
 - Fidelity Ledger;
-- approval state;
+- approval/permit state;
 - deployment state;
 - final verification.
 
@@ -132,8 +160,54 @@ redeliver_webhook_delivery(...)
 
 Provider identifiers are opaque strings.
 
-The redelivery operation is consequential and must be approval-gated through
-TrueForge.
+The redelivery operation is consequential and must be permit- and
+approval-gated through TrueForge.
+
+## Receiver Connector / Receiver Ops MCP
+
+Receiver-side production truth is obtained through a separately deployed,
+least-privilege Receiver Connector.
+
+The connector belongs to the Redrive integration surface. It is not embedded
+into the target application repository.
+
+Initial read-only capabilities are:
+
+```text
+get_receiver_health()
+get_deployed_revision()
+get_business_state(delivery_guid)
+get_receiver_logs(delivery_guid)
+```
+
+The implementation behind those capabilities is customer-defined and
+source-enforced. For example, `get_business_state` may query a narrowly scoped
+database view/function, an internal API, or an audit ledger.
+
+The connector must not expose generic capabilities such as:
+
+```text
+sql_query(...)
+shell(...)
+ssh_exec(...)
+search_all_logs(...)
+```
+
+Its underlying credentials remain inside the customer environment and are not
+passed to Redrive agents, model context, generated sandbox code, or Daytona.
+
+If the customer has not exposed enough evidence to establish a causally
+required fact, Redrive records that fact as `UNRESOLVED` and blocks
+consequential recovery rather than escalating privileges or guessing.
+
+A later write capability may be added:
+
+```text
+deploy_candidate(...)
+```
+
+but it is consequential and must require a runtime-valid `DeployPermit` plus
+native TrueForge approval.
 
 ## Repository understanding
 
@@ -192,7 +266,7 @@ execute validated environment plan
     ↓
 start receiver + dependencies
     ↓
-replay captured request
+construct fidelity-accounted authenticated replay
 ```
 
 The target repository should not require Redrive-specific configuration for the
@@ -212,18 +286,27 @@ EXACT
 REAL_LOCAL
 REPOSITORY_FIXTURE
 RECORDED
+RECONSTRUCTED
+DERIVED
 UNRESOLVED
 ```
 
-The initial hero environment is expected to resemble:
+The hero environment is expected to resemble:
 
 ```text
-Application        EXACT
-Webhook request    EXACT
-PostgreSQL         REAL_LOCAL
-Initial DB state   REPOSITORY_FIXTURE
-External HTTP      RECORDED
+Application revision          EXACT
+Webhook semantic payload      EXACT
+Original signature header     RECORDED
+Original raw request body     unavailable
+Sandbox request body          RECONSTRUCTED
+Sandbox signature             DERIVED
+PostgreSQL                     REAL_LOCAL
+Initial DB state               REPOSITORY_FIXTURE
+Controlled downstream HTTP     REAL_LOCAL
 ```
+
+The original GitHub signature is evidence about the original request. It must
+not be assumed to authenticate a reserialized sandbox request body.
 
 A required causal dependency that remains `UNRESOLVED` blocks consequential
 recovery.
@@ -235,7 +318,7 @@ recovery.
 Responsible for:
 
 - delivery identity;
-- provider request;
+- provider request evidence;
 - provider response;
 - provider failure state;
 - redelivery semantics.
@@ -246,10 +329,14 @@ Responsible for:
 
 - failing revision;
 - relevant source;
-- logs;
-- database/business state;
+- receiver-scoped logs;
+- approved business-state evidence;
 - side effects;
 - idempotency behavior.
+
+Receiver production evidence is obtained through the Receiver Connector. The
+investigator does not receive arbitrary database, shell, or infrastructure
+access.
 
 ### Recovery Coordinator
 
@@ -290,11 +377,12 @@ The repair agent is not given a known fixed implementation.
 The minimum replay verification suite includes:
 
 ```text
-exact captured request
+fidelity-accounted authenticated replay
 sequential duplicate replay
 concurrent duplicate replay
 invalid signature
 business invariant
+required downstream causal-completion assertion
 ```
 
 The verifier should try to falsify safety.
@@ -310,12 +398,14 @@ It is part of authorization, not only UI metadata.
 Example:
 
 ```text
-Application       EXACT
-Webhook body      EXACT
-Webhook headers   EXACT
-PostgreSQL        REAL_LOCAL
-DB state          REPOSITORY_FIXTURE
-Notifier          RECORDED
+Application revision          EXACT
+Webhook semantic payload      EXACT
+Original signature header     RECORDED
+Sandbox body                   RECONSTRUCTED
+Sandbox signature              DERIVED
+PostgreSQL                     REAL_LOCAL
+DB state                       REPOSITORY_FIXTURE
+Downstream HTTP                REAL_LOCAL
 ```
 
 If a required causal dependency is:
@@ -333,10 +423,13 @@ There are two distinct action boundaries:
 1. deploy the verified candidate;
 2. redrive the original external delivery.
 
-Each requires its own TrueForge approval.
+Deployment requires a deterministic, state-bound `DeployPermit` plus its own
+TrueForge approval.
 
-Approvals should be tied to the exact recovery state rather than a vague
-incident intention.
+Redelivery requires a separate deterministic, state-bound `RedrivePermit` plus
+a second TrueForge approval.
+
+Relevant state drift invalidates the permit/approval and requires revalidation.
 
 ## Final verification
 
@@ -347,11 +440,9 @@ Final success requires:
 ```text
 provider redelivery succeeds
 AND
-business invariant succeeds
+business mutation count = exactly one
+AND
+required downstream operation succeeds
 ```
 
-For the hero incident:
-
-```text
-business mutation count for the provider delivery == 1
-```
+All final facts must refer to the same logical delivery identity.

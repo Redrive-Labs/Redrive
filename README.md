@@ -102,7 +102,7 @@ Active hackathon development.
 
 ## Run the control plane locally
 
-Requirements: Node.js 20.9 or newer and npm.
+Requirements: Node.js 22 or newer and npm.
 
 ```bash
 npm install
@@ -117,7 +117,10 @@ SQLite database. The database directory and schema are created automatically on
 first use.
 
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
-`REDRIVE_DATABASE_PATH`.
+`REDRIVE_DATABASE_PATH`. Set the required server-side
+`REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
+Redrive does not select or interpret a provider, and TrueForge credentials stay
+server-side.
 
 Provider inspection requires a bridge exposing the proven
 `get_webhook_delivery` MCP tool. Set `REDRIVE_GITHUB_MCP_URL`, then configure an

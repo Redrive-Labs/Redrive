@@ -12,8 +12,34 @@ const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 interface Migration {
   version: number;
-  sql: string;
+  sql?: string;
+  apply?: (database: SqliteDatabase) => void;
 }
+
+const trueforgeSessionBindingsTableSql = `
+  CREATE TABLE trueforge_session_bindings (
+    incident_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK (
+      state IN ('CREATING', 'CREATION_UNCERTAIN', 'ACTIVE', 'LOST')
+    ),
+    trueforge_session_id TEXT UNIQUE,
+    creation_token TEXT,
+    coordinator_spec_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (state = 'CREATING'
+        AND trueforge_session_id IS NULL
+        AND creation_token IS NOT NULL)
+      OR (state = 'CREATION_UNCERTAIN'
+        AND trueforge_session_id IS NULL)
+      OR (state IN ('ACTIVE', 'LOST')
+        AND trueforge_session_id IS NOT NULL
+        AND creation_token IS NULL)
+    ),
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+  );
+`;
 
 const migrations: Migration[] = [
   {
@@ -64,6 +90,17 @@ const migrations: Migration[] = [
       CREATE INDEX provider_evidence_delivery_idx
         ON provider_evidence (provider_delivery_id);
     `,
+  },
+  {
+    version: 4,
+    sql: trueforgeSessionBindingsTableSql,
+  },
+  {
+    version: 5,
+    // Version 4 was briefly shipped with a malformed table definition. Keep
+    // the recorded version intact and normalize that table in a forward,
+    // transactional migration instead of stranding those databases.
+    apply: repairTrueForgeSessionBindings,
   },
 ];
 
@@ -162,6 +199,94 @@ export class SqliteDatabase {
   }
 }
 
+const trueforgeSessionBindingColumns = [
+  "incident_id",
+  "state",
+  "trueforge_session_id",
+  "creation_token",
+  "coordinator_spec_version",
+  "created_at",
+  "updated_at",
+] as const;
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function hasTable(database: SqliteDatabase, tableName: string): boolean {
+  return (
+    database.get<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      [tableName],
+    ) !== undefined
+  );
+}
+
+function repairTrueForgeSessionBindings(database: SqliteDatabase): void {
+  const tableName = "trueforge_session_bindings";
+  if (!hasTable(database, tableName)) {
+    database.exec(trueforgeSessionBindingsTableSql);
+    return;
+  }
+
+  const legacyColumns = new Set(
+    database
+      .all<{ name: string }>(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`)
+      .map((column) => column.name.toLowerCase()),
+  );
+  const requiredLegacyColumns = [
+    "incident_id",
+    "state",
+    "created_at",
+    "updated_at",
+  ];
+  const missingColumns = requiredLegacyColumns.filter(
+    (column) => !legacyColumns.has(column),
+  );
+
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Cannot safely repair trueforge_session_bindings; missing columns: ${missingColumns.join(", ")}.`,
+    );
+  }
+
+  if (!legacyColumns.has("coordinator_spec_version")) {
+    const legacyRowCount = database.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM ${quoteSqlIdentifier(tableName)}`,
+    )?.count;
+
+    if (legacyRowCount !== 0) {
+      throw new Error(
+        "Cannot safely repair trueforge_session_bindings; coordinator_spec_version is missing from a nonempty legacy table.",
+      );
+    }
+  }
+
+  const legacyTableName = "trueforge_session_bindings_v4_legacy";
+  if (hasTable(database, legacyTableName)) {
+    throw new Error(
+      "Cannot safely repair trueforge_session_bindings; a legacy repair table already exists.",
+    );
+  }
+
+  database.exec(
+    `ALTER TABLE ${quoteSqlIdentifier(tableName)} RENAME TO ${quoteSqlIdentifier(legacyTableName)};`,
+  );
+  database.exec(trueforgeSessionBindingsTableSql);
+
+  const sourceExpressions = trueforgeSessionBindingColumns.map((column) =>
+    legacyColumns.has(column) ? quoteSqlIdentifier(column) : "NULL",
+  );
+  database.exec(`
+    INSERT INTO ${quoteSqlIdentifier(tableName)} (
+      ${trueforgeSessionBindingColumns.map(quoteSqlIdentifier).join(", ")}
+    )
+    SELECT ${sourceExpressions.join(", ")}
+    FROM ${quoteSqlIdentifier(legacyTableName)};
+  `);
+  database.exec(`DROP TABLE ${quoteSqlIdentifier(legacyTableName)};`);
+}
+
 export function initializeDatabase(database: SqliteDatabase): void {
   // BEGIN IMMEDIATE obtains SQLite's write reservation before any migration
   // state is read. Every opener therefore re-checks state after waiting for
@@ -184,7 +309,13 @@ export function initializeDatabase(database: SqliteDatabase): void {
         continue;
       }
 
-      database.exec(migration.sql);
+      if (migration.apply !== undefined) {
+        migration.apply(database);
+      } else if (migration.sql !== undefined) {
+        database.exec(migration.sql);
+      } else {
+        throw new Error(`Migration ${migration.version} has no operation.`);
+      }
       database.run(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
         [migration.version, new Date().toISOString()],
