@@ -111,6 +111,47 @@ function assertScalarDetails(details: IncidentWorkflowEventDetails): void {
   }
 }
 
+function canonicalizeDetails(details: Record<string, unknown>): string {
+  const canonical = Object.fromEntries(
+    Object.keys(details)
+      .sort()
+      .map((key) => [key, details[key]]),
+  );
+  const serialized = JSON.stringify(canonical);
+  if (serialized === undefined) {
+    throw new Error("Incident workflow event details could not be serialized.");
+  }
+  return serialized;
+}
+
+function hasMatchingProvenance(
+  existing: IncidentWorkflowEvent,
+  attempted: {
+    incidentId: string;
+    eventType: IncidentWorkflowEventType;
+    trueForgeSessionId: string | null;
+    turnId: string | null;
+    providerInvestigatorThreadId: string | null;
+    trueForgeEventId: string | null;
+    toolCallId: string | null;
+    occurredAt: string;
+    details: Record<string, unknown>;
+  },
+): boolean {
+  return (
+    existing.incidentId === attempted.incidentId &&
+    existing.eventType === attempted.eventType &&
+    existing.trueForgeSessionId === attempted.trueForgeSessionId &&
+    existing.turnId === attempted.turnId &&
+    existing.providerInvestigatorThreadId ===
+      attempted.providerInvestigatorThreadId &&
+    existing.trueForgeEventId === attempted.trueForgeEventId &&
+    existing.toolCallId === attempted.toolCallId &&
+    existing.occurredAt === attempted.occurredAt &&
+    canonicalizeDetails(existing.details) === canonicalizeDetails(attempted.details)
+  );
+}
+
 export interface AppendIncidentWorkflowEventInput {
   incidentId: string;
   eventType: IncidentWorkflowEventType;
@@ -182,7 +223,24 @@ export function createIncidentWorkflowEventService(
     }
 
     const id = randomUUID();
+    const trueForgeSessionId = input.trueForgeSessionId ?? null;
+    const turnId = input.turnId ?? null;
+    const providerInvestigatorThreadId =
+      input.providerInvestigatorThreadId ?? null;
     const trueForgeEventId = input.trueForgeEventId ?? null;
+    const toolCallId = input.toolCallId ?? null;
+    const occurredAt = input.occurredAt ?? now();
+    const attempted = {
+      incidentId: input.incidentId,
+      eventType: input.eventType,
+      trueForgeSessionId,
+      turnId,
+      providerInvestigatorThreadId,
+      trueForgeEventId,
+      toolCallId,
+      occurredAt,
+      details,
+    };
     const insertion = database.run(
       `
         INSERT INTO incident_workflow_events (
@@ -214,13 +272,12 @@ export function createIncidentWorkflowEventService(
         id,
         incidentId: input.incidentId,
         eventType: input.eventType,
-        trueForgeSessionId: input.trueForgeSessionId ?? null,
-        turnId: input.turnId ?? null,
-        providerInvestigatorThreadId:
-          input.providerInvestigatorThreadId ?? null,
+        trueForgeSessionId,
+        turnId,
+        providerInvestigatorThreadId,
         trueForgeEventId,
-        toolCallId: input.toolCallId ?? null,
-        occurredAt: input.occurredAt ?? now(),
+        toolCallId,
+        occurredAt,
         detailsJson,
       },
     );
@@ -231,16 +288,18 @@ export function createIncidentWorkflowEventService(
         throw new Error("Incident workflow event insert did not persist.");
       }
 
-      const existing = database.get<{ id: string; incident_id: string }>(
-        "SELECT id, incident_id FROM incident_workflow_events WHERE trueforge_event_id = ?",
-        [trueForgeEventId],
-      );
-      if (existing === undefined) {
+      const existing = getByTrueForgeEventId(trueForgeEventId);
+      if (existing === null) {
         throw new Error("Incident workflow event idempotency lookup failed.");
       }
-      if (existing.incident_id !== input.incidentId) {
+      if (existing.incidentId !== input.incidentId) {
         throw new Error(
           "TrueForge event id is already attributed to a different incident.",
+        );
+      }
+      if (!hasMatchingProvenance(existing, attempted)) {
+        throw new Error(
+          "TrueForge event idempotency replay does not match the existing durable event.",
         );
       }
       persistedId = existing.id;

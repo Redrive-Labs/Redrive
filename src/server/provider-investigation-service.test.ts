@@ -11,6 +11,7 @@ import {
   ProviderEvidenceConflictError,
 } from "@/server/provider-evidence-service";
 import { createIncidentService } from "@/server/incident-service";
+import { createIncidentWorkflowEventService } from "@/server/incident-workflow-event-service";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import {
   createProviderInvestigationService,
@@ -768,6 +769,47 @@ describe("TrueForge provider investigation", () => {
         (event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED",
       )?.details,
     ).toMatchObject({ sourceTrueForgeEventId: "tool-response-event" });
+  });
+
+  it("rolls back evidence when a conflicting provenance replay is encountered", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const workflowEvents = createIncidentWorkflowEventService(database);
+    const conflictingEvent = workflowEvents.append({
+      incidentId: incident.id,
+      eventType: "PROVIDER_EVIDENCE_CAPTURED",
+      trueForgeSessionId: "different-session",
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "provider-thread-1",
+      trueForgeEventId: "tool-response-event",
+      toolCallId: "github-call-1",
+      occurredAt: "2026-08-25T10:00:02.000Z",
+      details: { providerDeliveryId: "different-delivery" },
+    });
+    const service = createProviderInvestigationService(
+      database,
+      createClient(makeStream()),
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toThrow("does not match the existing durable event");
+
+    expect(
+      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+    ).toBeNull();
+    expect(workflowEvents.getByTrueForgeEventId("tool-response-event")).toEqual(
+      conflictingEvent,
+    );
+    expect(
+      database.get<{ count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM incident_workflow_events
+         WHERE incident_id = ? AND event_type = 'PROVIDER_EVIDENCE_CAPTURED'`,
+        [incident.id],
+      ),
+    ).toEqual({ count: 1 });
   });
 
   it("rolls back first-capture evidence when its workflow event cannot persist", async () => {

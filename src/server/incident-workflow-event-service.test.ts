@@ -54,7 +54,8 @@ describe("incident workflow provenance", () => {
       providerInvestigatorThreadId: "thread-1",
       trueForgeEventId: "tf-event-1",
       toolCallId: "spawn-call",
-      details: { agentName: "provider-investigator" },
+      occurredAt: "2026-01-01T00:00:01.000Z",
+      details: { parentThreadId: "main", agentName: "provider-investigator" },
     });
 
     expect(duplicate).toEqual(first);
@@ -68,6 +69,89 @@ describe("incident workflow provenance", () => {
         "SELECT COUNT(*) AS count FROM incident_workflow_events",
       ),
     ).toEqual({ count: 1 });
+  });
+
+  it("rejects a duplicate TrueForge event with a changed event type", () => {
+    const incidentId = createIncident();
+    const events = createIncidentWorkflowEventService(database);
+    const original = {
+      incidentId,
+      eventType: "PROVIDER_INVESTIGATOR_STARTED" as const,
+      trueForgeSessionId: "session-1",
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "thread-1",
+      trueForgeEventId: "tf-event-1",
+      toolCallId: "tool-call-1",
+      occurredAt: "2026-01-01T00:00:01.000Z",
+      details: { observation: "same" },
+    };
+    events.append(original);
+
+    expect(() =>
+      events.append({
+        ...original,
+        eventType: "PROVIDER_EVIDENCE_CAPTURED",
+      }),
+    ).toThrow("does not match the existing durable event");
+    expect(events.listByIncidentId(incidentId)).toHaveLength(1);
+  });
+
+  it.each([
+    ["session", { trueForgeSessionId: "session-2" }],
+    ["turn", { turnId: "turn-2" }],
+    ["provider thread", { providerInvestigatorThreadId: "thread-2" }],
+    ["tool call", { toolCallId: "tool-call-2" }],
+  ])("rejects a duplicate TrueForge event with changed %s attribution", (_name, change) => {
+    const incidentId = createIncident();
+    const events = createIncidentWorkflowEventService(database);
+    const original = {
+      incidentId,
+      eventType: "PROVIDER_INVESTIGATOR_STARTED" as const,
+      trueForgeSessionId: "session-1",
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "thread-1",
+      trueForgeEventId: "tf-event-1",
+      toolCallId: "tool-call-1",
+      occurredAt: "2026-01-01T00:00:01.000Z",
+      details: { observation: "same" },
+    };
+    events.append(original);
+
+    expect(() => events.append({ ...original, ...change })).toThrow(
+      "does not match the existing durable event",
+    );
+    expect(events.listByIncidentId(incidentId)).toHaveLength(1);
+  });
+
+  it("rejects a duplicate TrueForge event with changed timestamp or details", () => {
+    const incidentId = createIncident();
+    const events = createIncidentWorkflowEventService(database);
+    const original = {
+      incidentId,
+      eventType: "PROVIDER_INVESTIGATOR_STARTED" as const,
+      trueForgeSessionId: "session-1",
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "thread-1",
+      trueForgeEventId: "tf-event-1",
+      toolCallId: "tool-call-1",
+      occurredAt: "2026-01-01T00:00:01.000Z",
+      details: { observation: "same" },
+    };
+    events.append(original);
+
+    expect(() =>
+      events.append({
+        ...original,
+        occurredAt: "2026-01-01T00:00:02.000Z",
+      }),
+    ).toThrow("does not match the existing durable event");
+    expect(() =>
+      events.append({
+        ...original,
+        details: { observation: "changed" },
+      }),
+    ).toThrow("does not match the existing durable event");
+    expect(events.listByIncidentId(incidentId)).toHaveLength(1);
   });
 
   it("does not reuse a TrueForge event ID across incidents", () => {

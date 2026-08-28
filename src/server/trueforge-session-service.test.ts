@@ -208,6 +208,11 @@ describe("TrueForge incident session spine", () => {
       sessionId: null,
     });
     expect(client.createSession).not.toHaveBeenCalled();
+    expect(restartedService.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "CREATION_UNCERTAIN",
+      creationToken: "stale-creation-token",
+      trueForgeSessionId: null,
+    });
 
     const recreatedService = createTrueForgeSessionService(
       database,
@@ -216,6 +221,97 @@ describe("TrueForge incident session spine", () => {
     );
     const blocked = await recreatedService.ensureTrueForgeSession(incident.id);
     expect(blocked.outcome).toBe("CREATION_UNCERTAIN");
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("lets the original owner activate a late result after stale recovery", async () => {
+    const incident = createIncident();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const observedAt = new Date(
+      Date.parse(createdAt) + TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+    ).toISOString();
+    const ownerClient = createFakeClient();
+    const staleRecoveryClient = createFakeClient();
+    const contenderDatabase = openDatabase(databasePath);
+    const staleService = createTrueForgeSessionService(
+      contenderDatabase,
+      staleRecoveryClient,
+      () => observedAt,
+    );
+    let staleRecovery!: ReturnType<typeof staleService.ensureTrueForgeSession>;
+    ownerClient.createSession.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          // Resolve the remote create first. Starting stale recovery in the
+          // same turn pauses local activation until the reservation is fenced.
+          resolve("late-session");
+          staleRecovery = staleService.ensureTrueForgeSession(incident.id);
+        }),
+    );
+    const ownerService = createTrueForgeSessionService(
+      database,
+      ownerClient,
+      vi.fn().mockReturnValueOnce(createdAt).mockReturnValue(observedAt),
+    );
+
+    try {
+      const ownerResult = await ownerService.ensureTrueForgeSession(incident.id);
+      const staleResult = await staleRecovery;
+
+      expect(staleResult).toMatchObject({
+        outcome: "CREATION_UNCERTAIN",
+        state: "CREATION_UNCERTAIN",
+        sessionId: null,
+      });
+      expect(ownerResult).toMatchObject({
+        outcome: "CREATED",
+        state: "ACTIVE",
+        sessionId: "late-session",
+      });
+      expect(ownerResult.binding.creationToken).toBeNull();
+      expect(staleRecoveryClient.createSession).not.toHaveBeenCalled();
+      expect(ownerClient.createSession).toHaveBeenCalledTimes(1);
+      expect(ownerService.getBindingByIncidentId(incident.id)).toMatchObject({
+        state: "ACTIVE",
+        trueForgeSessionId: "late-session",
+        creationToken: null,
+      });
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("rejects a differently-owned late activation without replacing the token", async () => {
+    const incident = createIncident();
+    const creationToken = "stale-fencing-token";
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const observedAt = new Date(
+      Date.parse(createdAt) + TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+    ).toISOString();
+    insertCreatingBinding(incident.id, creationToken, createdAt);
+    const client = createFakeClient();
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      () => observedAt,
+    );
+
+    await service.ensureTrueForgeSession(incident.id);
+    const repository = createTrueForgeSessionBindingRepository(database);
+
+    expect(
+      repository.activate(
+        incident.id,
+        "wrong-fencing-token",
+        "should-not-activate",
+        observedAt,
+      ),
+    ).toBeNull();
+    expect(service.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "CREATION_UNCERTAIN",
+      creationToken,
+      trueForgeSessionId: null,
+    });
     expect(client.createSession).not.toHaveBeenCalled();
   });
 
@@ -290,9 +386,10 @@ describe("TrueForge incident session spine", () => {
     expect(first.outcome).toBe("CREATION_UNCERTAIN");
     expect(second.outcome).toBe("CREATION_UNCERTAIN");
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(service.getBindingByIncidentId(incident.id)?.state).toBe(
-      "CREATION_UNCERTAIN",
-    );
+    expect(service.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "CREATION_UNCERTAIN",
+      creationToken: "stale-no-replacement-token",
+    });
   });
 
   it("creates the schema and stores one inline versioned Coordinator binding", async () => {

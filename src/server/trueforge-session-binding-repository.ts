@@ -177,7 +177,7 @@ export function createTrueForgeSessionBindingRepository(
             creation_token = NULL,
             updated_at = @now
           WHERE incident_id = @incidentId
-            AND state = 'CREATING'
+            AND state IN ('CREATING', 'CREATION_UNCERTAIN')
             AND trueforge_session_id IS NULL
             AND creation_token = @creationToken
         `,
@@ -243,7 +243,9 @@ export function createTrueForgeSessionBindingRepository(
           SET
             state = 'CREATION_UNCERTAIN',
             trueforge_session_id = NULL,
-            creation_token = NULL,
+            -- Retain the owner identity so a delayed positive create result
+            -- can still be fenced to the original creator.
+            creation_token = @creationToken,
             updated_at = @now
           WHERE incident_id = @incidentId
             AND state = 'CREATING'
