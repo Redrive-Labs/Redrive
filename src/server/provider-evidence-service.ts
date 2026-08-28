@@ -265,77 +265,108 @@ export function createProviderEvidenceService(
     }
   }
 
-  function persistNormalizedEvidence(
-    incidentId: string,
-    evidence: ProviderEvidence,
-  ): ProviderEvidenceCaptureResult {
+  function serializeEvidence(evidence: ProviderEvidence): string {
     const evidenceJson = JSON.stringify(evidence);
     if (evidenceJson === undefined) {
       throw new Error("Provider evidence could not be serialized.");
     }
+    return evidenceJson;
+  }
 
-    const inserted = database.transaction(() => {
-      const insertion = database.run(
-        `
-          INSERT INTO provider_evidence (
-            incident_id,
-            schema_version,
-            provider,
-            provider_delivery_id,
-            delivery_guid,
-            outcome_status,
-            status_code,
-            delivered_at,
-            canonical_payload_sha256,
-            evidence_json,
-            captured_at
-          ) VALUES (
-            @incidentId,
-            @schemaVersion,
-            @provider,
-            @providerDeliveryId,
-            @deliveryGuid,
-            @outcomeStatus,
-            @statusCode,
-            @deliveredAt,
-            @canonicalPayloadSha256,
-            @evidenceJson,
-            @capturedAt
-          )
-          ON CONFLICT (incident_id) DO NOTHING
-        `,
-        {
-          incidentId,
-          schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
-          provider: GITHUB_PROVIDER,
-          providerDeliveryId: evidence.providerDeliveryId,
-          deliveryGuid: evidence.deliveryGuid,
-          outcomeStatus: evidence.outcome.status,
-          statusCode: evidence.outcome.statusCode,
-          deliveredAt: evidence.deliveredAt,
-          canonicalPayloadSha256: evidence.request.canonicalPayloadSha256,
-          evidenceJson,
-          capturedAt: evidence.capturedAt,
-        },
-      );
-      return insertion.changes === 1;
-    }, "immediate");
+  interface ProviderEvidenceReconciliation {
+    capture: ProviderEvidenceCaptureResult;
+    conflict: ProviderEvidenceConflictError | null;
+  }
+
+  function reconcileNormalizedEvidenceWithinTransaction(
+    incidentId: string,
+    evidence: ProviderEvidence,
+    evidenceJson: string,
+  ): ProviderEvidenceReconciliation {
+    const insertion = database.run(
+      `
+        INSERT INTO provider_evidence (
+          incident_id,
+          schema_version,
+          provider,
+          provider_delivery_id,
+          delivery_guid,
+          outcome_status,
+          status_code,
+          delivered_at,
+          canonical_payload_sha256,
+          evidence_json,
+          captured_at
+        ) VALUES (
+          @incidentId,
+          @schemaVersion,
+          @provider,
+          @providerDeliveryId,
+          @deliveryGuid,
+          @outcomeStatus,
+          @statusCode,
+          @deliveredAt,
+          @canonicalPayloadSha256,
+          @evidenceJson,
+          @capturedAt
+        )
+        ON CONFLICT (incident_id) DO NOTHING
+      `,
+      {
+        incidentId,
+        schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
+        provider: GITHUB_PROVIDER,
+        providerDeliveryId: evidence.providerDeliveryId,
+        deliveryGuid: evidence.deliveryGuid,
+        outcomeStatus: evidence.outcome.status,
+        statusCode: evidence.outcome.statusCode,
+        deliveredAt: evidence.deliveredAt,
+        canonicalPayloadSha256: evidence.request.canonicalPayloadSha256,
+        evidenceJson,
+        capturedAt: evidence.capturedAt,
+      },
+    );
 
     const persisted = getByIncidentId(incidentId);
     if (persisted === null) {
       throw new Error("Provider evidence insert did not produce a persisted snapshot.");
     }
 
-    if (
-      providerEvidenceMatchesIgnoringCaptureTime(persisted, evidence)
-    ) {
+    if (providerEvidenceMatchesIgnoringCaptureTime(persisted, evidence)) {
       return {
-        evidence: persisted,
-        disposition: inserted ? "CAPTURED" : "REOBSERVED",
+        capture: {
+          evidence: persisted,
+          disposition: insertion.changes === 1 ? "CAPTURED" : "REOBSERVED",
+        },
+        conflict: null,
       };
     }
 
-    throw new ProviderEvidenceConflictError(persisted, evidence);
+    return {
+      capture: { evidence: persisted, disposition: "REOBSERVED" },
+      conflict: new ProviderEvidenceConflictError(persisted, evidence),
+    };
+  }
+
+  function persistNormalizedEvidence(
+    incidentId: string,
+    evidence: ProviderEvidence,
+  ): ProviderEvidenceCaptureResult {
+    const evidenceJson = serializeEvidence(evidence);
+    const reconciliation = database.transaction(
+      () =>
+        reconcileNormalizedEvidenceWithinTransaction(
+          incidentId,
+          evidence,
+          evidenceJson,
+        ),
+      "immediate",
+    );
+
+    if (reconciliation.conflict !== null) {
+      throw reconciliation.conflict;
+    }
+    return reconciliation.capture;
   }
 
   function captureOrReconcileForIncident(
@@ -343,15 +374,6 @@ export function createProviderEvidenceService(
     result: unknown,
   ): ProviderEvidenceCaptureResult {
     const evidence = normalizeForIncident(incidentId, result);
-    const existing = getByIncidentId(incidentId);
-
-    if (existing !== null) {
-      if (providerEvidenceMatchesIgnoringCaptureTime(existing, evidence)) {
-        return { evidence: existing, disposition: "REOBSERVED" };
-      }
-      throw new ProviderEvidenceConflictError(existing, evidence);
-    }
-
     return persistNormalizedEvidence(incidentId, evidence);
   }
 
@@ -372,6 +394,8 @@ export function createProviderEvidenceService(
     normalizeForIncident,
     obtainForIncident,
     captureOrReconcileForIncident,
+    reconcileNormalizedEvidenceWithinTransaction,
+    serializeEvidence,
     inspectForIncident,
   };
 }

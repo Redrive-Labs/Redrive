@@ -167,7 +167,7 @@ export function createIncidentWorkflowEventService(
       .map(mapWorkflowEventRow);
   }
 
-  function append(
+  function appendWithinTransaction(
     input: AppendIncidentWorkflowEventInput,
   ): IncidentWorkflowEvent {
     if (!INCIDENT_WORKFLOW_EVENT_TYPES.includes(input.eventType)) {
@@ -183,53 +183,50 @@ export function createIncidentWorkflowEventService(
 
     const id = randomUUID();
     const trueForgeEventId = input.trueForgeEventId ?? null;
-    const persistedId = database.transaction(() => {
-      const insertion = database.run(
-        `
-          INSERT INTO incident_workflow_events (
-            id,
-            incident_id,
-            event_type,
-            trueforge_session_id,
-            turn_id,
-            provider_investigator_thread_id,
-            trueforge_event_id,
-            tool_call_id,
-            occurred_at,
-            details_json
-          ) VALUES (
-            @id,
-            @incidentId,
-            @eventType,
-            @trueForgeSessionId,
-            @turnId,
-            @providerInvestigatorThreadId,
-            @trueForgeEventId,
-            @toolCallId,
-            @occurredAt,
-            @detailsJson
-          )
-          ON CONFLICT (trueforge_event_id) DO NOTHING
-        `,
-        {
+    const insertion = database.run(
+      `
+        INSERT INTO incident_workflow_events (
           id,
-          incidentId: input.incidentId,
-          eventType: input.eventType,
-          trueForgeSessionId: input.trueForgeSessionId ?? null,
-          turnId: input.turnId ?? null,
-          providerInvestigatorThreadId:
-            input.providerInvestigatorThreadId ?? null,
-          trueForgeEventId,
-          toolCallId: input.toolCallId ?? null,
-          occurredAt: input.occurredAt ?? now(),
-          detailsJson,
-        },
-      );
+          incident_id,
+          event_type,
+          trueforge_session_id,
+          turn_id,
+          provider_investigator_thread_id,
+          trueforge_event_id,
+          tool_call_id,
+          occurred_at,
+          details_json
+        ) VALUES (
+          @id,
+          @incidentId,
+          @eventType,
+          @trueForgeSessionId,
+          @turnId,
+          @providerInvestigatorThreadId,
+          @trueForgeEventId,
+          @toolCallId,
+          @occurredAt,
+          @detailsJson
+        )
+        ON CONFLICT (trueforge_event_id) DO NOTHING
+      `,
+      {
+        id,
+        incidentId: input.incidentId,
+        eventType: input.eventType,
+        trueForgeSessionId: input.trueForgeSessionId ?? null,
+        turnId: input.turnId ?? null,
+        providerInvestigatorThreadId:
+          input.providerInvestigatorThreadId ?? null,
+        trueForgeEventId,
+        toolCallId: input.toolCallId ?? null,
+        occurredAt: input.occurredAt ?? now(),
+        detailsJson,
+      },
+    );
 
-      if (insertion.changes === 1) {
-        return id;
-      }
-
+    let persistedId: string = id;
+    if (insertion.changes !== 1) {
       if (trueForgeEventId === null) {
         throw new Error("Incident workflow event insert did not persist.");
       }
@@ -246,8 +243,8 @@ export function createIncidentWorkflowEventService(
           "TrueForge event id is already attributed to a different incident.",
         );
       }
-      return existing.id;
-    }, "immediate");
+      persistedId = existing.id;
+    }
 
     const persisted = getById(persistedId);
     if (persisted === null) {
@@ -256,8 +253,18 @@ export function createIncidentWorkflowEventService(
     return persisted;
   }
 
+  function append(
+    input: AppendIncidentWorkflowEventInput,
+  ): IncidentWorkflowEvent {
+    return database.transaction(
+      () => appendWithinTransaction(input),
+      "immediate",
+    );
+  }
+
   return {
     append,
+    appendWithinTransaction,
     getById,
     getByTrueForgeEventId,
     listByIncidentId,

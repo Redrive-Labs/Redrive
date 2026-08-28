@@ -229,6 +229,40 @@ export function createTrueForgeSessionBindingRepository(
     }, "immediate");
   }
 
+  function markStaleCreationUncertain(
+    incidentId: string,
+    creationToken: string,
+    expectedCreatedAt: string,
+    staleBefore: string,
+    now: string,
+  ): boolean {
+    return database.transaction(() => {
+      const update = database.run(
+        `
+          UPDATE trueforge_session_bindings
+          SET
+            state = 'CREATION_UNCERTAIN',
+            trueforge_session_id = NULL,
+            creation_token = NULL,
+            updated_at = @now
+          WHERE incident_id = @incidentId
+            AND state = 'CREATING'
+            AND creation_token = @creationToken
+            AND created_at = @expectedCreatedAt
+            AND created_at <= @staleBefore
+        `,
+        {
+          incidentId,
+          creationToken,
+          expectedCreatedAt,
+          staleBefore,
+          now,
+        },
+      );
+      return update.changes === 1;
+    }, "immediate");
+  }
+
   function releaseCreation(
     incidentId: string,
     creationToken: string,
@@ -329,6 +363,7 @@ export function createTrueForgeSessionBindingRepository(
     reserveCreation,
     activate,
     markCreationUncertain,
+    markStaleCreationUncertain,
     releaseCreation,
     updateCoordinatorSpecVersion,
     markLost,

@@ -16,6 +16,7 @@ import { getServerConfig } from "@/server/config";
 import { createIncidentService } from "@/server/incident-service";
 import {
   createConfiguredTrueForgeClient,
+  TRUEFORGE_REQUEST_TIMEOUT_SECONDS,
   TrueForgeConfigurationError,
   TrueForgeSessionCreateError,
   TrueForgeSessionNotFoundError,
@@ -132,6 +133,37 @@ function isDefinitiveCreateFailure(error: unknown): boolean {
   );
 }
 
+// A reservation is stale only after four bounded 15-second create timeouts.
+// This leaves room for a slow but still-live owner while allowing a crashed
+// owner to stop blocking the incident forever after a restart.
+export const TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS =
+  TRUEFORGE_REQUEST_TIMEOUT_SECONDS * 4 * 1_000;
+
+function isStaleCreation(
+  binding: TrueForgeSessionBinding,
+  observedAt: string,
+): boolean {
+  const createdAtMs = Date.parse(binding.createdAt);
+  const observedAtMs = Date.parse(observedAt);
+
+  return (
+    Number.isFinite(createdAtMs) &&
+    Number.isFinite(observedAtMs) &&
+    observedAtMs - createdAtMs >= TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS
+  );
+}
+
+function staleCreationCutoff(observedAt: string): string {
+  const observedAtMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedAtMs)) {
+    throw new Error("Cannot calculate a stale TrueForge reservation cutoff.");
+  }
+
+  return new Date(
+    observedAtMs - TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+  ).toISOString();
+}
+
 export function createTrueForgeSessionService(
   database: SqliteDatabase,
   trueForgeClient: TrueForgeSessionUpgradeClient,
@@ -165,6 +197,66 @@ export function createTrueForgeSessionService(
       retryable: false,
       reused: false,
     });
+  }
+
+  async function recoverStaleCreation(
+    binding: TrueForgeSessionBinding,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    const observedAt = now();
+    if (!isStaleCreation(binding, observedAt)) {
+      return inProgressResult(binding);
+    }
+
+    const creationToken = binding.creationToken;
+    if (creationToken === null) {
+      throw new TrueForgeSessionBindingError(binding.incidentId);
+    }
+
+    const transitioned = bindingRepository.markStaleCreationUncertain(
+      binding.incidentId,
+      creationToken,
+      binding.createdAt,
+      staleCreationCutoff(observedAt),
+      observedAt,
+    );
+
+    if (transitioned) {
+      const uncertain = bindingRepository.getByIncidentId(binding.incidentId);
+      if (uncertain === null || uncertain.state !== "CREATION_UNCERTAIN") {
+        throw new TrueForgeSessionBindingError(binding.incidentId);
+      }
+      return resultFor(uncertain, "CREATION_UNCERTAIN", {
+        retryable: false,
+        reused: false,
+      });
+    }
+
+    // Another actor may have activated or otherwise transitioned this exact
+    // reservation. Never overwrite that outcome; classify the durable state
+    // that won the CAS instead.
+    const current = bindingRepository.getByIncidentId(binding.incidentId);
+    if (current === null) {
+      throw new TrueForgeSessionBindingError(binding.incidentId);
+    }
+    if (current.state === "ACTIVE") {
+      return verifyActiveBinding(current);
+    }
+    if (current.state === "CREATING") {
+      return inProgressResult(current);
+    }
+    return blockedResult(current);
+  }
+
+  async function classifyExistingBinding(
+    binding: TrueForgeSessionBinding,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    if (binding.state === "ACTIVE") {
+      return verifyActiveBinding(binding);
+    }
+    if (binding.state === "CREATING") {
+      return recoverStaleCreation(binding);
+    }
+    return blockedResult(binding);
   }
 
   async function verifyActiveBinding(
@@ -237,13 +329,7 @@ export function createTrueForgeSessionService(
 
     const existing = bindingRepository.getByIncidentId(incidentId);
     if (existing !== null) {
-      if (existing.state === "ACTIVE") {
-        return verifyActiveBinding(existing);
-      }
-      if (existing.state === "CREATING") {
-        return inProgressResult(existing);
-      }
-      return blockedResult(existing);
+      return classifyExistingBinding(existing);
     }
 
     // Validate the server-side model/resource name before reserving or
@@ -265,13 +351,7 @@ export function createTrueForgeSessionService(
       reservation.state !== "CREATING" ||
       reservation.creationToken !== creationToken
     ) {
-      if (reservation.state === "ACTIVE") {
-        return verifyActiveBinding(reservation);
-      }
-      if (reservation.state === "CREATING") {
-        return inProgressResult(reservation);
-      }
-      return blockedResult(reservation);
+      return classifyExistingBinding(reservation);
     }
 
     let sessionId: string;

@@ -904,38 +904,57 @@ export function createProviderInvestigationService(
       const githubResult = extractGithubDeliveryFromTrueForgeToolResponse(
         collected.toolResponse.content,
       );
-      let capture: ProviderEvidenceCaptureResult;
-      try {
-        capture = evidenceService.captureOrReconcileForIncident(
-          incidentId,
-          githubResult,
-        );
-      } catch (error) {
-        if (error instanceof ProviderEvidenceConflictError) {
-          appendConflictEvent(
-            workflowEvents.append,
+      // Extraction and normalization stay outside the write transaction. Only
+      // the normalized snapshot and its matching provenance event are atomic.
+      const normalizedEvidence = evidenceService.normalizeForIncident(
+        incidentId,
+        githubResult,
+      );
+      const evidenceJson = evidenceService.serializeEvidence(normalizedEvidence);
+      const reconciliation = database.transaction(
+        () => {
+          const result = evidenceService.reconcileNormalizedEvidenceWithinTransaction(
             incidentId,
-            upgraded.sessionId,
-            turnId,
-            collected.thread,
-            collected.toolCall,
-            collected.toolResponse,
-            error,
+            normalizedEvidence,
+            evidenceJson,
           );
-        }
-        throw error;
+
+          if (result.conflict !== null) {
+            appendConflictEvent(
+              workflowEvents.appendWithinTransaction,
+              incidentId,
+              upgraded.sessionId,
+              collected.turnId,
+              collected.thread,
+              collected.toolCall,
+              collected.toolResponse,
+              result.conflict,
+            );
+          } else {
+            appendEvidenceEvent(
+              workflowEvents.appendWithinTransaction,
+              incidentId,
+              upgraded.sessionId,
+              collected.turnId,
+              collected.thread,
+              collected.toolCall,
+              collected.toolResponse,
+              result.capture,
+            );
+          }
+
+          return result;
+        },
+        "immediate",
+      );
+
+      if (reconciliation.conflict !== null) {
+        // The conflict event is durable before the immutable-observation error
+        // is exposed to callers.
+        throw reconciliation.conflict;
       }
 
-      appendEvidenceEvent(
-        workflowEvents.append,
-        incidentId,
-        upgraded.sessionId,
-        turnId,
-        collected.thread,
-        collected.toolCall,
-        collected.toolResponse,
-        capture,
-      );
+      const capture: ProviderEvidenceCaptureResult = reconciliation.capture;
 
       return {
         incidentId,

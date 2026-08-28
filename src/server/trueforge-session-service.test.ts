@@ -10,8 +10,10 @@ import {
 } from "@/agents/recovery-coordinator";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import { createIncidentService } from "@/server/incident-service";
+import { createTrueForgeSessionBindingRepository } from "@/server/trueforge-session-binding-repository";
 import {
   createTrueForgeSessionService,
+  TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
   TrueForgeIncidentNotFoundError,
   TrueForgeSessionSpecUpgradeError,
   TrueForgeUnsupportedCoordinatorSpecError,
@@ -106,6 +108,192 @@ describe("TrueForge incident session spine", () => {
       ],
     );
   }
+
+  function insertCreatingBinding(
+    incidentId: string,
+    creationToken: string,
+    createdAt: string,
+  ): void {
+    database.run(
+      `
+        INSERT INTO trueforge_session_bindings (
+          incident_id,
+          state,
+          trueforge_session_id,
+          creation_token,
+          coordinator_spec_version,
+          created_at,
+          updated_at
+        ) VALUES (?, 'CREATING', NULL, ?, ?, ?, ?)
+      `,
+      [
+        incidentId,
+        creationToken,
+        RECOVERY_COORDINATOR_SPEC_VERSION,
+        createdAt,
+        createdAt,
+      ],
+    );
+  }
+
+  it("keeps a fresh CREATING reservation in progress for concurrent callers", async () => {
+    const incident = createIncident();
+    insertCreatingBinding(
+      incident.id,
+      "fresh-creation-token",
+      "2026-01-01T00:00:00.000Z",
+    );
+    const client1 = createFakeClient();
+    const client2 = createFakeClient();
+    const contenderDatabase = openDatabase(databasePath);
+    try {
+      const service1 = createTrueForgeSessionService(
+        database,
+        client1,
+        () => "2026-01-01T00:00:30.000Z",
+      );
+      const service2 = createTrueForgeSessionService(
+        contenderDatabase,
+        client2,
+        () => "2026-01-01T00:00:30.000Z",
+      );
+
+      const results = await Promise.all([
+        service1.ensureTrueForgeSession(incident.id),
+        service2.ensureTrueForgeSession(incident.id),
+      ]);
+
+      expect(results).toHaveLength(2);
+      expect(results).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            outcome: "IN_PROGRESS",
+            state: "CREATING",
+            retryable: true,
+          }),
+        ]),
+      );
+      expect(results.every((result) => result.outcome === "IN_PROGRESS")).toBe(
+        true,
+      );
+      expect(client1.createSession).not.toHaveBeenCalled();
+      expect(client2.createSession).not.toHaveBeenCalled();
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("marks a stale CREATING reservation uncertain after restart without creating remotely", async () => {
+    const incident = createIncident();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const observedAt = new Date(
+      Date.parse(createdAt) + TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+    ).toISOString();
+    insertCreatingBinding(incident.id, "stale-creation-token", createdAt);
+    const client = createFakeClient();
+    database.close();
+    database = openDatabase(databasePath);
+
+    const restartedService = createTrueForgeSessionService(
+      database,
+      client,
+      () => observedAt,
+    );
+    const result = await restartedService.ensureTrueForgeSession(incident.id);
+
+    expect(result).toMatchObject({
+      outcome: "CREATION_UNCERTAIN",
+      state: "CREATION_UNCERTAIN",
+      retryable: false,
+      sessionId: null,
+    });
+    expect(client.createSession).not.toHaveBeenCalled();
+
+    const recreatedService = createTrueForgeSessionService(
+      database,
+      client,
+      () => observedAt,
+    );
+    const blocked = await recreatedService.ensureTrueForgeSession(incident.id);
+    expect(blocked.outcome).toBe("CREATION_UNCERTAIN");
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("classifies activation that wins stale recovery instead of overwriting it", async () => {
+    const incident = createIncident();
+    const creationToken = "activation-race-token";
+    insertCreatingBinding(
+      incident.id,
+      creationToken,
+      "2026-01-01T00:00:00.000Z",
+    );
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "activated-session" });
+    const contenderDatabase = openDatabase(databasePath);
+    const contenderRepository = createTrueForgeSessionBindingRepository(
+      contenderDatabase,
+    );
+    let activated = false;
+    try {
+      const service = createTrueForgeSessionService(
+        database,
+        client,
+        () => {
+          if (!activated) {
+            activated = true;
+            expect(
+              contenderRepository.activate(
+                incident.id,
+                creationToken,
+                "activated-session",
+                "2026-01-01T00:01:00.000Z",
+              ),
+            ).not.toBeNull();
+          }
+          return "2026-01-01T00:01:00.000Z";
+        },
+      );
+
+      const result = await service.ensureTrueForgeSession(incident.id);
+
+      expect(result).toMatchObject({
+        outcome: "REUSED",
+        state: "ACTIVE",
+        sessionId: "activated-session",
+      });
+      expect(client.createSession).not.toHaveBeenCalled();
+      expect(contenderRepository.getByIncidentId(incident.id)?.state).toBe(
+        "ACTIVE",
+      );
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("preserves the no-replacement invariant after stale recovery", async () => {
+    const incident = createIncident();
+    insertCreatingBinding(
+      incident.id,
+      "stale-no-replacement-token",
+      "2026-01-01T00:00:00.000Z",
+    );
+    const client = createFakeClient();
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      () => "2026-01-01T00:02:00.000Z",
+    );
+
+    const first = await service.ensureTrueForgeSession(incident.id);
+    const second = await service.ensureTrueForgeSession(incident.id);
+
+    expect(first.outcome).toBe("CREATION_UNCERTAIN");
+    expect(second.outcome).toBe("CREATION_UNCERTAIN");
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(service.getBindingByIncidentId(incident.id)?.state).toBe(
+      "CREATION_UNCERTAIN",
+    );
+  });
 
   it("creates the schema and stores one inline versioned Coordinator binding", async () => {
     const incident = createIncident();

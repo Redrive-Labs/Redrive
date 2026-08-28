@@ -339,6 +339,27 @@ describe("TrueForge provider investigation", () => {
     );
   }
 
+  function failWorkflowEventPersistenceOnce(eventType: string): () => boolean {
+    const originalRun = database.run.bind(database);
+    let injectedFailure = false;
+    vi.spyOn(database, "run").mockImplementation((sql, parameters) => {
+      if (
+        !injectedFailure &&
+        sql.includes("INSERT INTO incident_workflow_events") &&
+        parameters !== null &&
+        parameters !== undefined &&
+        !Array.isArray(parameters) &&
+        typeof parameters === "object" &&
+        (parameters as Record<string, unknown>).eventType === eventType
+      ) {
+        injectedFailure = true;
+        throw new Error("injected workflow event persistence failure");
+      }
+      return originalRun(sql, parameters);
+    });
+    return () => injectedFailure;
+  }
+
   it("collects only the exact completed turn, not unrelated session history", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
@@ -731,6 +752,11 @@ describe("TrueForge provider investigation", () => {
     );
     expect(evidenceService.getByIncidentId(incident.id)).toEqual(original);
     const workflowEvents = service.getWorkflowEvents(incident.id);
+    expect(
+      workflowEvents.filter(
+        (event) => event.eventType === "PROVIDER_OBSERVATION_CONFLICT",
+      ),
+    ).toHaveLength(1);
     expect(workflowEvents.map((event) => event.eventType)).toEqual(
       expect.arrayContaining([
         "PROVIDER_OBSERVATION_CONFLICT",
@@ -742,6 +768,72 @@ describe("TrueForge provider investigation", () => {
         (event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED",
       )?.details,
     ).toMatchObject({ sourceTrueForgeEventId: "tool-response-event" });
+  });
+
+  it("rolls back first-capture evidence when its workflow event cannot persist", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream());
+    const failureInjected = failWorkflowEventPersistenceOnce(
+      "PROVIDER_EVIDENCE_CAPTURED",
+    );
+
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(service.investigateProviderForIncident(incident.id)).rejects.toThrow(
+      "injected workflow event persistence failure",
+    );
+    expect(
+      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+    ).toBeNull();
+    expect(
+      database.get<{ count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM incident_workflow_events
+         WHERE incident_id = ? AND event_type = 'PROVIDER_EVIDENCE_CAPTURED'`,
+        [incident.id],
+      ),
+    ).toEqual({ count: 0 });
+    expect(failureInjected()).toBe(true);
+  });
+
+  it("does not append a reobservation event without committing its transaction", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const evidenceService = createProviderEvidenceService(database, null, () =>
+      "2026-08-25T09:00:00.000Z",
+    );
+    const original = evidenceService.captureOrReconcileForIncident(
+      incident.id,
+      makeGithubResult(),
+    ).evidence;
+    const failureInjected = failWorkflowEventPersistenceOnce(
+      "PROVIDER_EVIDENCE_REOBSERVED",
+    );
+    const service = createProviderInvestigationService(
+      database,
+      createClient(makeStream()),
+      environment,
+    );
+
+    await expect(service.investigateProviderForIncident(incident.id)).rejects.toThrow(
+      "injected workflow event persistence failure",
+    );
+
+    expect(evidenceService.getByIncidentId(incident.id)).toEqual(original);
+    expect(
+      database.get<{ count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM incident_workflow_events
+         WHERE incident_id = ? AND event_type = 'PROVIDER_EVIDENCE_REOBSERVED'`,
+        [incident.id],
+      ),
+    ).toEqual({ count: 0 });
+    expect(failureInjected()).toBe(true);
   });
 
   it("accepts an empty create_sub_agent response after correlated provider evidence", async () => {
