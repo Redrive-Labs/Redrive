@@ -274,7 +274,7 @@ export function createTrueForgeSessionBindingRepository(
         `
           DELETE FROM trueforge_session_bindings
           WHERE incident_id = @incidentId
-            AND state = 'CREATING'
+            AND state IN ('CREATING', 'CREATION_UNCERTAIN')
             AND creation_token = @creationToken
         `,
         { incidentId, creationToken },

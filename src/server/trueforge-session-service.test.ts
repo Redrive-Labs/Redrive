@@ -315,6 +315,95 @@ describe("TrueForge incident session spine", () => {
     expect(client.createSession).not.toHaveBeenCalled();
   });
 
+  it("releases a stale uncertain reservation after the original owner is definitively rejected", async () => {
+    const incident = createIncident();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const observedAt = new Date(
+      Date.parse(createdAt) + TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+    ).toISOString();
+    const ownerClient = createFakeClient();
+    const staleRecoveryClient = createFakeClient();
+    const contenderDatabase = openDatabase(databasePath);
+    const staleService = createTrueForgeSessionService(
+      contenderDatabase,
+      staleRecoveryClient,
+      () => observedAt,
+    );
+    let staleRecovery!: ReturnType<typeof staleService.ensureTrueForgeSession>;
+    ownerClient.createSession
+      .mockImplementationOnce(
+        () =>
+          new Promise<never>((_resolve, reject) => {
+            // The definitive rejection arrives after stale recovery fences the
+            // original owner, so cleanup must release CREATION_UNCERTAIN.
+            reject(
+              new TrueForgeSessionCreateError(
+                "DEFINITIVE",
+                "invalid agent specification",
+              ),
+            );
+            staleRecovery = staleService.ensureTrueForgeSession(incident.id);
+          }),
+      )
+      .mockResolvedValueOnce("replacement-session");
+    const ownerService = createTrueForgeSessionService(
+      database,
+      ownerClient,
+      vi.fn().mockReturnValueOnce(createdAt).mockReturnValue("2026-01-01T00:02:00.000Z"),
+    );
+
+    try {
+      const ownerEnsure = ownerService.ensureTrueForgeSession(incident.id);
+      await expect(ownerEnsure).rejects.toThrow("invalid agent specification");
+      await expect(staleRecovery).resolves.toMatchObject({
+        outcome: "CREATION_UNCERTAIN",
+        state: "CREATION_UNCERTAIN",
+        sessionId: null,
+      });
+
+      expect(ownerService.getBindingByIncidentId(incident.id)).toBeNull();
+      const retry = await ownerService.ensureTrueForgeSession(incident.id);
+      expect(retry).toMatchObject({
+        outcome: "CREATED",
+        state: "ACTIVE",
+        sessionId: "replacement-session",
+      });
+      expect(staleRecoveryClient.createSession).not.toHaveBeenCalled();
+      expect(ownerClient.createSession).toHaveBeenCalledTimes(2);
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("does not release a stale uncertain reservation for a wrong token", async () => {
+    const incident = createIncident();
+    const creationToken = "stale-release-token";
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const observedAt = new Date(
+      Date.parse(createdAt) + TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
+    ).toISOString();
+    insertCreatingBinding(incident.id, creationToken, createdAt);
+    const client = createFakeClient();
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      () => observedAt,
+    );
+
+    await service.ensureTrueForgeSession(incident.id);
+    const repository = createTrueForgeSessionBindingRepository(database);
+
+    expect(
+      repository.releaseCreation(incident.id, "wrong-release-token"),
+    ).toBe(false);
+    expect(service.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "CREATION_UNCERTAIN",
+      creationToken,
+      trueForgeSessionId: null,
+    });
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
   it("classifies activation that wins stale recovery instead of overwriting it", async () => {
     const incident = createIncident();
     const creationToken = "activation-race-token";
