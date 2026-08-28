@@ -88,12 +88,15 @@ interface StreamOptions {
   expectedDeliveryId?: string;
   includeResponse?: boolean;
   includeRootToolCall?: boolean;
+  includeEmptySpawnResponse?: boolean;
   responseThreadId?: string;
   responseToolCallId?: string;
   responseContent?: string;
 }
 
-function makeStream(options: StreamOptions = {}): AsyncIterable<TrueForgeApi.TurnStreamingEvent> {
+function makeStream(
+  options: StreamOptions = {},
+): AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events: unknown[] } {
   const providerThreadId = "provider-thread-1";
   const toolCallId = "github-call-1";
   const events: unknown[] = [
@@ -210,7 +213,28 @@ function makeStream(options: StreamOptions = {}): AsyncIterable<TrueForgeApi.Tur
         options.responseContent ?? JSON.stringify(makeGithubResult()),
     });
   }
-
+  if (options.includeEmptySpawnResponse) {
+    // Matches the live TrueForge sequence:
+    // child finishes after its authoritative MCP response, then the root
+    // create_sub_agent system-tool completion emits content="".
+    events.push(
+      {
+        type: "model.message",
+        id: "provider-finished-event",
+        threadId: providerThreadId,
+        content: "Provider investigation complete.",
+        toolCalls: [],
+      },
+      {
+        type: "tool.response",
+        id: "spawn-provider-response-event",
+        createdAt: "2026-08-25T10:00:02.500Z",
+        threadId: "main",
+        toolCallId: "spawn-provider-1",
+        content: "",
+      },
+    );
+  }
   events.push({
     type: "turn.done",
     id: "turn-done-event",
@@ -233,6 +257,7 @@ function makeStream(options: StreamOptions = {}): AsyncIterable<TrueForgeApi.Tur
   }
 
   return {
+    events,
     async *[Symbol.asyncIterator]() {
       for (const event of events) {
         yield event as TrueForgeApi.TurnStreamingEvent;
@@ -241,14 +266,28 @@ function makeStream(options: StreamOptions = {}): AsyncIterable<TrueForgeApi.Tur
   };
 }
 
+function persistedEvents(events: unknown[]): AsyncIterable<TrueForgeApi.SessionEventItem> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) {
+        yield {
+          turnId: "turn-1",
+          event: event as TrueForgeApi.SessionEvent,
+        };
+      }
+    },
+  };
+}
+
 function createClient(
-  stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
+  stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events?: unknown[] },
 ) {
   return {
     createSession: vi.fn().mockResolvedValue("replacement-session"),
     getSession: vi.fn().mockResolvedValue({ id: "existing-session" }),
     updateSession: vi.fn().mockResolvedValue(undefined),
     createTurnStream: vi.fn().mockResolvedValue(stream),
+    listEvents: vi.fn().mockResolvedValue(persistedEvents(stream.events ?? [])),
   };
 }
 
@@ -277,6 +316,7 @@ describe("TrueForge provider investigation", () => {
   function installActiveBinding(
     incidentId: string,
     sessionId = "existing-session",
+    coordinatorSpecVersion: string = LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
   ): void {
     database.run(
       `
@@ -293,12 +333,52 @@ describe("TrueForge provider investigation", () => {
       [
         incidentId,
         sessionId,
-        LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+        coordinatorSpecVersion,
         "2026-01-01T00:00:00.000Z",
         "2026-01-01T00:00:00.000Z",
       ],
     );
   }
+
+  it("collects child MCP evidence from persisted events when the live stream omits it", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const persisted = makeStream();
+    const liveEvents = persisted.events.filter((event) =>
+      event !== null &&
+      typeof event === "object" &&
+      "type" in event &&
+      (event.type === "turn.created" || event.type === "turn.done"),
+    );
+    const liveStream = {
+      events: liveEvents,
+      async *[Symbol.asyncIterator]() {
+        for (const event of liveEvents) {
+          yield event as TrueForgeApi.TurnStreamingEvent;
+        }
+      },
+    };
+    const client = createClient(liveStream);
+    client.listEvents.mockResolvedValue(persistedEvents(persisted.events));
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(liveEvents.map((event) => (event as { type: string }).type)).toEqual([
+      "turn.created",
+      "turn.done",
+    ]);
+    expect(result).toMatchObject({
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "provider-thread-1",
+      providerStatusCode: 500,
+    });
+    expect(client.listEvents).toHaveBeenCalledWith("existing-session");
+  });
 
   it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
@@ -368,6 +448,35 @@ describe("TrueForge provider investigation", () => {
     expect(JSON.stringify(events)).not.toContain("receiver failed");
   });
 
+  it("reconciles the current v2 AgentSpec before using the existing session for a turn", async () => {
+    const incident = createIncident();
+    installActiveBinding(
+      incident.id,
+      "existing-v2-session",
+      RECOVERY_COORDINATOR_SPEC_VERSION,
+    );
+    const client = createClient(makeStream());
+    const service = createProviderInvestigationService(database, client, environment);
+
+    await service.investigateProviderForIncident(incident.id);
+
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-v2-session",
+      expect.objectContaining({
+        model: { name: environment.REDRIVE_TRUEFORGE_MODEL },
+        mcpServers: [
+          expect.objectContaining({
+            name: environment.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME,
+          }),
+        ],
+      }),
+    );
+    expect(client.updateSession.mock.invocationCallOrder[0]).toBeLessThan(
+      client.createTurnStream.mock.invocationCallOrder[0],
+    );
+  });
+
   it("captures first evidence from the correlated tool.response", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
@@ -430,9 +539,13 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).not.toHaveBeenCalled();
   });
 
-  it("does not start a turn when the in-place session upgrade fails", async () => {
+  it("does not start a turn when current v2 session reconciliation fails", async () => {
     const incident = createIncident();
-    installActiveBinding(incident.id, "v1-session");
+    installActiveBinding(
+      incident.id,
+      "v2-session",
+      RECOVERY_COORDINATOR_SPEC_VERSION,
+    );
     const client = createClient(makeStream());
     client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
     const service = createProviderInvestigationService(database, client, environment);
@@ -447,7 +560,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: RECOVERY_COORDINATOR_SPEC_VERSION });
   });
 
   it("rejects root-thread calls, wrong subagents, wrong MCP resources, and wrong IDs", async () => {
@@ -516,40 +629,44 @@ describe("TrueForge provider investigation", () => {
       makeStream({ includeResponse: false }),
     );
     // Replace the only model tool call with a prose-only model message.
+    const proseEvents = [
+      {
+        type: "turn.created",
+        id: "turn-created-event-prose",
+        turnId: "turn-prose",
+        state: { status: "running" },
+      },
+      {
+        type: "thread.created",
+        id: "thread-created-event-prose",
+        threadId: "provider-thread-prose",
+        title: "Provider investigator",
+        createdAt: "2026-08-25T10:00:01.000Z",
+        parent: { threadId: "main", toolCallId: "spawn-prose" },
+        agentInfo: {
+          type: "dynamic",
+          name: PROVIDER_INVESTIGATOR_NAME,
+          input: "provider-only investigation",
+        },
+      },
+      {
+        type: "model.message",
+        id: "prose-model-event",
+        threadId: "provider-thread-prose",
+        content: "GitHub returned HTTP 500",
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-event-prose",
+        state: { status: "done" },
+      },
+    ];
     proseClient.createTurnStream.mockResolvedValue({
       async *[Symbol.asyncIterator]() {
-        yield {
-          type: "turn.created",
-          id: "turn-created-event-prose",
-          turnId: "turn-prose",
-          state: { status: "running" },
-        } as never;
-        yield {
-          type: "thread.created",
-          id: "thread-created-event-prose",
-          threadId: "provider-thread-prose",
-          title: "Provider investigator",
-          createdAt: "2026-08-25T10:00:01.000Z",
-          parent: { threadId: "main", toolCallId: "spawn-prose" },
-          agentInfo: {
-            type: "dynamic",
-            name: PROVIDER_INVESTIGATOR_NAME,
-            input: "provider-only investigation",
-          },
-        } as never;
-        yield {
-          type: "model.message",
-          id: "prose-model-event",
-          threadId: "provider-thread-prose",
-          content: "GitHub returned HTTP 500",
-        } as never;
-        yield {
-          type: "turn.done",
-          id: "turn-done-event-prose",
-          state: { status: "done" },
-        } as never;
+        for (const event of proseEvents) yield event as never;
       },
     });
+    proseClient.listEvents.mockResolvedValue(persistedEvents(proseEvents));
     const proseService = createProviderInvestigationService(
       database,
       proseClient,
@@ -607,6 +724,61 @@ describe("TrueForge provider investigation", () => {
         (event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED",
       )?.details,
     ).toMatchObject({ sourceTrueForgeEventId: "tool-response-event" });
+  });
+
+  it("accepts an empty create_sub_agent response after correlated provider evidence", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+
+    const client = createClient(
+      makeStream({
+        includeEmptySpawnResponse: true,
+      }),
+    );
+
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+      () => "2026-08-25T09:59:00.000Z",
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      incidentId: incident.id,
+      trueForgeSessionId: "existing-session",
+      turnId: "turn-1",
+      providerInvestigatorThreadId: "provider-thread-1",
+      evidenceDisposition: "CAPTURED",
+      providerStatusCode: 500,
+    });
+
+    const evidence = createProviderEvidenceService(
+      database,
+      null,
+    ).getByIncidentId(incident.id);
+
+    expect(evidence).toMatchObject({
+      providerDeliveryId: deliveryId,
+      deliveryGuid: "logical-guid-1",
+      outcome: {
+        statusCode: 500,
+      },
+    });
+
+    const events = service.getWorkflowEvents(incident.id);
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      "PROVIDER_INVESTIGATION_STARTED",
+      "PROVIDER_INVESTIGATOR_STARTED",
+      "PROVIDER_EVIDENCE_CAPTURED",
+    ]);
+
+    expect(events[2]).toMatchObject({
+      trueForgeEventId: "tool-response-event",
+      toolCallId: "github-call-1",
+    });
   });
 });
 

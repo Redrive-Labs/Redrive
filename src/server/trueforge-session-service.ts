@@ -341,13 +341,10 @@ export function createTrueForgeSessionService(
     }
 
     const binding = session.binding;
-    if (binding.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION) {
-      return session;
-    }
-
     if (
       binding.coordinatorSpecVersion !==
-      LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION
+        LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION &&
+      binding.coordinatorSpecVersion !== RECOVERY_COORDINATOR_SPEC_VERSION
     ) {
       throw new TrueForgeUnsupportedCoordinatorSpecError(
         incidentId,
@@ -355,6 +352,9 @@ export function createTrueForgeSessionService(
       );
     }
 
+    // coordinatorSpecVersion tracks Redrive's semantic spec only. Reapply the
+    // desired spec so runtime-selected model and MCP resources stay current on
+    // this same inline session before a turn can begin.
     const coordinatorAgentSpec = getRecoveryCoordinatorAgentSpec(environment);
     if (typeof trueForgeClient.updateSession !== "function") {
       throw new TrueForgeSessionSpecUpgradeError(
@@ -371,6 +371,10 @@ export function createTrueForgeSessionService(
       throw new TrueForgeSessionSpecUpgradeError(incidentId, message, {
         cause: error,
       });
+    }
+
+    if (binding.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION) {
+      return session;
     }
 
     const upgraded = bindingRepository.updateCoordinatorSpecVersion(

@@ -47,6 +47,11 @@ describe("TrueForge SDK adapter", () => {
         yield { type: "turn.created" };
       },
     });
+    sdk.sessions.listEvents = vi.fn().mockResolvedValue({
+      async *[Symbol.asyncIterator]() {
+        yield { turnId: "turn-1", event: { type: "turn.created" } };
+      },
+    });
     const client = createTrueForgeClient(sdk);
     const spec = { model: { name: "configured-model" } } as never;
     const request = { input: [{ type: "user.message", content: "inspect" }] } as never;
@@ -57,6 +62,17 @@ describe("TrueForge SDK adapter", () => {
     for await (const event of stream) events.push(event);
 
     expect(events).toEqual([{ type: "turn.created" }]);
+    const persistedEvents = await client.listEvents("same-session");
+    const persisted = [];
+    for await (const item of persistedEvents) persisted.push(item);
+    expect(persisted).toEqual([
+      { turnId: "turn-1", event: { type: "turn.created" } },
+    ]);
+    expect(sdk.sessions.listEvents).toHaveBeenCalledWith(
+      "same-session",
+      undefined,
+      { maxRetries: 0 },
+    );
     expect(sdk.sessions.update).toHaveBeenCalledWith(
       "same-session",
       { agent: { spec } },

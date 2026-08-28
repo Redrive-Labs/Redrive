@@ -62,6 +62,11 @@ Set:
 The recovery route fails closed when any of these values is missing. It never
 derives a hook ID from a repository ID.
 
+`coordinator_spec_version` records the repository-owned semantic Redrive
+Coordinator spec version. Before each investigation turn, Redrive reconciles
+the current runtime model and GitHub MCP resource selection onto the same
+ACTIVE inline session; it does not create a replacement session.
+
 ## 4. Validate the canonical trace
 
 With the canonical incident's existing `ACTIVE` binding and immutable provider

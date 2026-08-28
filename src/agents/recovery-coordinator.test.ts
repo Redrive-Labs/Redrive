@@ -28,6 +28,7 @@ describe("Recovery Coordinator v2 spec", () => {
       {
         name: "redrive-github",
         enableTools: [GITHUB_WEBHOOK_DELIVERY_TOOL],
+        preload: true,
       },
     ]);
     expect(spec.skills).toEqual([{ name: PROVIDER_INVESTIGATION_SKILL_NAME }]);

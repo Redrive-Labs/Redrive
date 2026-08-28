@@ -77,6 +77,7 @@ export function getRecoveryCoordinatorAgentSpec(
       {
         name: githubMcpName,
         enableTools: [GITHUB_WEBHOOK_DELIVERY_TOOL],
+        preload: true
       },
     ],
     skills: [{ name: PROVIDER_INVESTIGATION_SKILL_NAME }],
