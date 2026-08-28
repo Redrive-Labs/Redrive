@@ -266,14 +266,11 @@ function makeStream(
   };
 }
 
-function persistedEvents(events: unknown[]): AsyncIterable<TrueForgeApi.SessionEventItem> {
+function persistedTurnEvents(events: unknown[]): AsyncIterable<TrueForgeApi.SessionEvent> {
   return {
     async *[Symbol.asyncIterator]() {
       for (const event of events) {
-        yield {
-          turnId: "turn-1",
-          event: event as TrueForgeApi.SessionEvent,
-        };
+        yield event as TrueForgeApi.SessionEvent;
       }
     },
   };
@@ -287,7 +284,9 @@ function createClient(
     getSession: vi.fn().mockResolvedValue({ id: "existing-session" }),
     updateSession: vi.fn().mockResolvedValue(undefined),
     createTurnStream: vi.fn().mockResolvedValue(stream),
-    listEvents: vi.fn().mockResolvedValue(persistedEvents(stream.events ?? [])),
+    listTurnEvents: vi.fn().mockResolvedValue(
+      persistedTurnEvents(stream.events ?? []),
+    ),
   };
 }
 
@@ -340,10 +339,18 @@ describe("TrueForge provider investigation", () => {
     );
   }
 
-  it("collects child MCP evidence from persisted events when the live stream omits it", async () => {
+  it("collects only the exact completed turn, not unrelated session history", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
     const persisted = makeStream();
+    const unrelatedSessionHistory = [
+      {
+        type: "model.message",
+        id: "unrelated-model-event",
+        threadId: "unrelated-thread",
+        content: "unrelated session history",
+      },
+    ];
     const liveEvents = persisted.events.filter((event) =>
       event !== null &&
       typeof event === "object" &&
@@ -359,7 +366,13 @@ describe("TrueForge provider investigation", () => {
       },
     };
     const client = createClient(liveStream);
-    client.listEvents.mockResolvedValue(persistedEvents(persisted.events));
+    client.listTurnEvents.mockImplementation((_sessionId, turnId) =>
+      Promise.resolve(
+        persistedTurnEvents(
+          turnId === "turn-1" ? persisted.events : unrelatedSessionHistory,
+        ),
+      ),
+    );
     const service = createProviderInvestigationService(
       database,
       client,
@@ -377,7 +390,10 @@ describe("TrueForge provider investigation", () => {
       providerInvestigatorThreadId: "provider-thread-1",
       providerStatusCode: 500,
     });
-    expect(client.listEvents).toHaveBeenCalledWith("existing-session");
+    expect(client.listTurnEvents).toHaveBeenCalledWith(
+      "existing-session",
+      "turn-1",
+    );
   });
 
   it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
@@ -666,7 +682,9 @@ describe("TrueForge provider investigation", () => {
         for (const event of proseEvents) yield event as never;
       },
     });
-    proseClient.listEvents.mockResolvedValue(persistedEvents(proseEvents));
+    proseClient.listTurnEvents.mockResolvedValue(
+      persistedTurnEvents(proseEvents),
+    );
     const proseService = createProviderInvestigationService(
       database,
       proseClient,

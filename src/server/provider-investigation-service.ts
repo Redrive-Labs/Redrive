@@ -442,103 +442,6 @@ async function collectTurnLifecycle(
   return turnId;
 }
 
-interface PersistedTurnEvent {
-  event: RecordValue;
-  sourceIndex: number;
-}
-
-function persistedEventRank(event: RecordValue): number {
-  switch (event.type) {
-    case "turn.created":
-      return 0;
-    case "thread.created":
-      return 1;
-    case "model.message":
-      return 2;
-    case "tool.response":
-      return 3;
-    case "turn.done":
-      return 4;
-    default:
-      return 5;
-  }
-}
-
-async function* collectPersistedTurnEvents(
-  items: AsyncIterable<TrueForgeApi.SessionEventItem>,
-  completedTurnId: string,
-): AsyncIterable<TrueForgeApi.TurnStreamingEvent> {
-  const events: PersistedTurnEvent[] = [];
-  let sourceIndex = 0;
-
-  for await (const item of items) {
-    if (!isRecord(item)) {
-      throw new ProviderInvestigationTurnError(
-        "TrueForge persisted session events contained an invalid item.",
-      );
-    }
-    const itemTurnId = requiredString(
-      item,
-      "turnId",
-      "persisted session event item",
-    );
-    if (!isRecord(item.event)) {
-      throw new ProviderInvestigationTurnError(
-        "TrueForge persisted session event item contained an invalid event.",
-      );
-    }
-    const event = item.event;
-    if (eventType(event) === "turn.created") {
-      const eventTurnId = requiredString(
-        event,
-        "turnId",
-        "persisted turn.created event",
-      );
-      if (eventTurnId !== itemTurnId) {
-        throw new ProviderInvestigationTurnError(
-          "TrueForge persisted turn.created attribution does not match its turn.",
-        );
-      }
-    }
-    if (itemTurnId === completedTurnId) {
-      events.push({ event, sourceIndex });
-    }
-    sourceIndex += 1;
-  }
-
-  if (events.length === 0) {
-    throw new ProviderInvestigationTurnError(
-      "TrueForge persisted session events did not contain the completed turn.",
-    );
-  }
-
-  const allHaveCreatedAt = events.every(
-    ({ event }) => typeof event.createdAt === "string" && event.createdAt.length > 0,
-  );
-  events.sort((left, right) => {
-    if (allHaveCreatedAt) {
-      const leftCreatedAt = left.event.createdAt as string;
-      const rightCreatedAt = right.event.createdAt as string;
-      const byTime =
-        leftCreatedAt < rightCreatedAt
-          ? -1
-          : leftCreatedAt > rightCreatedAt
-            ? 1
-            : 0;
-      if (byTime !== 0) return byTime;
-    } else {
-      const byRank =
-        persistedEventRank(left.event) - persistedEventRank(right.event);
-      if (byRank !== 0) return byRank;
-    }
-    return left.sourceIndex - right.sourceIndex;
-  });
-
-  for (const { event } of events) {
-    yield event as unknown as TrueForgeApi.TurnStreamingEvent;
-  }
-}
-
 async function collectProviderTurn(
   stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
   expectedHookId: string,
@@ -940,8 +843,8 @@ export function createProviderInvestigationService(
       let collected: CollectedProviderTurn;
       try {
         // The live stream is only a turn-creation/terminal-status channel.
-        // Dynamic child events are read from the persisted session event log
-        // after the server reports the turn completed.
+        // Dynamic child events are read from the exact persisted turn after the
+        // server reports the turn completed.
         const completedTurnId = await collectTurnLifecycle(
           stream,
           (attribution) => {
@@ -950,11 +853,12 @@ export function createProviderInvestigationService(
               attribution.trueForgeEventId ?? trueForgeEventId;
           },
         );
-        const persistedEvents = await trueForgeClient.listEvents(
+        const persistedEvents = await trueForgeClient.listTurnEvents(
           upgraded.sessionId,
+          completedTurnId,
         );
         collected = await collectProviderTurn(
-          collectPersistedTurnEvents(persistedEvents, completedTurnId),
+          persistedEvents,
           hookId,
           incident.externalDeliveryId,
           configuredMcpName,

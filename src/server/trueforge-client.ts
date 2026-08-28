@@ -31,9 +31,10 @@ export interface TrueForgeTurnClient {
     sessionId: string,
     request: TrueForgeApi.CreateTurnSessionsStreamRequest,
   ): Promise<AsyncIterable<TrueForgeApi.TurnStreamingEvent>>;
-  listEvents(
+  listTurnEvents(
     sessionId: string,
-  ): Promise<AsyncIterable<TrueForgeApi.SessionEventItem>>;
+    turnId: string,
+  ): Promise<AsyncIterable<TrueForgeApi.SessionEvent>>;
 }
 
 export type TrueForgeIncidentClient = TrueForgeSessionClient &
@@ -271,11 +272,12 @@ export function createTrueForgeClient(
       }
     },
 
-    async listEvents(sessionId) {
+    async listTurnEvents(sessionId, turnId) {
       try {
-        return await sdk.sessions.listEvents(
+        return await sdk.sessions.listTurnEvents(
           sessionId,
-          undefined,
+          turnId,
+          { order: "asc" },
           { maxRetries: 0 },
         );
       } catch (error) {

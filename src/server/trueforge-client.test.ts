@@ -17,6 +17,7 @@ function createSdkDouble() {
     sessions: {
       create: vi.fn(),
       get: vi.fn(),
+      listTurnEvents: vi.fn(),
     },
   } as unknown as TrueForgeSdk;
 }
@@ -39,7 +40,7 @@ describe("TrueForge SDK adapter", () => {
     );
   });
 
-  it("uses inline session update and streaming turn operations without SDK retries", async () => {
+  it("uses inline session update and exact-turn events without SDK retries", async () => {
     const sdk = createSdkDouble();
     sdk.sessions.update = vi.fn().mockResolvedValue({ data: { id: "same-session" } });
     sdk.sessions.createTurnStream = vi.fn().mockResolvedValue({
@@ -47,11 +48,12 @@ describe("TrueForge SDK adapter", () => {
         yield { type: "turn.created" };
       },
     });
-    sdk.sessions.listEvents = vi.fn().mockResolvedValue({
+    const page = {
       async *[Symbol.asyncIterator]() {
-        yield { turnId: "turn-1", event: { type: "turn.created" } };
+        yield { type: "turn.created" };
       },
-    });
+    };
+    sdk.sessions.listTurnEvents = vi.fn().mockResolvedValue(page);
     const client = createTrueForgeClient(sdk);
     const spec = { model: { name: "configured-model" } } as never;
     const request = { input: [{ type: "user.message", content: "inspect" }] } as never;
@@ -62,15 +64,18 @@ describe("TrueForge SDK adapter", () => {
     for await (const event of stream) events.push(event);
 
     expect(events).toEqual([{ type: "turn.created" }]);
-    const persistedEvents = await client.listEvents("same-session");
-    const persisted = [];
-    for await (const item of persistedEvents) persisted.push(item);
-    expect(persisted).toEqual([
-      { turnId: "turn-1", event: { type: "turn.created" } },
-    ]);
-    expect(sdk.sessions.listEvents).toHaveBeenCalledWith(
+    const persistedEvents = await client.listTurnEvents(
       "same-session",
-      undefined,
+      "completed-turn-id",
+    );
+    expect(persistedEvents).toBe(page);
+    const persisted = [];
+    for await (const event of persistedEvents) persisted.push(event);
+    expect(persisted).toEqual([{ type: "turn.created" }]);
+    expect(sdk.sessions.listTurnEvents).toHaveBeenCalledWith(
+      "same-session",
+      "completed-turn-id",
+      { order: "asc" },
       { maxRetries: 0 },
     );
     expect(sdk.sessions.update).toHaveBeenCalledWith(
