@@ -39,6 +39,36 @@ describe("TrueForge SDK adapter", () => {
     );
   });
 
+  it("uses inline session update and streaming turn operations without SDK retries", async () => {
+    const sdk = createSdkDouble();
+    sdk.sessions.update = vi.fn().mockResolvedValue({ data: { id: "same-session" } });
+    sdk.sessions.createTurnStream = vi.fn().mockResolvedValue({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "turn.created" };
+      },
+    });
+    const client = createTrueForgeClient(sdk);
+    const spec = { model: { name: "configured-model" } } as never;
+    const request = { input: [{ type: "user.message", content: "inspect" }] } as never;
+
+    await client.updateSession("same-session", spec);
+    const stream = await client.createTurnStream("same-session", request);
+    const events = [];
+    for await (const event of stream) events.push(event);
+
+    expect(events).toEqual([{ type: "turn.created" }]);
+    expect(sdk.sessions.update).toHaveBeenCalledWith(
+      "same-session",
+      { agent: { spec } },
+      { maxRetries: 0 },
+    );
+    expect(sdk.sessions.createTurnStream).toHaveBeenCalledWith(
+      "same-session",
+      request,
+      { maxRetries: 0 },
+    );
+  });
+
   it("classifies server validation failures as definitive create failures", async () => {
     const sdk = createSdkDouble();
     sdk.sessions.create = vi.fn().mockRejectedValue(

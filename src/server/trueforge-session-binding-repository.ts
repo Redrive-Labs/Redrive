@@ -247,6 +247,48 @@ export function createTrueForgeSessionBindingRepository(
     }, "immediate");
   }
 
+  function updateCoordinatorSpecVersion(
+    incidentId: string,
+    trueForgeSessionId: string,
+    expectedVersion: string,
+    nextVersion: string,
+    now: string,
+  ): TrueForgeSessionBinding | null {
+    return database.transaction(() => {
+      const update = database.run(
+        `
+          UPDATE trueforge_session_bindings
+          SET
+            coordinator_spec_version = @nextVersion,
+            updated_at = @now
+          WHERE incident_id = @incidentId
+            AND state = 'ACTIVE'
+            AND trueforge_session_id = @trueForgeSessionId
+            AND coordinator_spec_version = @expectedVersion
+        `,
+        {
+          incidentId,
+          trueForgeSessionId,
+          expectedVersion,
+          nextVersion,
+          now,
+        },
+      );
+
+      if (update.changes !== 1) {
+        return null;
+      }
+
+      const updated = getByIncidentId(incidentId);
+      if (updated === null || updated.state !== "ACTIVE") {
+        throw new Error(
+          "TrueForge Coordinator spec version update was not persisted.",
+        );
+      }
+      return updated;
+    }, "immediate");
+  }
+
   function markLost(
     incidentId: string,
     trueForgeSessionId: string,
@@ -288,6 +330,7 @@ export function createTrueForgeSessionBindingRepository(
     activate,
     markCreationUncertain,
     releaseCreation,
+    updateCoordinatorSpecVersion,
     markLost,
   };
 }

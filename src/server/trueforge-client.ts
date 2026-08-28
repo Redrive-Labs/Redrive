@@ -22,6 +22,20 @@ export interface TrueForgeSessionClient {
   getSession(sessionId: string): Promise<unknown>;
 }
 
+export interface TrueForgeTurnClient {
+  updateSession(
+    sessionId: string,
+    spec: TrueForgeApi.AgentSpec,
+  ): Promise<void>;
+  createTurnStream(
+    sessionId: string,
+    request: TrueForgeApi.CreateTurnSessionsStreamRequest,
+  ): Promise<AsyncIterable<TrueForgeApi.TurnStreamingEvent>>;
+}
+
+export type TrueForgeIncidentClient = TrueForgeSessionClient &
+  TrueForgeTurnClient;
+
 export class TrueForgeConfigurationError extends Error {
   constructor(message: string) {
     super(message);
@@ -64,6 +78,34 @@ export class TrueForgeSessionLookupError extends Error {
   ) {
     super(`TrueForge session ${sessionId} could not be read: ${message}`, options);
     this.name = "TrueForgeSessionLookupError";
+    this.statusCode = options?.statusCode;
+  }
+}
+
+export class TrueForgeSessionUpdateError extends Error {
+  readonly statusCode: number | undefined;
+
+  constructor(
+    sessionId: string,
+    message: string,
+    options?: ErrorOptions & { statusCode?: number },
+  ) {
+    super(`TrueForge session ${sessionId} could not be updated: ${message}`, options);
+    this.name = "TrueForgeSessionUpdateError";
+    this.statusCode = options?.statusCode;
+  }
+}
+
+export class TrueForgeTurnCreateError extends Error {
+  readonly statusCode: number | undefined;
+
+  constructor(
+    sessionId: string,
+    message: string,
+    options?: ErrorOptions & { statusCode?: number },
+  ) {
+    super(`TrueForge turn for session ${sessionId} could not be created: ${message}`, options);
+    this.name = "TrueForgeTurnCreateError";
     this.statusCode = options?.statusCode;
   }
 }
@@ -141,6 +183,32 @@ function lookupErrorFromUnknown(
   });
 }
 
+function sessionUpdateErrorFromUnknown(
+  sessionId: string,
+  error: unknown,
+): TrueForgeSessionUpdateError {
+  const statusCode = readStatusCode(error);
+  const message =
+    error instanceof Error ? error.message : "TrueForge session update failed.";
+  return new TrueForgeSessionUpdateError(sessionId, message, {
+    cause: error,
+    statusCode,
+  });
+}
+
+function turnCreateErrorFromUnknown(
+  sessionId: string,
+  error: unknown,
+): TrueForgeTurnCreateError {
+  const statusCode = readStatusCode(error);
+  const message =
+    error instanceof Error ? error.message : "TrueForge turn creation failed.";
+  return new TrueForgeTurnCreateError(sessionId, message, {
+    cause: error,
+    statusCode,
+  });
+}
+
 export interface TrueForgeClientOptions {
   baseUrl: string;
   token?: string;
@@ -148,13 +216,13 @@ export interface TrueForgeClientOptions {
 }
 
 /**
- * Adapt only the two TrueForge operations needed by the incident spine.
+ * Adapt the bounded TrueForge operations used by the incident spine.
  * Automatic SDK retries are disabled because a retried POST could create a
- * second remote session after an ambiguous response.
+ * second remote session or turn after an ambiguous response.
  */
 export function createTrueForgeClient(
   sdk: TrueForgeSdk,
-): TrueForgeSessionClient {
+): TrueForgeIncidentClient {
   return {
     async createSession(spec) {
       try {
@@ -173,6 +241,30 @@ export function createTrueForgeClient(
         return await sdk.sessions.get(sessionId, { maxRetries: 0 });
       } catch (error) {
         throw lookupErrorFromUnknown(sessionId, error);
+      }
+    },
+
+    async updateSession(sessionId, spec) {
+      try {
+        await sdk.sessions.update(
+          sessionId,
+          { agent: { spec } },
+          { maxRetries: 0 },
+        );
+      } catch (error) {
+        throw sessionUpdateErrorFromUnknown(sessionId, error);
+      }
+    },
+
+    async createTurnStream(sessionId, request) {
+      try {
+        return await sdk.sessions.createTurnStream(
+          sessionId,
+          request,
+          { maxRetries: 0 },
+        );
+      } catch (error) {
+        throw turnCreateErrorFromUnknown(sessionId, error);
       }
     },
   };
@@ -212,7 +304,7 @@ export function getTrueForgeClientOptions(
 export function createConfiguredTrueForgeClient(
   environment: NodeJS.ProcessEnv = process.env,
   fetchImplementation: typeof fetch = fetch,
-): TrueForgeSessionClient {
+): TrueForgeIncidentClient {
   const options = getTrueForgeClientOptions(environment);
   const sdk = new TrueForgeSdk({
     baseUrl: options.baseUrl,

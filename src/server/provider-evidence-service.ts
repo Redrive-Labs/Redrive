@@ -34,6 +34,25 @@ export class ProviderEvidenceReadError extends Error {
   }
 }
 
+export type ProviderEvidenceDisposition = "CAPTURED" | "REOBSERVED";
+
+export interface ProviderEvidenceCaptureResult {
+  evidence: ProviderEvidence;
+  disposition: ProviderEvidenceDisposition;
+}
+
+export class ProviderEvidenceConflictError extends Error {
+  readonly existing: ProviderEvidence;
+  readonly observation: ProviderEvidence;
+
+  constructor(existing: ProviderEvidence, observation: ProviderEvidence) {
+    super("The provider observation conflicts with immutable ProviderEvidence.");
+    this.name = "ProviderEvidenceConflictError";
+    this.existing = existing;
+    this.observation = observation;
+  }
+}
+
 interface ProviderEvidenceRow extends Record<string, unknown> {
   incidentId: unknown;
   schemaVersion: unknown;
@@ -126,9 +145,43 @@ const providerEvidenceColumns = `
   captured_at AS capturedAt
 `;
 
+function canonicalizeForComparison(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalizeForComparison).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      )
+      .map(
+        ([key, item]) =>
+          `${JSON.stringify(key)}:${canonicalizeForComparison(item)}`,
+      );
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function providerEvidenceMatchesIgnoringCaptureTime(
+  left: ProviderEvidence,
+  right: ProviderEvidence,
+): boolean {
+  const { capturedAt: _leftCapturedAt, ...leftFacts } = left;
+  const { capturedAt: _rightCapturedAt, ...rightFacts } = right;
+  return (
+    canonicalizeForComparison(leftFacts) ===
+    canonicalizeForComparison(rightFacts)
+  );
+}
+
 export function createProviderEvidenceService(
   database: SqliteDatabase,
-  githubDeliveryReader: GithubWebhookDeliveryReader,
+  githubDeliveryReader: GithubWebhookDeliveryReader | null,
   now: () => string = () => new Date().toISOString(),
 ) {
   const incidentService = createIncidentService(database);
@@ -164,48 +217,65 @@ export function createProviderEvidenceService(
     return new Set(rows.map((row) => row.incidentId));
   }
 
-  async function inspectForIncident(
-    incidentId: string,
-  ): Promise<ProviderEvidence> {
+  function getIncidentOrThrow(incidentId: string) {
     const incident = incidentService.getById(incidentId);
-
     if (incident === null) {
       throw new IncidentNotFoundError(incidentId);
     }
+    return incident;
+  }
 
-    const existing = getByIncidentId(incidentId);
-    if (existing !== null) return existing;
-
+  function normalizeForIncident(
+    incidentId: string,
+    result: unknown,
+    capturedAt = now(),
+  ): ProviderEvidence {
+    const incident = getIncidentOrThrow(incidentId);
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
     }
 
-    let result: unknown;
+    return normalizeGithubWebhookDelivery(
+      result,
+      {
+        repositoryId: incident.repositoryId,
+        deliveryId: incident.externalDeliveryId,
+      },
+      capturedAt,
+    );
+  }
+
+  async function obtainForIncident(incidentId: string): Promise<unknown> {
+    const incident = getIncidentOrThrow(incidentId);
+    if (incident.provider !== GITHUB_PROVIDER) {
+      throw new UnsupportedProviderEvidenceError(incident.provider);
+    }
+
+    if (githubDeliveryReader === null) {
+      throw new ProviderEvidenceReadError();
+    }
+
     try {
-      result = await githubDeliveryReader.getWebhookDelivery({
+      return await githubDeliveryReader.getWebhookDelivery({
         repositoryId: incident.repositoryId,
         deliveryId: incident.externalDeliveryId,
       });
     } catch (error) {
       throw new ProviderEvidenceReadError({ cause: error });
     }
+  }
 
-    const evidence: ProviderEvidence = normalizeGithubWebhookDelivery(
-      result,
-      {
-        repositoryId: incident.repositoryId,
-        deliveryId: incident.externalDeliveryId,
-      },
-      now(),
-    );
-
+  function persistNormalizedEvidence(
+    incidentId: string,
+    evidence: ProviderEvidence,
+  ): ProviderEvidenceCaptureResult {
     const evidenceJson = JSON.stringify(evidence);
     if (evidenceJson === undefined) {
       throw new Error("Provider evidence could not be serialized.");
     }
 
-    database.transaction(() => {
-      database.run(
+    const inserted = database.transaction(() => {
+      const insertion = database.run(
         `
           INSERT INTO provider_evidence (
             incident_id,
@@ -248,18 +318,60 @@ export function createProviderEvidenceService(
           capturedAt: evidence.capturedAt,
         },
       );
+      return insertion.changes === 1;
     }, "immediate");
 
     const persisted = getByIncidentId(incidentId);
     if (persisted === null) {
       throw new Error("Provider evidence insert did not produce a persisted snapshot.");
     }
-    return persisted;
+
+    if (
+      providerEvidenceMatchesIgnoringCaptureTime(persisted, evidence)
+    ) {
+      return {
+        evidence: persisted,
+        disposition: inserted ? "CAPTURED" : "REOBSERVED",
+      };
+    }
+
+    throw new ProviderEvidenceConflictError(persisted, evidence);
+  }
+
+  function captureOrReconcileForIncident(
+    incidentId: string,
+    result: unknown,
+  ): ProviderEvidenceCaptureResult {
+    const evidence = normalizeForIncident(incidentId, result);
+    const existing = getByIncidentId(incidentId);
+
+    if (existing !== null) {
+      if (providerEvidenceMatchesIgnoringCaptureTime(existing, evidence)) {
+        return { evidence: existing, disposition: "REOBSERVED" };
+      }
+      throw new ProviderEvidenceConflictError(existing, evidence);
+    }
+
+    return persistNormalizedEvidence(incidentId, evidence);
+  }
+
+  async function inspectForIncident(
+    incidentId: string,
+  ): Promise<ProviderEvidence> {
+    getIncidentOrThrow(incidentId);
+    const existing = getByIncidentId(incidentId);
+    if (existing !== null) return existing;
+
+    const result = await obtainForIncident(incidentId);
+    return captureOrReconcileForIncident(incidentId, result).evidence;
   }
 
   return {
     getByIncidentId,
     getCapturedIncidentIds,
+    normalizeForIncident,
+    obtainForIncident,
+    captureOrReconcileForIncident,
     inspectForIncident,
   };
 }

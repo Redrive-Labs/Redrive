@@ -3,6 +3,7 @@ import {
   createGithubMcpToolCaller,
   createGithubWebhookDeliveryReader,
   GithubMcpConfigurationError,
+  resolveConfiguredGithubHookId,
   GithubMcpError,
   GithubMcpResponseTooLargeError,
   GithubMcpTimeoutError,
@@ -68,6 +69,22 @@ describe("GitHub MCP boundary", () => {
       hook_id: "670245925",
       delivery_id: lookup.deliveryId,
     });
+  });
+
+  it("resolves the same explicit hook mapping used by provider investigation", () => {
+    expect(
+      resolveConfiguredGithubHookId("example/receiver", {
+        NODE_ENV: "test",
+        REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ "example/receiver": "hook-42" }),
+        REDRIVE_GITHUB_HOOK_ID: "fallback-hook",
+      }),
+    ).toBe("hook-42");
+    expect(
+      resolveConfiguredGithubHookId("other/receiver", {
+        NODE_ENV: "test",
+        REDRIVE_GITHUB_HOOK_ID: "fallback-hook",
+      }),
+    ).toBe("fallback-hook");
   });
 
   it("fails closed when the hook mapping is missing", async () => {

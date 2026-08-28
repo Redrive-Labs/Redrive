@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 
+import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 import {
   getRecoveryCoordinatorAgentSpec,
+  LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
   RECOVERY_COORDINATOR_SPEC_VERSION,
 } from "@/agents/recovery-coordinator";
 import type {
@@ -56,6 +58,39 @@ export class TrueForgeSessionBindingError extends Error {
   }
 }
 
+export class TrueForgeSessionUnavailableError extends Error {
+  constructor(incidentId: string) {
+    super(`TrueForge session for incident ${incidentId} is not usable.`);
+    this.name = "TrueForgeSessionUnavailableError";
+  }
+}
+
+export class TrueForgeSessionSpecUpgradeError extends Error {
+  constructor(incidentId: string, message: string, options?: ErrorOptions) {
+    super(
+      `TrueForge Coordinator spec for incident ${incidentId} could not be upgraded: ${message}`,
+      options,
+    );
+    this.name = "TrueForgeSessionSpecUpgradeError";
+  }
+}
+
+export class TrueForgeUnsupportedCoordinatorSpecError extends Error {
+  constructor(incidentId: string, version: string) {
+    super(
+      `TrueForge Coordinator spec version ${version} for incident ${incidentId} is newer than this Redrive version supports.`,
+    );
+    this.name = "TrueForgeUnsupportedCoordinatorSpecError";
+  }
+}
+
+type TrueForgeSessionUpgradeClient = TrueForgeSessionClient & {
+  updateSession?: (
+    sessionId: string,
+    spec: TrueForgeApi.AgentSpec,
+  ) => Promise<void>;
+};
+
 function resultFor(
   binding: TrueForgeSessionBinding,
   outcome: TrueForgeSessionEnsureOutcome,
@@ -99,7 +134,7 @@ function isDefinitiveCreateFailure(error: unknown): boolean {
 
 export function createTrueForgeSessionService(
   database: SqliteDatabase,
-  trueForgeClient: TrueForgeSessionClient,
+  trueForgeClient: TrueForgeSessionUpgradeClient,
   now: () => string = () => new Date().toISOString(),
   environment: NodeJS.ProcessEnv = process.env,
 ) {
@@ -291,18 +326,111 @@ export function createTrueForgeSessionService(
     });
   }
 
+  async function ensureCoordinatorV2(
+    incidentId: string,
+    ensured?: TrueForgeSessionEnsureResult,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    const session = ensured ?? (await ensure(incidentId));
+
+    if (
+      session.state !== "ACTIVE" ||
+      session.sessionId === null ||
+      (session.outcome !== "CREATED" && session.outcome !== "REUSED")
+    ) {
+      return session;
+    }
+
+    const binding = session.binding;
+    if (binding.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION) {
+      return session;
+    }
+
+    if (
+      binding.coordinatorSpecVersion !==
+      LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION
+    ) {
+      throw new TrueForgeUnsupportedCoordinatorSpecError(
+        incidentId,
+        binding.coordinatorSpecVersion,
+      );
+    }
+
+    const coordinatorAgentSpec = getRecoveryCoordinatorAgentSpec(environment);
+    if (typeof trueForgeClient.updateSession !== "function") {
+      throw new TrueForgeSessionSpecUpgradeError(
+        incidentId,
+        "the TrueForge client does not support inline session updates",
+      );
+    }
+
+    try {
+      await trueForgeClient.updateSession(session.sessionId, coordinatorAgentSpec);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "remote update failed";
+      throw new TrueForgeSessionSpecUpgradeError(incidentId, message, {
+        cause: error,
+      });
+    }
+
+    const upgraded = bindingRepository.updateCoordinatorSpecVersion(
+      incidentId,
+      session.sessionId,
+      LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+      RECOVERY_COORDINATOR_SPEC_VERSION,
+      now(),
+    );
+
+    if (upgraded !== null) {
+      return resultFor(upgraded, session.outcome, {
+        retryable: session.retryable,
+        reused: session.reused,
+      });
+    }
+
+    const current = bindingRepository.getByIncidentId(incidentId);
+    if (
+      current?.state === "ACTIVE" &&
+      current.trueForgeSessionId === session.sessionId &&
+      current.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION
+    ) {
+      return resultFor(current, session.outcome, {
+        retryable: session.retryable,
+        reused: session.reused,
+      });
+    }
+
+    if (
+      current !== null &&
+      current !== undefined &&
+      current.coordinatorSpecVersion !==
+        LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION
+    ) {
+      throw new TrueForgeUnsupportedCoordinatorSpecError(
+        incidentId,
+        current.coordinatorSpecVersion,
+      );
+    }
+
+    throw new TrueForgeSessionSpecUpgradeError(
+      incidentId,
+      "the durable binding changed before its v2 version could be recorded",
+    );
+  }
+
   return {
     getBindingByIncidentId,
     ensureTrueForgeSession: ensure,
+    ensureCoordinatorV2,
   };
 }
 
 type TrueForgeSessionService = ReturnType<typeof createTrueForgeSessionService>;
 
-function createLazyConfiguredTrueForgeClient(): TrueForgeSessionClient {
-  let configured: TrueForgeSessionClient | undefined;
+function createLazyConfiguredTrueForgeClient(): TrueForgeSessionUpgradeClient {
+  let configured: TrueForgeSessionUpgradeClient | undefined;
 
-  function getConfigured(): TrueForgeSessionClient {
+  function getConfigured(): TrueForgeSessionUpgradeClient {
     configured ??= createConfiguredTrueForgeClient();
     return configured;
   }
@@ -313,6 +441,11 @@ function createLazyConfiguredTrueForgeClient(): TrueForgeSessionClient {
     },
     getSession(sessionId) {
       return getConfigured().getSession(sessionId);
+    },
+    updateSession(sessionId, spec) {
+      return getConfigured().updateSession?.(sessionId, spec) ?? Promise.reject(
+        new Error("TrueForge session updates are not configured."),
+      );
     },
   };
 }

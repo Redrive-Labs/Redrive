@@ -184,7 +184,7 @@ function isUnsafeIntegerLiteral(literal: string): boolean {
   return integer > MAX_SAFE_INTEGER_DECIMAL;
 }
 
-function parseProvenDeliveryJson(text: string): unknown {
+export function parseGithubMcpToolResultJson(text: string): unknown {
   const unsafeIntegerSentinel = randomUUID();
   const unsafeIntegers: string[] = [];
   let protectedText = "";
@@ -315,7 +315,7 @@ function parseJsonRpcEnvelope(text: string, requestId: string): unknown {
     throw new GithubMcpError("GitHub MCP result text item is invalid.");
   }
 
-  return parseProvenDeliveryJson(item.text);
+  return parseGithubMcpToolResultJson(item.text);
 }
 
 function parseTransportResponse(
@@ -576,6 +576,35 @@ function readHookIdMap(
   return hookIds;
 }
 
+/**
+ * Resolve a webhook hook only from explicit Redrive configuration. This is
+ * shared by direct diagnostic capture and the TrueForge provider path so the
+ * model never gets to select or derive a hook ID.
+ */
+export function resolveConfiguredGithubHookId(
+  repositoryId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  if (repositoryId.length === 0) {
+    throw new GithubMcpConfigurationError(
+      "A repository ID is required to resolve a GitHub webhook hook ID.",
+    );
+  }
+
+  const hookIds = readHookIdMap(environment);
+  const singleHookId = environment.REDRIVE_GITHUB_HOOK_ID?.trim();
+  const hookId = hookIds[repositoryId] ?? singleHookId;
+
+  if (hookId === undefined || hookId.length === 0) {
+    throw new GithubMcpConfigurationError(
+      "No explicit GitHub webhook hook ID is configured for repository " +
+        `${repositoryId}.`,
+    );
+  }
+
+  return hookId;
+}
+
 export function createConfiguredGithubWebhookDeliveryReader(
   environment: NodeJS.ProcessEnv = process.env,
   fetchImplementation: typeof fetch = fetch,
@@ -587,24 +616,13 @@ export function createConfiguredGithubWebhookDeliveryReader(
     );
   }
 
-  const hookIds = readHookIdMap(environment);
-  const singleHookId = environment.REDRIVE_GITHUB_HOOK_ID?.trim();
   const callTool = createGithubMcpToolCaller({
     endpoint,
     token: environment.REDRIVE_GITHUB_MCP_TOKEN,
     fetchImplementation,
   });
 
-  return createGithubWebhookDeliveryReader(callTool, (repositoryId) => {
-    const hookId = hookIds[repositoryId] ?? singleHookId;
-
-    if (hookId === undefined || hookId.length === 0) {
-      throw new GithubMcpConfigurationError(
-        "No explicit GitHub webhook hook ID is configured for repository " +
-          `${repositoryId}.`,
-      );
-    }
-
-    return hookId;
-  });
+  return createGithubWebhookDeliveryReader(callTool, (repositoryId) =>
+    resolveConfiguredGithubHookId(repositoryId, environment),
+  );
 }

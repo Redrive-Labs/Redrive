@@ -41,6 +41,32 @@ const trueforgeSessionBindingsTableSql = `
   );
 `;
 
+const incidentWorkflowEventsTableSql = `
+  CREATE TABLE incident_workflow_events (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+      'PROVIDER_INVESTIGATION_STARTED',
+      'PROVIDER_INVESTIGATOR_STARTED',
+      'PROVIDER_EVIDENCE_CAPTURED',
+      'PROVIDER_EVIDENCE_REOBSERVED',
+      'PROVIDER_OBSERVATION_CONFLICT',
+      'PROVIDER_INVESTIGATION_FAILED'
+    )),
+    trueforge_session_id TEXT,
+    turn_id TEXT,
+    provider_investigator_thread_id TEXT,
+    trueforge_event_id TEXT UNIQUE,
+    tool_call_id TEXT,
+    occurred_at TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX incident_workflow_events_incident_idx
+    ON incident_workflow_events (incident_id, occurred_at, id);
+`;
+
 const migrations: Migration[] = [
   {
     version: 1,
@@ -101,6 +127,10 @@ const migrations: Migration[] = [
     // the recorded version intact and normalize that table in a forward,
     // transactional migration instead of stranding those databases.
     apply: repairTrueForgeSessionBindings,
+  },
+  {
+    version: 6,
+    sql: incidentWorkflowEventsTableSql,
   },
 ];
 

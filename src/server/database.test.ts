@@ -281,6 +281,7 @@ function runIndependentDatabaseOpener(
 function installRecordedMalformedV4BindingTable(
   database: SqliteDatabase,
 ): void {
+  database.exec("DROP TABLE IF EXISTS incident_workflow_events");
   database.exec("DROP TABLE trueforge_session_bindings");
   database.run("DELETE FROM schema_migrations WHERE version >= ?", [4]);
   database.exec(`
@@ -524,6 +525,7 @@ describe("native SQLite persistence", () => {
       { version: 3 },
       { version: 4 },
       { version: 5 },
+      { version: 6 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -717,6 +719,7 @@ describe("native SQLite persistence", () => {
       { version: 3 },
       { version: 4 },
       { version: 5 },
+      { version: 6 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -762,7 +765,7 @@ describe("native SQLite persistence", () => {
       results.map((result) => JSON.parse(result.stdout)),
     ).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5],
+        migrationVersions: [1, 2, 3, 4, 5, 6],
         incidentCount: 0,
       })),
     );
@@ -779,6 +782,7 @@ describe("native SQLite persistence", () => {
         { version: 3 },
         { version: 4 },
         { version: 5 },
+        { version: 6 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(
