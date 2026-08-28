@@ -277,6 +277,43 @@ function runIndependentDatabaseOpener(
   });
 }
 
+
+function installRecordedMalformedV4BindingTable(
+  database: SqliteDatabase,
+): void {
+  database.exec("DROP TABLE IF EXISTS incident_workflow_events");
+  database.exec("DROP TABLE trueforge_session_bindings");
+  database.run("DELETE FROM schema_migrations WHERE version >= ?", [4]);
+  database.exec(`
+    CREATE TABLE trueforge_session_bindings (
+      incident_id TEXT PRIMARY KEY NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN ('CREATING', 'CREATION_UNCERTAIN', 'ACTIVE', 'LOST')
+      ),
+      trueforge_session_id TEXT UNIQUE,
+      creation_token TEXT,
+      T NULL,
+      updated_at TEXT N coordinator_spec_version TEXT NOT NULL,
+      created_at TEXT NOOT NULL,
+      CHECK (
+        (state = 'CREATING'
+          AND trueforge_session_id IS NULL
+          AND creation_token IS NOT NULL)
+        OR (state = 'CREATION_UNCERTAIN'
+          AND trueforge_session_id IS NULL)
+        OR (state IN ('ACTIVE', 'LOST')
+          AND trueforge_session_id IS NOT NULL
+          AND creation_token IS NULL)
+      ),
+      FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+    );
+  `);
+  database.run(
+    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    [4, "2026-01-01T00:00:00.000Z"],
+  );
+}
+
 describe("native SQLite persistence", () => {
   let testDirectory: string;
   let databasePath: string;
@@ -331,6 +368,266 @@ describe("native SQLite persistence", () => {
     expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
     expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.pragma("busy_timeout", { simple: true })).toBe(5000);
+  });
+
+  it("creates the approved TrueForge binding schema and constraints on a fresh database", () => {
+    const columns = database.all<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>("PRAGMA table_info('trueforge_session_bindings')");
+
+    expect(
+      columns.map(({ name, type, notnull, pk }) => ({
+        name,
+        type,
+        notnull,
+        pk,
+      })),
+    ).toEqual([
+      { name: "incident_id", type: "TEXT", notnull: 1, pk: 1 },
+      { name: "state", type: "TEXT", notnull: 1, pk: 0 },
+      { name: "trueforge_session_id", type: "TEXT", notnull: 0, pk: 0 },
+      { name: "creation_token", type: "TEXT", notnull: 0, pk: 0 },
+      {
+        name: "coordinator_spec_version",
+        type: "TEXT",
+        notnull: 1,
+        pk: 0,
+      },
+      { name: "created_at", type: "TEXT", notnull: 1, pk: 0 },
+      { name: "updated_at", type: "TEXT", notnull: 1, pk: 0 },
+    ]);
+
+    expect(
+      database.all<{
+        table: string;
+        from: string;
+        to: string;
+        on_delete: string;
+      }>("PRAGMA foreign_key_list('trueforge_session_bindings')").map(
+        ({ table, from, to, on_delete }) => ({ table, from, to, on_delete }),
+      ),
+    ).toEqual([
+      {
+        table: "incidents",
+        from: "incident_id",
+        to: "id",
+        on_delete: "CASCADE",
+      },
+    ]);
+
+    const insertIncident = (id: string) => {
+      database.run(
+        `
+          INSERT INTO incidents (
+            id,
+            provider,
+            external_delivery_id,
+            repository_id,
+            status,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          id,
+          "github",
+          `delivery-${id}`,
+          "example/receiver",
+          "OPEN",
+          "2026-01-01T00:00:00.000Z",
+          "2026-01-01T00:00:00.000Z",
+        ],
+      );
+    };
+    const insertBinding = (
+      incidentId: string,
+      state: string,
+      trueForgeSessionId: string | null,
+      creationToken: string | null,
+    ) => {
+      database.run(
+        `
+          INSERT INTO trueforge_session_bindings (
+            incident_id,
+            state,
+            trueforge_session_id,
+            creation_token,
+            coordinator_spec_version,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          incidentId,
+          state,
+          trueForgeSessionId,
+          creationToken,
+          "v1",
+          "2026-01-01T00:00:00.000Z",
+          "2026-01-01T00:00:00.000Z",
+        ],
+      );
+    };
+
+    insertIncident("binding-creating");
+    insertBinding("binding-creating", "CREATING", null, "token-1");
+    expect(() =>
+      insertBinding("binding-creating", "CREATING", null, "token-2"),
+    ).toThrow();
+
+    insertIncident("binding-uncertain");
+    insertBinding("binding-uncertain", "CREATION_UNCERTAIN", null, null);
+    insertIncident("binding-active");
+    insertBinding("binding-active", "ACTIVE", "session-1", null);
+    insertIncident("binding-lost");
+    insertBinding("binding-lost", "LOST", "session-2", null);
+
+    insertIncident("binding-duplicate-session");
+    expect(() =>
+      insertBinding("binding-duplicate-session", "ACTIVE", "session-1", null),
+    ).toThrow();
+
+    insertIncident("binding-invalid-state");
+    expect(() =>
+      insertBinding("binding-invalid-state", "UNKNOWN", null, null),
+    ).toThrow();
+
+    insertIncident("binding-invalid-creating");
+    expect(() =>
+      insertBinding("binding-invalid-creating", "CREATING", "session-3", "token-3"),
+    ).toThrow();
+
+    insertIncident("binding-invalid-active");
+    expect(() =>
+      insertBinding("binding-invalid-active", "ACTIVE", null, null),
+    ).toThrow();
+
+    expect(() =>
+      insertBinding("missing-incident", "CREATING", null, "token-4"),
+    ).toThrow();
+  });
+
+  it("repairs an empty table from the recorded malformed v4 schema", () => {
+    installRecordedMalformedV4BindingTable(database);
+
+    initializeDatabase(database);
+
+    expect(
+      database.all<{ version: number }>(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ),
+    ).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+      { version: 4 },
+      { version: 5 },
+      { version: 6 },
+    ]);
+    expect(
+      database.all<{ name: string }>(
+        "PRAGMA table_info('trueforge_session_bindings')",
+      ).map(({ name }) => name),
+    ).toEqual([
+      "incident_id",
+      "state",
+      "trueforge_session_id",
+      "creation_token",
+      "coordinator_spec_version",
+      "created_at",
+      "updated_at",
+    ]);
+    expect(
+      database.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM trueforge_session_bindings",
+      )?.count,
+    ).toBe(0);
+  });
+
+  it("fails closed for nonempty malformed v4 data without losing rows", () => {
+    const incidentId = "legacy-binding-incident";
+    database.run(
+      `
+        INSERT INTO incidents (
+          id,
+          provider,
+          external_delivery_id,
+          repository_id,
+          status,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        incidentId,
+        "github",
+        "legacy-binding-delivery",
+        "example/receiver",
+        "OPEN",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z",
+      ],
+    );
+    installRecordedMalformedV4BindingTable(database);
+    database.run(
+      `
+        INSERT INTO trueforge_session_bindings (
+          incident_id,
+          state,
+          trueforge_session_id,
+          creation_token,
+          updated_at,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        incidentId,
+        "ACTIVE",
+        "legacy-session",
+        null,
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z",
+      ],
+    );
+
+    const legacyColumns = database.all<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>("PRAGMA table_info('trueforge_session_bindings')");
+    const legacyRows = database.all(
+      "SELECT * FROM trueforge_session_bindings",
+    );
+
+    expect(() => initializeDatabase(database)).toThrow(
+      "coordinator_spec_version is missing from a nonempty legacy table",
+    );
+
+    expect(
+      database.all<{ version: number }>(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ),
+    ).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+      { version: 4 },
+    ]);
+    expect(
+      database.all<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>("PRAGMA table_info('trueforge_session_bindings')"),
+    ).toEqual(legacyColumns);
+    expect(
+      database.all("SELECT * FROM trueforge_session_bindings"),
+    ).toEqual(legacyRows);
   });
 
   it("rolls back every statement when a transaction fails", () => {
@@ -416,7 +713,14 @@ describe("native SQLite persistence", () => {
       database.all<{ version: number }>(
         "SELECT version FROM schema_migrations ORDER BY version",
       ),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    ).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+      { version: 4 },
+      { version: 5 },
+      { version: 6 },
+    ]);
     expect(
       database.get<{ count: number }>(
         "SELECT COUNT(*) AS count FROM incidents",
@@ -461,7 +765,7 @@ describe("native SQLite persistence", () => {
       results.map((result) => JSON.parse(result.stdout)),
     ).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3],
+        migrationVersions: [1, 2, 3, 4, 5, 6],
         incidentCount: 0,
       })),
     );
@@ -472,7 +776,14 @@ describe("native SQLite persistence", () => {
         verificationDatabase.all<{ version: number }>(
           "SELECT version FROM schema_migrations ORDER BY version",
         ),
-      ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+      ).toEqual([
+        { version: 1 },
+        { version: 2 },
+        { version: 3 },
+        { version: 4 },
+        { version: 5 },
+        { version: 6 },
+      ]);
       expect(
         verificationDatabase.get<{ count: number }>(
           "SELECT COUNT(*) AS count FROM incidents",

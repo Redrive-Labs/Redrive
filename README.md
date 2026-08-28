@@ -102,7 +102,7 @@ Active hackathon development.
 
 ## Run the control plane locally
 
-Requirements: Node.js 20.9 or newer and npm.
+Requirements: Node.js 22 or newer and npm.
 
 ```bash
 npm install
@@ -117,7 +117,12 @@ SQLite database. The database directory and schema are created automatically on
 first use.
 
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
-`REDRIVE_DATABASE_PATH`.
+`REDRIVE_DATABASE_PATH`. Set the required server-side
+`REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
+Set `REDRIVE_TRUEFORGE_GITHUB_MCP_NAME` to the name of the configured read-only
+GitHub MCP server in TrueForge. TrueForge Settings owns that server's URL and
+credentials. Redrive does not select or interpret a provider, and TrueForge
+credentials stay server-side.
 
 Provider inspection requires a bridge exposing the proven
 `get_webhook_delivery` MCP tool. Set `REDRIVE_GITHUB_MCP_URL`, then configure an
@@ -133,10 +138,19 @@ idempotency. Capture fails closed if those identities, the request header, or
 the configured repository evidence contradict each other.
 
 `GET /api/incidents/:incidentId/provider-evidence` reads only the persisted
-snapshot and returns `{ "evidence": null }` before capture. `POST` performs the
-bounded read-only MCP inspection. The first normalized snapshot is immutable;
-later capture requests return it without contacting GitHub again. MCP reads
-time out after 12 seconds and reject transport responses larger than 64 MiB.
+snapshot and returns `{ "evidence": null }` before capture. Its `POST` remains
+the direct diagnostic primitive. The first normalized snapshot is immutable;
+later direct capture requests return it without contacting GitHub again. MCP
+reads time out after 12 seconds and reject transport responses larger than 64
+MiB.
+
+`POST /api/incidents/:incidentId/provider-investigation` runs the recovery path
+through the incident's existing TrueForge session. It upgrades an existing
+`m2.5-v1` inline session in place to `m2.5-v2`, then requires a dynamic
+`provider-investigator` thread and correlates its read-only
+`get_webhook_delivery` model tool call and `tool.response`. Only that response
+is normalized as provider evidence. The route returns product state, not a
+TrueForge transcript.
 GitHub caps webhook payloads at 25 MB; the higher transport limit allows for
 the proven bridge's escaped JSON-RPC text envelope while remaining bounded.
 
