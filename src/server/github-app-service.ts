@@ -1077,6 +1077,25 @@ export function claimInstallationAttempt(
   }
   return result;
 }
+export function releaseInstallationAttemptForRetry(
+  database: SqliteDatabase,
+  attemptId: string,
+  now = new Date(),
+): boolean {
+  const result = database.run(
+    `UPDATE github_installation_attempts
+        SET status = ?, claimed_at = NULL, recovery_reason = NULL, updated_at = ?
+      WHERE id = ? AND status = ?`,
+    [
+      INSTALLATION_ATTEMPT_PENDING,
+      now.toISOString(),
+      attemptId,
+      INSTALLATION_ATTEMPT_VERIFYING,
+    ],
+  );
+  return result.changes === 1;
+}
+
 export function markInstallationAttemptRecovery(
   database: SqliteDatabase,
   attemptId: string,

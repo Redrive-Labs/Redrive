@@ -346,7 +346,7 @@ export class GithubApi {
   getInstallation(installationId: string, appJwt: string): Promise<unknown> {
     return this.requestJson(
       `/app/installations/${encodePathSegment(installationId, "installation ID")}`,
-      { token: appJwt },
+      { method: "GET", token: appJwt },
     );
   }
 

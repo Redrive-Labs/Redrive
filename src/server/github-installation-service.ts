@@ -8,11 +8,12 @@ import {
   getGithubAppRegistration,
   getInstallation,
   markInstallationAttemptRecovery,
+  releaseInstallationAttemptForRetry,
 } from "@/server/github-app-service";
 import { parseGithubInstallation } from "@/server/github-connection-service";
 import { createGithubAppJwt } from "@/server/github-app-jwt";
 import type { SqliteDatabase } from "@/server/database";
-import type { GithubApi } from "@/server/github-rest";
+import { GithubRestError, type GithubApi } from "@/server/github-rest";
 import type { SecretStore } from "@/server/secret-store";
 
 export class GithubInstallationVerificationError extends Error {
@@ -37,6 +38,18 @@ function stateErrorCode(error: GithubIntegrationStateError): GithubInstallationV
   if (error.code === "EXPIRED_STATE") return "EXPIRED_STATE";
   if (error.code === "ALREADY_CLAIMED") return "ALREADY_CLAIMED";
   return "INVALID_STATE";
+}
+
+function isRetryableInstallationVerificationError(error: unknown): boolean {
+  return (
+    error instanceof GithubRestError &&
+    (error.code === "TIMEOUT" ||
+      error.code === "NETWORK" ||
+      (error.code === "HTTP" &&
+        error.status !== null &&
+        error.status >= 500 &&
+        error.status <= 599))
+  );
 }
 
 export async function verifyAndPersistGithubInstallation(options: {
@@ -143,7 +156,20 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.installationId,
       appJwt,
     );
-  } catch {
+  } catch (error) {
+    if (isRetryableInstallationVerificationError(error)) {
+      const released = releaseInstallationAttemptForRetry(
+        options.database,
+        claim.attempt.id,
+        now,
+      );
+      if (released) {
+        throw new GithubInstallationVerificationError(
+          "RECOVERY_REQUIRED",
+          "GitHub installation verification is temporarily unavailable; retry the callback.",
+        );
+      }
+    }
     markInstallationAttemptRecovery(
       options.database,
       claim.attempt.id,
