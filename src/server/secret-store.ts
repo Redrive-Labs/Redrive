@@ -237,15 +237,19 @@ function assertRecoverableFileMetadata(stats: Stats): void {
   }
 }
 
-function sameRequiredFileIdentity(left: Stats, right: Stats): boolean {
+function hasRequiredFileIdentity(stats: Stats): boolean {
   return (
-    typeof left.dev === "number" &&
-    typeof right.dev === "number" &&
-    typeof left.ino === "number" &&
-    typeof right.ino === "number" &&
-    left.dev === right.dev &&
-    left.ino === right.ino
+    typeof stats.dev === "number" &&
+    Number.isFinite(stats.dev) &&
+    typeof stats.ino === "number" &&
+    Number.isFinite(stats.ino)
   );
+}
+
+function sameRequiredFileIdentity(left: Stats, right: Stats): boolean {
+  return hasRequiredFileIdentity(left) && hasRequiredFileIdentity(right) &&
+    left.dev === right.dev &&
+    left.ino === right.ino;
 }
 
 function isUnsupportedDirectorySyncError(error: unknown): boolean {
@@ -632,37 +636,52 @@ export class FilesystemSecretStore implements SecretStore {
           "The deterministic private key has unexplained links.",
         );
       }
+      if (!hasRequiredFileIdentity(initialStats)) {
+        throw new SecretStoreError(
+          "The deterministic private key identity could not be verified.",
+        );
+      }
 
       const temporaryReferences = this.filesystem
         .readdirSync(this.directory)
         .filter((entry) => TEMPORARY_REFERENCE_PATTERN.test(entry));
-      if (temporaryReferences.length !== 1) {
+      const matchingTemporaryPaths: string[] = [];
+      for (const temporaryReference of temporaryReferences) {
+        const temporaryPath = path.join(this.directory, temporaryReference);
+        if (
+          path.dirname(path.resolve(temporaryPath)) !== this.directory ||
+          path.basename(temporaryPath) !== temporaryReference
+        ) {
+          throw new SecretStoreError("The temporary private key path is not safe.");
+        }
+
+        const temporaryStats = this.filesystem.lstatSync(temporaryPath);
+        if (!hasRequiredFileIdentity(temporaryStats)) {
+          throw new SecretStoreError(
+            "The temporary private key identity could not be verified.",
+          );
+        }
+        if (!sameRequiredFileIdentity(initialStats, temporaryStats)) continue;
+
+        assertRecoverableFileMetadata(temporaryStats);
+        if (
+          typeof temporaryStats.nlink !== "number" ||
+          temporaryStats.nlink !== 2
+        ) {
+          throw new SecretStoreError(
+            "The temporary private key has an unexpected link count.",
+          );
+        }
+        matchingTemporaryPaths.push(temporaryPath);
+      }
+
+      if (matchingTemporaryPaths.length !== 1) {
         throw new SecretStoreError(
           "The deterministic private key has no unique stale temporary link.",
         );
       }
 
-      const temporaryReference = temporaryReferences[0];
-      const temporaryPath = path.join(this.directory, temporaryReference);
-      if (
-        path.dirname(path.resolve(temporaryPath)) !== this.directory ||
-        path.basename(temporaryPath) !== temporaryReference
-      ) {
-        throw new SecretStoreError("The temporary private key path is not safe.");
-      }
-      const temporaryStats = this.filesystem.lstatSync(temporaryPath);
-      assertRecoverableFileMetadata(temporaryStats);
-      if (
-        typeof temporaryStats.nlink !== "number" ||
-        temporaryStats.nlink !== 2 ||
-        !sameRequiredFileIdentity(initialStats, temporaryStats)
-      ) {
-        throw new SecretStoreError(
-          "The temporary private key does not match the published key.",
-        );
-      }
-
-      this.filesystem.unlinkSync(temporaryPath);
+      this.filesystem.unlinkSync(matchingTemporaryPaths[0]);
       this.filesystem.syncDirectory(this.directory);
       this.revalidateRecoveredPrivateKey(finalPath, initialStats);
     } catch (error) {

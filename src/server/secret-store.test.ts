@@ -7,6 +7,7 @@ import {
   writeFileSync,
   readlinkSync,
   statSync,
+  lstatSync as nativeLstatSync,
   symlinkSync,
   readdirSync,
   rmSync,
@@ -227,6 +228,38 @@ describe("filesystem GitHub secret store", () => {
     expect(statSync(finalPath).nlink).toBe(2);
   });
 
+  it("fails closed when a matching temp link has unsafe metadata", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const matchingTemporaryPath = path.join(
+      secretDirectory,
+      ".tmp-00000000-0000-0000-0000-000000000005.secret",
+    );
+    const store = new FilesystemSecretStore(secretDirectory, {
+      lstatSync: (filePath) => {
+        const stats = nativeLstatSync(filePath);
+        if (filePath === matchingTemporaryPath && process.platform !== "win32") {
+          stats.mode |= 0o004;
+        }
+        return stats;
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    nativeLinkSync(finalPath, matchingTemporaryPath);
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    expect(readdirSync(secretDirectory)).toEqual(
+      expect.arrayContaining([reference, path.basename(matchingTemporaryPath)]),
+    );
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
   it("fails closed when multiple hard links explain the final file", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
     directories.push(directory);
@@ -252,7 +285,7 @@ describe("filesystem GitHub secret store", () => {
     expect(statSync(finalPath).nlink).toBe(3);
   });
 
-  it("fails closed for ambiguous multiple temp links", () => {
+  it("fails closed for multiple matching temp links", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
     directories.push(directory);
     const secretDirectory = path.join(directory, "secrets");
@@ -265,7 +298,7 @@ describe("filesystem GitHub secret store", () => {
       path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000004.secret"),
     ];
     nativeLinkSync(finalPath, temporaryPaths[0]);
-    writeFileSync(temporaryPaths[1], PEM, { mode: 0o600 });
+    nativeLinkSync(finalPath, temporaryPaths[1]);
     const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
 
     expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
@@ -274,7 +307,35 @@ describe("filesystem GitHub secret store", () => {
     expect(readdirSync(secretDirectory)).toEqual(
       expect.arrayContaining([reference, ...temporaryPaths.map((filePath) => path.basename(filePath))]),
     );
-    expect(statSync(finalPath).nlink).toBe(2);
+    expect(statSync(finalPath).nlink).toBe(3);
+  });
+
+  it("ignores an unrelated temp file when one matching hard link exists", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const matchingTemporaryPath = path.join(
+      secretDirectory,
+      ".tmp-00000000-0000-0000-0000-000000000003.secret",
+    );
+    const unrelatedTemporaryPath = path.join(
+      secretDirectory,
+      ".tmp-00000000-0000-0000-0000-000000000004.secret",
+    );
+    nativeLinkSync(finalPath, matchingTemporaryPath);
+    writeFileSync(unrelatedTemporaryPath, PEM, { mode: 0o600 });
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(readdirSync(secretDirectory)).toEqual([
+      path.basename(unrelatedTemporaryPath),
+      reference,
+    ]);
+    expect(statSync(finalPath).nlink).toBe(1);
   });
 
   it("rejects traversal and symlink references", () => {
