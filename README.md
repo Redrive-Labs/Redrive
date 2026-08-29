@@ -117,7 +117,12 @@ SQLite database. The database directory and schema are created automatically on
 first use.
 
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
-`REDRIVE_DATABASE_PATH`. Set the required server-side
+`REDRIVE_DATABASE_PATH`. GitHub App private keys are stored outside the
+repository at `$HOME/.redrive/secrets` by default. Redrive creates the
+`.redrive` and `secrets` directories with mode `0700` and private-key files
+with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit
+absolute directory when required; its ownership, ancestor, symlink, and
+permission checks remain enforced. Set the required server-side
 `REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
 Set `REDRIVE_TRUEFORGE_GITHUB_MCP_NAME` to the name of the configured read-only
 GitHub MCP server in TrueForge. TrueForge Settings owns that server's URL and

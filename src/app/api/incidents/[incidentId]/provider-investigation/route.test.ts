@@ -5,6 +5,7 @@ import {
 } from "@/server/provider-evidence-service";
 import {
   investigateProviderForIncident,
+  ConnectionBackedProviderInvestigationUnsupportedError,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
 } from "@/server/provider-investigation-service";
@@ -77,6 +78,23 @@ describe("provider investigation API", () => {
       evidenceDisposition: "REOBSERVED",
       providerStatus: "Invalid HTTP Response: 500",
       providerStatusCode: 500,
+    });
+  });
+
+  it("explains that connection-backed investigation is deferred to M2.6B", async () => {
+    investigateMock.mockRejectedValueOnce(
+      new ConnectionBackedProviderInvestigationUnsupportedError(),
+    );
+
+    const response = await POST(
+      new Request("http://localhost"),
+      context("connection-incident"),
+    );
+
+    expect(response.status).toBe(422);
+    await expect(response.json()).resolves.toEqual({
+      error:
+        "Connection-backed provider investigation requires the M2.6B connection-aware GitHub MCP path.",
     });
   });
 

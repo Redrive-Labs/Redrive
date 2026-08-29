@@ -1,4 +1,5 @@
 import { IncidentForm } from "@/components/incident-form";
+import { GithubConnectionFlow } from "@/components/github-connection-flow";
 import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 import { listIncidents } from "@/server/incident-service";
 import { getProviderEvidenceCaptureStatus } from "@/server/provider-evidence-service";
@@ -66,6 +67,8 @@ export default async function Home() {
           </p>
         </aside>
       </section>
+
+      <GithubConnectionFlow />
 
       <section className="py-12 sm:py-16" id="incidents">
         <div className="mb-5 flex items-baseline justify-between gap-4">

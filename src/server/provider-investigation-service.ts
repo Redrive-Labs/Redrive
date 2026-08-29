@@ -61,6 +61,15 @@ export class ProviderInvestigationEvidenceError extends Error {
   }
 }
 
+export class ConnectionBackedProviderInvestigationUnsupportedError extends Error {
+  constructor() {
+    super(
+      "Connection-backed provider investigation requires the M2.6B connection-aware GitHub MCP path.",
+    );
+    this.name = "ConnectionBackedProviderInvestigationUnsupportedError";
+  }
+}
+
 export interface ProviderInvestigationResult {
   incidentId: string;
   trueForgeSessionId: string;
@@ -781,6 +790,15 @@ export function createProviderInvestigationService(
     }
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
+    }
+    if (
+      incident.applicationConnectionId !== undefined &&
+      incident.applicationConnectionId !== null
+    ) {
+      // M2.6A deliberately has no connection-aware MCP investigation path. Do
+      // this before configuration, hook resolution, session work, or events so
+      // a connection cannot fall back to a repository-level legacy hook.
+      throw new ConnectionBackedProviderInvestigationUnsupportedError();
     }
 
     // Validate every deterministic execution input before any remote session

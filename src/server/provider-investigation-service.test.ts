@@ -16,6 +16,7 @@ import { openDatabase, type SqliteDatabase } from "@/server/database";
 import {
   createProviderInvestigationService,
   extractGithubDeliveryFromTrueForgeToolResponse,
+  ConnectionBackedProviderInvestigationUnsupportedError,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
   PROVIDER_INVESTIGATOR_NAME,
@@ -360,6 +361,67 @@ describe("TrueForge provider investigation", () => {
     });
     return () => injectedFailure;
   }
+
+  it("fails closed for a connection-backed incident before legacy hook or TrueForge lookup", async () => {
+    const incident = createIncident("connection-delivery");
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["app-connection", "app-id", "redrive", "owner-id", "octocat", "User", "key", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO github_installations
+        (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["installation-connection", "app-connection", "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["connection-incident", "github", "installation-connection", repositoryId, repositoryId, "hook-A", "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      "UPDATE incidents SET application_connection_id = ? WHERE id = ?",
+      ["connection-incident", incident.id],
+    );
+
+    const environmentWithLegacyHook = {
+      ...environment,
+      REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: "hook-B" }),
+    };
+    const client = createClient(makeStream());
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environmentWithLegacyHook,
+    );
+
+    await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
+      ConnectionBackedProviderInvestigationUnsupportedError,
+    );
+    expect(client.getSession).not.toHaveBeenCalled();
+    expect(client.updateSession).not.toHaveBeenCalled();
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.createTurnStream).not.toHaveBeenCalled();
+    expect(client.listTurnEvents).not.toHaveBeenCalled();
+    expect(
+      database.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM provider_evidence",
+      )?.count,
+    ).toBe(0);
+    expect(
+      database.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM incident_workflow_events",
+      )?.count,
+    ).toBe(0);
+  });
 
   it("collects only the exact completed turn, not unrelated session history", async () => {
     const incident = createIncident();

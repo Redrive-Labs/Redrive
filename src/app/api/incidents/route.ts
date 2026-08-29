@@ -44,9 +44,12 @@ function decodeFormComponent(component: string): string {
 }
 
 function parseUrlEncodedForm(body: string): {
-  provider: string | null;
-  externalDeliveryId: string | null;
-  repositoryId: string | null;
+  input: {
+    provider: string | null;
+    externalDeliveryId: string | null;
+    repositoryId: string | null;
+  };
+  connectionShaped: boolean;
 } {
   const fields = new Map<string, string>();
 
@@ -67,9 +70,13 @@ function parseUrlEncodedForm(body: string): {
   }
 
   return {
-    provider: fields.get("provider") ?? null,
-    externalDeliveryId: fields.get("externalDeliveryId") ?? null,
-    repositoryId: fields.get("repositoryId") ?? null,
+    input: {
+      provider: fields.get("provider") ?? null,
+      externalDeliveryId: fields.get("externalDeliveryId") ?? null,
+      repositoryId: fields.get("repositoryId") ?? null,
+    },
+    connectionShaped:
+      fields.has("applicationConnectionId") || fields.has("deliveryId"),
   };
 }
 
@@ -217,7 +224,11 @@ export async function POST(request: Request): Promise<Response> {
 
   if (isUrlEncodedForm) {
     try {
-      input = parseUrlEncodedForm(decodedRequestBody);
+      const parsedForm = parseUrlEncodedForm(decodedRequestBody);
+      if (parsedForm.connectionShaped) {
+        return invalidRequestBodyResponse();
+      }
+      input = parsedForm.input;
     } catch (error) {
       if (error instanceof MalformedFormEncodingError) {
         return invalidRequestBodyResponse();
