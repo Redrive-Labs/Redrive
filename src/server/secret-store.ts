@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   linkSync,
   unlinkSync,
   writeSync,
@@ -32,6 +33,8 @@ export class SecretStoreError extends Error {
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const TEMPORARY_REFERENCE_PATTERN =
+  /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.secret$/;
 const SECRET_REFERENCE_PATTERN =
   /^(?:github-app-private-key|github-app-manifest)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pem$/;
 const MAX_PRIVATE_KEY_BYTES = 128 * 1024;
@@ -50,6 +53,7 @@ interface SecretStoreFilesystem {
   fsyncSync(fileDescriptor: number): void;
   closeSync(fileDescriptor: number): void;
   lstatSync(path: string): Stats;
+  readdirSync(path: string): string[];
   chmodSync(path: string, mode: number): void;
   linkSync(existingPath: string, newPath: string): void;
   unlinkSync(path: string): void;
@@ -190,7 +194,7 @@ function sameFileIdentity(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function assertRegularFileMode(stats: Stats): void {
+function assertRegularFileMetadata(stats: Stats): void {
   if (typeof process.getuid === "function" && typeof stats.uid === "number") {
     if (stats.uid !== process.getuid()) {
       throw new SecretStoreError(
@@ -201,12 +205,47 @@ function assertRegularFileMode(stats: Stats): void {
   if (!stats.isFile() || stats.isSymbolicLink()) {
     throw new SecretStoreError("The private key file is not a regular file.");
   }
-  if (typeof stats.nlink === "number" && stats.nlink !== 1) {
-    throw new SecretStoreError("The private key file has an unexpected link count.");
-  }
   if (isPosixModeAvailable(stats) && (stats.mode & 0o077) !== 0) {
     throw new SecretStoreError("The private key file permissions are too broad.");
   }
+}
+
+function assertRegularFileMode(stats: Stats): void {
+  assertRegularFileMetadata(stats);
+  if (typeof stats.nlink === "number" && stats.nlink !== 1) {
+    throw new SecretStoreError("The private key file has an unexpected link count.");
+  }
+}
+
+function assertRecoverableFileMetadata(stats: Stats): void {
+  assertRegularFileMetadata(stats);
+  if (
+    typeof process.getuid === "function" &&
+    (typeof stats.uid !== "number" || stats.uid !== process.getuid())
+  ) {
+    throw new SecretStoreError(
+      "The private key file ownership could not be verified.",
+    );
+  }
+  if (
+    process.platform !== "win32" &&
+    (typeof stats.mode !== "number" || (stats.mode & 0o777) !== 0o600)
+  ) {
+    throw new SecretStoreError(
+      "The private key file does not have the required private mode.",
+    );
+  }
+}
+
+function sameRequiredFileIdentity(left: Stats, right: Stats): boolean {
+  return (
+    typeof left.dev === "number" &&
+    typeof right.dev === "number" &&
+    typeof left.ino === "number" &&
+    typeof right.ino === "number" &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
 }
 
 function isUnsupportedDirectorySyncError(error: unknown): boolean {
@@ -254,6 +293,7 @@ const defaultFilesystem: SecretStoreFilesystem = {
   fsyncSync,
   closeSync,
   lstatSync,
+  readdirSync,
   chmodSync,
   linkSync,
   unlinkSync,
@@ -363,6 +403,7 @@ export class FilesystemSecretStore implements SecretStore {
     let publishedByUs = false;
     let succeeded = false;
     let createdTemporary = false;
+    let temporaryLinkRemoved = false;
     let expectedIdentity: Stats | undefined;
 
     try {
@@ -446,8 +487,18 @@ export class FilesystemSecretStore implements SecretStore {
       }
 
       // Drop the temporary hard link before validating the final object so the
-      // existing nlink === 1 security invariant remains in force.
-      this.filesystem.unlinkSync(temporaryPath);
+      // existing nlink === 1 security invariant remains in force. A verifier
+      // may have already removed this link after publication; that is safe as
+      // long as the published final object is still revalidated below.
+      try {
+        this.filesystem.unlinkSync(temporaryPath);
+        temporaryLinkRemoved = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // ENOENT leaves the unlink outcome ambiguous to this process. Do not
+        // remove the final object in failure cleanup; revalidation below is
+        // still required before accepting the publication.
+      }
       const finalStats = this.filesystem.lstatSync(finalPath);
       assertRegularFileMode(finalStats);
       if (expectedIdentity === undefined || !sameFileIdentity(expectedIdentity, finalStats)) {
@@ -462,13 +513,13 @@ export class FilesystemSecretStore implements SecretStore {
       if (error instanceof SecretStoreError) throw error;
       throw new SecretStoreError("The private key could not be stored safely.");
     } finally {
-      // A failed pre-rename write must not leave attacker-controlled temp
-      // material. A failed post-rename operation is removed only when the path
-      // still names the object we just published. A successful write is never
-      // cleaned up here.
+      // A failed pre-publication write must not leave attacker-controlled temp
+      // material. A failed post-publication operation is removed only after
+      // temp-link removal completed and the path still names our object. An
+      // ambiguous temp unlink never permits deleting the final object.
       if (!succeeded) {
         try {
-          const pathsToClean = publishedByUs
+          const pathsToClean = publishedByUs && temporaryLinkRemoved
             ? [finalPath, temporaryPath]
             : [temporaryPath];
           for (const pathToClean of pathsToClean) {
@@ -515,6 +566,113 @@ export class FilesystemSecretStore implements SecretStore {
     return this.readPrivateKeyBytesAtPath(filePath).toString("utf8");
   }
 
+  private revalidateRecoveredPrivateKey(
+    finalPath: string,
+    expectedIdentity: Stats,
+  ): void {
+    try {
+      const finalStats = this.filesystem.lstatSync(finalPath);
+      assertRecoverableFileMetadata(finalStats);
+      if (
+        typeof finalStats.nlink !== "number" ||
+        finalStats.nlink !== 1 ||
+        !sameRequiredFileIdentity(expectedIdentity, finalStats)
+      ) {
+        throw new SecretStoreError(
+          "The published private key changed unexpectedly.",
+        );
+      }
+
+      let fileDescriptor: number | undefined;
+      try {
+        const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+        fileDescriptor = this.filesystem.openSync(
+          finalPath,
+          fsConstants.O_RDONLY | noFollow,
+        );
+        const openedStats = this.filesystem.fstatSync(fileDescriptor);
+        assertRecoverableFileMetadata(openedStats);
+        if (
+          typeof openedStats.nlink !== "number" ||
+          openedStats.nlink !== 1 ||
+          !sameRequiredFileIdentity(expectedIdentity, openedStats)
+        ) {
+          throw new SecretStoreError(
+            "The published private key changed unexpectedly.",
+          );
+        }
+      } finally {
+        if (fileDescriptor !== undefined) {
+          this.filesystem.closeSync(fileDescriptor);
+        }
+      }
+    } catch (error) {
+      if (error instanceof SecretStoreError) throw error;
+      throw new SecretStoreError(
+        "The deterministic private key could not be revalidated safely.",
+      );
+    }
+  }
+
+  private recoverStaleTemporaryLink(finalPath: string): void {
+    let initialStats: Stats;
+    try {
+      initialStats = this.filesystem.lstatSync(finalPath);
+    } catch {
+      return;
+    }
+    if (typeof initialStats.nlink !== "number" || initialStats.nlink <= 1) {
+      return;
+    }
+
+    try {
+      assertRecoverableFileMetadata(initialStats);
+      if (initialStats.nlink !== 2) {
+        throw new SecretStoreError(
+          "The deterministic private key has unexplained links.",
+        );
+      }
+
+      const temporaryReferences = this.filesystem
+        .readdirSync(this.directory)
+        .filter((entry) => TEMPORARY_REFERENCE_PATTERN.test(entry));
+      if (temporaryReferences.length !== 1) {
+        throw new SecretStoreError(
+          "The deterministic private key has no unique stale temporary link.",
+        );
+      }
+
+      const temporaryReference = temporaryReferences[0];
+      const temporaryPath = path.join(this.directory, temporaryReference);
+      if (
+        path.dirname(path.resolve(temporaryPath)) !== this.directory ||
+        path.basename(temporaryPath) !== temporaryReference
+      ) {
+        throw new SecretStoreError("The temporary private key path is not safe.");
+      }
+      const temporaryStats = this.filesystem.lstatSync(temporaryPath);
+      assertRecoverableFileMetadata(temporaryStats);
+      if (
+        typeof temporaryStats.nlink !== "number" ||
+        temporaryStats.nlink !== 2 ||
+        !sameRequiredFileIdentity(initialStats, temporaryStats)
+      ) {
+        throw new SecretStoreError(
+          "The temporary private key does not match the published key.",
+        );
+      }
+
+      this.filesystem.unlinkSync(temporaryPath);
+      this.filesystem.syncDirectory(this.directory);
+      this.revalidateRecoveredPrivateKey(finalPath, initialStats);
+    } catch (error) {
+      if (error instanceof SecretStoreError) throw error;
+      throw new SecretStoreError(
+        "The deterministic private key could not be recovered safely.",
+      );
+    }
+  }
+
   verifyPrivateKeyForManifestAttempt(
     attemptId: string,
     expectedSha256: string,
@@ -524,10 +682,12 @@ export class FilesystemSecretStore implements SecretStore {
     if (!/^[0-9a-f]{64}$/.test(expectedSha256)) {
       throw new SecretStoreError("The private key digest is invalid.");
     }
-    const bytes = this.readPrivateKeyBytesAtPath(
-      path.join(this.directory, assertSafeReference(reference)),
-      true,
+    const finalPath = path.join(
+      this.directory,
+      assertSafeReference(reference),
     );
+    this.recoverStaleTemporaryLink(finalPath);
+    const bytes = this.readPrivateKeyBytesAtPath(finalPath, true);
     const actual = createHash("sha256").update(bytes).digest();
     const expected = Buffer.from(expectedSha256, "hex");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {

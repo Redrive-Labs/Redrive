@@ -10,6 +10,8 @@ import {
   symlinkSync,
   readdirSync,
   rmSync,
+  linkSync as nativeLinkSync,
+  unlinkSync as nativeUnlinkSync,
   writeSync as nativeWriteSync,
 } from "node:fs";
 import os from "node:os";
@@ -66,6 +68,213 @@ describe("filesystem GitHub secret store", () => {
     expect(statSync(secretDirectory).mode & 0o777).toBe(0o700);
     expect(statSync(path.join(secretDirectory, reference)).mode & 0o777).toBe(0o600);
     expect(readFileSync(path.join(secretDirectory, reference), "utf8")).toBe(PEM);
+    expect(statSync(path.join(secretDirectory, reference)).nlink).toBe(1);
+  });
+
+  it("survives a verifier removing the temp link before publisher cleanup", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let publisherCleanup = true;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (publisherCleanup && path.basename(filePath).startsWith(".tmp-")) {
+          publisherCleanup = false;
+          nativeUnlinkSync(filePath);
+          const error = new Error("verifier removed temp link") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        nativeUnlinkSync(filePath);
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+
+    expect(reference).toBe(`github-app-manifest-${attemptId}.pem`);
+    expect(readFileSync(finalPath, "utf8")).toBe(PEM);
+    expect(readdirSync(secretDirectory)).toEqual([reference]);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("keeps the published PEM when temp unlink outcome is ambiguous", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let firstTempUnlink = true;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (firstTempUnlink && path.basename(filePath).startsWith(".tmp-")) {
+          firstTempUnlink = false;
+          const error = new Error("unlink outcome is unknown") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        nativeUnlinkSync(filePath);
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = `github-app-manifest-${attemptId}.pem`;
+    const finalPath = path.join(secretDirectory, reference);
+
+    expect(() => store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toThrow(
+      SecretStoreError,
+    );
+    expect(readFileSync(finalPath, "utf8")).toBe(PEM);
+    expect(readdirSync(secretDirectory)).toEqual([reference]);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("recovers a deterministic PEM left with its temp hard link after publication", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let crashed = true;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (crashed) throw new Error("simulated crash");
+        nativeUnlinkSync(filePath);
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = `github-app-manifest-${attemptId}.pem`;
+    expect(() => store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toThrow(
+      SecretStoreError,
+    );
+    const finalPath = path.join(secretDirectory, reference);
+    const temporaryReferences = readdirSync(secretDirectory).filter((entry) =>
+      entry.startsWith(".tmp-"),
+    );
+
+    expect(temporaryReferences).toHaveLength(1);
+    expect(statSync(finalPath).nlink).toBe(2);
+
+    crashed = false;
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(readdirSync(secretDirectory)).toEqual([reference]);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("fsyncs the secret directory after stale temp-link cleanup", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const syncSnapshots: string[][] = [];
+    const store = new FilesystemSecretStore(secretDirectory, {
+      syncDirectory: (directoryPath) => {
+        syncSnapshots.push(readdirSync(directoryPath));
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const temporaryPath = path.join(
+      secretDirectory,
+      ".tmp-00000000-0000-0000-0000-000000000001.secret",
+    );
+    nativeLinkSync(finalPath, temporaryPath);
+    const syncsBeforeRecovery = syncSnapshots.length;
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(syncSnapshots.slice(syncsBeforeRecovery)).toEqual([[reference], [reference]]);
+  });
+
+  it("does not remove an unrelated hard link and fails closed", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const unrelatedPath = path.join(secretDirectory, "unrelated-hard-link");
+    nativeLinkSync(finalPath, unrelatedPath);
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    expect(readdirSync(secretDirectory)).toContain("unrelated-hard-link");
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
+  it("fails closed when a temp-named file has the wrong inode", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const unrelatedPath = path.join(secretDirectory, "unrelated-hard-link");
+    const wrongTemporaryPath = path.join(
+      secretDirectory,
+      ".tmp-00000000-0000-0000-0000-000000000002.secret",
+    );
+    nativeLinkSync(finalPath, unrelatedPath);
+    writeFileSync(wrongTemporaryPath, PEM, { mode: 0o600 });
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    expect(readdirSync(secretDirectory)).toEqual(
+      expect.arrayContaining([reference, "unrelated-hard-link", path.basename(wrongTemporaryPath)]),
+    );
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
+  it("fails closed when multiple hard links explain the final file", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const extraPaths = [
+      path.join(secretDirectory, "extra-hard-link-one"),
+      path.join(secretDirectory, "extra-hard-link-two"),
+    ];
+    nativeLinkSync(finalPath, extraPaths[0]);
+    nativeLinkSync(finalPath, extraPaths[1]);
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    expect(readdirSync(secretDirectory)).toEqual(
+      expect.arrayContaining([reference, ...extraPaths.map((filePath) => path.basename(filePath))]),
+    );
+    expect(statSync(finalPath).nlink).toBe(3);
+  });
+
+  it("fails closed for ambiguous multiple temp links", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const finalPath = path.join(secretDirectory, reference);
+    const temporaryPaths = [
+      path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000003.secret"),
+      path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000004.secret"),
+    ];
+    nativeLinkSync(finalPath, temporaryPaths[0]);
+    writeFileSync(temporaryPaths[1], PEM, { mode: 0o600 });
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    expect(readdirSync(secretDirectory)).toEqual(
+      expect.arrayContaining([reference, ...temporaryPaths.map((filePath) => path.basename(filePath))]),
+    );
+    expect(statSync(finalPath).nlink).toBe(2);
   });
 
   it("rejects traversal and symlink references", () => {
