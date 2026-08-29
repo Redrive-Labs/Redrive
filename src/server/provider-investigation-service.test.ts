@@ -84,30 +84,43 @@ interface StreamOptions {
   toolInfoServerName?: string;
   connectionArgument?: string;
   deliveryArgument?: string;
+  providerArgumentsText?: string;
+  extraArguments?: Record<string, unknown>;
   expectedDeliveryId?: string;
+  turnId?: string;
+  providerThreadId?: string;
+  providerToolCallId?: string;
+  providerSpawnToolCallId?: string;
   includeResponse?: boolean;
   includeRootToolCall?: boolean;
   includeEmptySpawnResponse?: boolean;
   responseThreadId?: string;
   responseToolCallId?: string;
   responseContent?: string;
+  eventSuffix?: string;
 }
 
 function makeStream(
   options: StreamOptions = {},
 ): AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events: unknown[] } {
-  const providerThreadId = "provider-thread-1";
-  const toolCallId = "github-call-1";
+  const providerThreadId = options.providerThreadId ?? "provider-thread-1";
+  const toolCallId = options.providerToolCallId ?? "github-call-1";
+  const providerSpawnToolCallId =
+    options.providerSpawnToolCallId ?? "spawn-provider-1";
+  const turnId = options.turnId ?? "turn-1";
   const providerToolArguments = {
     connection_id: options.connectionArgument ?? "connection-1",
     delivery_id:
       options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+    ...options.extraArguments,
   };
+  const providerToolArgumentsText =
+    options.providerArgumentsText ?? JSON.stringify(providerToolArguments);
   const events: unknown[] = [
     {
       type: "turn.created",
       id: "turn-created-event",
-      turnId: "turn-1",
+      turnId,
       previousTurnId: null,
       state: { status: "running" },
       createdAt: "2026-08-25T10:00:00.000Z",
@@ -120,7 +133,7 @@ function makeStream(
       content: null,
       toolCalls: [
         {
-          id: "spawn-provider-1",
+          id: providerSpawnToolCallId,
           type: "function",
           function: {
             name: "create_sub_agent",
@@ -142,7 +155,7 @@ function makeStream(
       threadId: providerThreadId,
       title: "Provider investigator",
       createdAt: "2026-08-25T10:00:01.000Z",
-      parent: { threadId: "main", toolCallId: "spawn-provider-1" },
+      parent: { threadId: "main", toolCallId: providerSpawnToolCallId },
       agentInfo: {
         type: "dynamic",
         name: options.agentName ?? PROVIDER_INVESTIGATOR_NAME,
@@ -160,7 +173,7 @@ function makeStream(
           type: "function",
           function: {
             name: options.toolName ?? "get_webhook_delivery",
-            arguments: JSON.stringify(providerToolArguments),
+            arguments: providerToolArgumentsText,
           },
           toolInfo: {
             type: "mcp",
@@ -230,7 +243,7 @@ function makeStream(
         id: "spawn-provider-response-event",
         createdAt: "2026-08-25T10:00:02.500Z",
         threadId: "main",
-        toolCallId: "spawn-provider-1",
+        toolCallId: providerSpawnToolCallId,
         content: "",
       },
     );
@@ -252,6 +265,18 @@ function makeStream(
         typeof event.id === "string"
       ) {
         event.id = `${event.id}-${options.expectedDeliveryId}`;
+      }
+    }
+  }
+  if (options.eventSuffix !== undefined) {
+    for (const event of events) {
+      if (
+        event !== null &&
+        typeof event === "object" &&
+        "id" in event &&
+        typeof event.id === "string"
+      ) {
+        event.id = `${event.id}-${options.eventSuffix}`;
       }
     }
   }
@@ -652,6 +677,192 @@ describe("TrueForge provider investigation", () => {
     );
   });
 
+  it("uses one turn for a valid first attempt and does not retry", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream());
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result.evidenceDisposition).toBe("CAPTURED");
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
+    expect(client.listTurnEvents).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { mcp_server: connectionMcpServerName },
+    { repository_id: repositoryId, webhook_id: "fabricated-hook" },
+  ])(
+    "retries an exact lookup tuple with fabricated extra keys (%s)",
+    async (extraArguments) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const first = makeStream({
+        extraArguments,
+        eventSuffix: "first",
+      });
+      const second = makeStream({
+        turnId: "turn-2",
+        providerThreadId: "provider-thread-2",
+        providerToolCallId: "github-call-2",
+        providerSpawnToolCallId: "spawn-provider-2",
+        eventSuffix: "second",
+      });
+      const client = createClient(first);
+      client.createTurnStream
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(second);
+      client.listTurnEvents.mockImplementation((_sessionId, turnId) =>
+        Promise.resolve(
+          persistedTurnEvents(turnId === "turn-1" ? first.events : second.events),
+        ),
+      );
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      const result = await service.investigateProviderForIncident(incident.id);
+
+      expect(result).toMatchObject({
+        turnId: "turn-2",
+        providerInvestigatorThreadId: "provider-thread-2",
+        evidenceDisposition: "CAPTURED",
+      });
+      expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+      expect(client.createTurnStream.mock.calls[0][0]).toBe("existing-session");
+      expect(client.createTurnStream.mock.calls[1][0]).toBe("existing-session");
+      expect(client.listTurnEvents).toHaveBeenNthCalledWith(
+        2,
+        "existing-session",
+        "turn-2",
+      );
+      const retryInput = JSON.stringify(client.createTurnStream.mock.calls[1][1]?.input);
+      expect(retryInput).toContain("previous provider investigation attempt was rejected");
+      expect(retryInput).toContain("added extra argument keys");
+      expect(retryInput).toContain(
+        JSON.stringify(
+          `EXACTLY: {"connection_id":"connection-1","delivery_id":"${deliveryId}"}`,
+        ).slice(1, -1),
+      );
+      expect(retryInput).toContain("no other properties");
+
+      const events = service.getWorkflowEvents(incident.id);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "PROVIDER_INVESTIGATION_FAILED",
+            turnId: "turn-1",
+            details: expect.objectContaining({
+              attempt: 1,
+              retryEligible: true,
+              reason: "ProviderInvestigationUnexpectedArgumentsError",
+            }),
+          }),
+          expect.objectContaining({
+            eventType: "PROVIDER_EVIDENCE_CAPTURED",
+            turnId: "turn-2",
+            trueForgeEventId: "tool-response-event-second",
+            toolCallId: "github-call-2",
+          }),
+        ]),
+      );
+      expect(events.map((event) => event.trueForgeEventId)).not.toContain(
+        "tool-response-event-first",
+      );
+    },
+  );
+
+  it("does not retry an extra-key attempt when the second attempt also fails", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const first = makeStream({
+      extraArguments: { repository_id: repositoryId },
+      eventSuffix: "first",
+    });
+    const second = makeStream({
+      extraArguments: { webhook_id: "fabricated-hook" },
+      turnId: "turn-2",
+      providerThreadId: "provider-thread-2",
+      providerToolCallId: "github-call-2",
+      providerSpawnToolCallId: "spawn-provider-2",
+      eventSuffix: "second",
+    });
+    const client = createClient(first);
+    client.createTurnStream
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second);
+    client.listTurnEvents.mockImplementation((_sessionId, turnId) =>
+      Promise.resolve(
+        persistedTurnEvents(turnId === "turn-1" ? first.events : second.events),
+      ),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+    expect(createProviderEvidenceService(database).getByIncidentId(incident.id)).toBeNull();
+    expect(
+      service
+        .getWorkflowEvents(incident.id)
+        .filter((event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED"),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attempt: 1,
+            retryEligible: true,
+            reason: "ProviderInvestigationUnexpectedArgumentsError",
+          }),
+        }),
+        expect.objectContaining({
+          turnId: "turn-2",
+          providerInvestigatorThreadId: "provider-thread-2",
+          toolCallId: "github-call-2",
+          details: expect.objectContaining({
+            attempt: 2,
+            retryEligible: false,
+            reason: "ProviderInvestigationUnexpectedArgumentsError",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    ["missing connection_id", JSON.stringify({ delivery_id: deliveryId })],
+    ["missing delivery_id", JSON.stringify({ connection_id: "connection-1" })],
+    ["invalid JSON", "not-json"],
+    ["non-object JSON", JSON.stringify(["connection-1", deliveryId])],
+  ])("does not retry %s arguments", async (_description, providerArgumentsText) => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream({ providerArgumentsText }));
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
+  });
+
   it("captures first evidence from the correlated tool.response", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
@@ -764,6 +975,7 @@ describe("TrueForge provider investigation", () => {
       await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
         ProviderInvestigationTurnError,
       );
+      expect(client.createTurnStream).toHaveBeenCalledOnce();
       expect(
         createProviderEvidenceService(database).getByIncidentId(incident.id),
       ).toBeNull();

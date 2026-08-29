@@ -171,27 +171,31 @@ describe("production connection-backed GitHub MCP", () => {
 
   it("rejects extra or legacy selectors without invoking the service", async () => {
     const { server: mcp, deliveryService } = server();
-    const response = await mcp.handleRequest(
-      request({
-        jsonrpc: "2.0",
-        id: "call-2",
-        method: "tools/call",
-        params: {
-          name: GITHUB_WEBHOOK_DELIVERY_TOOL,
-          arguments: {
-            connection_id: "connection-1",
-            delivery_id: DELIVERY_ID,
-            hook_id: "legacy-hook",
+    for (const [field, value] of [
+      ["hook_id", "legacy-hook"],
+      ["mcp_server", "redrive-github"],
+    ] as const) {
+      const response = await mcp.handleRequest(
+        request({
+          jsonrpc: "2.0",
+          id: `call-${field}`,
+          method: "tools/call",
+          params: {
+            name: GITHUB_WEBHOOK_DELIVERY_TOOL,
+            arguments: {
+              connection_id: "connection-1",
+              delivery_id: DELIVERY_ID,
+              [field]: value,
+            },
           },
-        },
-      }),
-    );
-    expect(response.status).toBe(200);
-    expect(await responseJson(response)).toMatchObject({
-      jsonrpc: "2.0",
-      id: "call-2",
-      result: { isError: true },
-    });
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await responseJson(response)).toMatchObject({
+        jsonrpc: "2.0",
+        result: { isError: true },
+      });
+    }
     expect(deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
   });
 

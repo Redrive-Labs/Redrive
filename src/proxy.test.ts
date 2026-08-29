@@ -4,7 +4,8 @@ import {
   createOperatorSession,
   OPERATOR_SESSION_COOKIE,
 } from "@/server/operator-auth";
-import { proxy } from "../proxy";
+import proxy from "./proxy";
+
 
 const token = "operator-token-that-is-at-least-32-characters";
 const originalEnvironment = { ...process.env };
