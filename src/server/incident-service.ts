@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   INCIDENT_STATUS,
+  type CreateIncidentInput,
   type Incident,
   parseCreateIncidentInput,
 } from "@/domain/incident";
@@ -9,6 +10,10 @@ import {
   type SqliteDatabase,
 } from "@/server/database";
 import { getServerConfig } from "@/server/config";
+import {
+  getApplicationConnection,
+} from "@/server/github-connection-service";
+import type { VerifiedGithubFailedDelivery } from "@/server/github-delivery-service";
 
 export const INCIDENT_LIST_LIMIT = 50;
 
@@ -17,11 +22,19 @@ export interface IncidentCreationResult {
   created: boolean;
 }
 
+export class IncidentIdentityConflictError extends Error {
+  constructor() {
+    super("The delivery identity is already bound to a different incident.");
+    this.name = "IncidentIdentityConflictError";
+  }
+}
+
 const incidentColumns = `
   id,
   provider,
   external_delivery_id AS externalDeliveryId,
   repository_id AS repositoryId,
+  application_connection_id AS applicationConnectionId,
   status,
   created_at AS createdAt,
   updated_at AS updatedAt
@@ -44,11 +57,23 @@ function mapIncidentRow(row: Record<string, unknown>): Incident {
     throw new Error("Incident row has an invalid status.");
   }
 
+  const applicationConnectionId = row.applicationConnectionId;
+  if (
+    applicationConnectionId !== null &&
+    applicationConnectionId !== undefined &&
+    typeof applicationConnectionId !== "string"
+  ) {
+    throw new Error("Incident row has an invalid application connection value.");
+  }
+
   return {
     id: readText("id"),
     provider: readText("provider"),
     externalDeliveryId: readText("externalDeliveryId"),
     repositoryId: readText("repositoryId"),
+    ...(applicationConnectionId === null || applicationConnectionId === undefined
+      ? {}
+      : { applicationConnectionId }),
     status,
     createdAt: readText("createdAt"),
     updatedAt: readText("updatedAt"),
@@ -62,6 +87,7 @@ export function createIncidentService(database: SqliteDatabase) {
       provider,
       external_delivery_id,
       repository_id,
+      application_connection_id,
       status,
       created_at,
       updated_at
@@ -70,6 +96,7 @@ export function createIncidentService(database: SqliteDatabase) {
       @provider,
       @externalDeliveryId,
       @repositoryId,
+      @applicationConnectionId,
       @status,
       @createdAt,
       @updatedAt
@@ -100,41 +127,106 @@ export function createIncidentService(database: SqliteDatabase) {
     return row === undefined ? null : mapIncidentRow(row);
   }
 
+  function getByDeliveryIdentity(
+    provider: string,
+    repositoryId: string,
+    externalDeliveryId: string,
+  ): Incident | null {
+    const row = database.get<Record<string, unknown>>(
+      getIncidentByIdentity,
+      [provider, repositoryId, externalDeliveryId],
+    );
+    return row === undefined ? null : mapIncidentRow(row);
+  }
+
+  function insert(
+    values: CreateIncidentInput & { applicationConnectionId?: string },
+  ): IncidentCreationResult {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+
+    const insertion = database.run(
+      insertIncident,
+      {
+        id,
+        provider: values.provider,
+        externalDeliveryId: values.externalDeliveryId,
+        repositoryId: values.repositoryId,
+        applicationConnectionId: values.applicationConnectionId ?? null,
+        status: INCIDENT_STATUS,
+        createdAt: now,
+        updatedAt: now,
+      },
+    );
+
+    const incident = getByDeliveryIdentity(
+      values.provider,
+      values.repositoryId,
+      values.externalDeliveryId,
+    );
+
+    if (incident === null) {
+      throw new Error("Created or existing incident could not be read back.");
+    }
+
+    return {
+      incident,
+      created: insertion.changes === 1,
+    };
+  }
+
   return {
+    // This is the historical incident operation. Connection-shaped input is
+    // rejected by parseCreateIncidentInput and cannot reach persistence here.
     create(input: unknown): IncidentCreationResult {
-      const values = parseCreateIncidentInput(input);
-      const now = new Date().toISOString();
-      const id = randomUUID();
-
-      const insertion = database.run(
-        insertIncident,
-        {
-          id,
-          provider: values.provider,
-          externalDeliveryId: values.externalDeliveryId,
-          repositoryId: values.repositoryId,
-          status: INCIDENT_STATUS,
-          createdAt: now,
-          updatedAt: now,
-        },
+      return insert(parseCreateIncidentInput(input));
+    },
+    // The only connection-backed persistence operation accepts a value produced
+    // by the GitHub delivery verification boundary, never raw request fields.
+    createFromVerifiedConnectionDelivery(
+      delivery: VerifiedGithubFailedDelivery,
+    ): IncidentCreationResult {
+      const connection = getApplicationConnection(
+        database,
+        delivery.connectionId,
       );
-
-      const row = database.get<Record<string, unknown>>(
-        getIncidentByIdentity,
-        [values.provider, values.repositoryId, values.externalDeliveryId],
-      );
-      const incident = row === undefined ? null : mapIncidentRow(row);
-
-      if (incident === null) {
-        throw new Error("Created or existing incident could not be read back.");
+      if (
+        connection === null ||
+        connection.provider !== delivery.provider ||
+        connection.repositoryId !== delivery.repositoryId ||
+        connection.webhookId !== delivery.webhookId
+      ) {
+        throw new Error(
+          "The verified GitHub delivery no longer matches its application connection.",
+        );
       }
-
-      return {
-        incident,
-        created: insertion.changes === 1,
-      };
+      const existing = getByDeliveryIdentity(
+        connection.provider,
+        connection.repositoryId,
+        delivery.id,
+      );
+      if (
+        existing !== null &&
+        existing.applicationConnectionId !== connection.id
+      ) {
+        throw new IncidentIdentityConflictError();
+      }
+      const result = insert({
+        provider: connection.provider,
+        externalDeliveryId: delivery.id,
+        repositoryId: connection.repositoryId,
+        applicationConnectionId: connection.id,
+      });
+      // Re-check the row returned after the conflict-safe insert as well. A
+      // concurrent legacy writer may have won between the preflight read and
+      // INSERT; never return that row as a connection-backed incident.
+      if (result.incident.applicationConnectionId !== connection.id) {
+        throw new IncidentIdentityConflictError();
+      }
+      return result;
     },
     getById,
+    getByDeliveryIdentity,
     list(): Incident[] {
       return database
         .all<Record<string, unknown>>(listIncidentRows)

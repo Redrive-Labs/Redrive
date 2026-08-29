@@ -100,6 +100,14 @@ See:
 
 Active hackathon development.
 
+## Operator access
+
+Redrive is currently a single-operator, self-hosted control plane. Configure a
+high-entropy `REDRIVE_OPERATOR_TOKEN` of at least 32 characters. The operator
+UI and control APIs require login at `/login`. GitHub callbacks retain their
+state-token authentication, and `/api/mcp/github` retains separate bearer
+authentication.
+
 ## Run the control plane locally
 
 Requirements: Node.js 22 or newer and npm.
@@ -111,25 +119,25 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The development capture
 form records minimal incident metadata in `.local/redrive.sqlite`. Each incident
-can use the control-plane action to inspect one GitHub delivery through the
-configured read-only MCP bridge. The normalized evidence is stored in the same
+can use the control-plane action to investigate one GitHub delivery through the
+connection-backed read-only MCP endpoint. The normalized evidence is stored in the same
 SQLite database. The database directory and schema are created automatically on
 first use.
 
 To use another local SQLite path, copy `.env.example` to `.env.local` and set
-`REDRIVE_DATABASE_PATH`. Set the required server-side
+`REDRIVE_DATABASE_PATH`. GitHub App private keys are stored outside the
+repository at `$HOME/.redrive/secrets` by default. Redrive creates the
+`.redrive` and `secrets` directories with mode `0700` and private-key files
+with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit
+absolute directory when required; its ownership, ancestor, symlink, and
+permission checks remain enforced. Set the required server-side
 `REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
-Set `REDRIVE_TRUEFORGE_GITHUB_MCP_NAME` to the name of the configured read-only
-GitHub MCP server in TrueForge. TrueForge Settings owns that server's URL and
-credentials. Redrive does not select or interpret a provider, and TrueForge
-credentials stay server-side.
-
-Provider inspection requires a bridge exposing the proven
-`get_webhook_delivery` MCP tool. Set `REDRIVE_GITHUB_MCP_URL`, then configure an
-explicit repository-to-hook mapping with `REDRIVE_GITHUB_HOOK_IDS` (or set the
-single-receiver `REDRIVE_GITHUB_HOOK_ID`). Redrive sends `hook_id` and the
-incident's exact `externalDeliveryId` as `delivery_id`; it never derives a hook
-ID from `repositoryId` and never calls GitHub REST directly.
+Connection-backed M2.6B incidents use
+`REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME`, whose configured server must
+point at Redrive's strict `/api/mcp/github` endpoint. Set
+`REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to its server-side bearer secret.
+TrueForge Settings owns the MCP server URL and credentials. Redrive does not
+select or interpret a provider, and TrueForge credentials stay server-side.
 
 `externalDeliveryId` and normalized `providerDeliveryId` identify the exact
 GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook
@@ -138,21 +146,21 @@ idempotency. Capture fails closed if those identities, the request header, or
 the configured repository evidence contradict each other.
 
 `GET /api/incidents/:incidentId/provider-evidence` reads only the persisted
-snapshot and returns `{ "evidence": null }` before capture. Its `POST` remains
-the direct diagnostic primitive. The first normalized snapshot is immutable;
-later direct capture requests return it without contacting GitHub again. MCP
-reads time out after 12 seconds and reject transport responses larger than 64
-MiB.
+snapshot and returns `{ "evidence": null }` before capture. Provider evidence
+is captured by the connection-backed TrueForge investigation. The first
+normalized snapshot is immutable. MCP reads time out after 12 seconds and
+reject transport responses larger than 64 MiB.
 
 `POST /api/incidents/:incidentId/provider-investigation` runs the recovery path
-through the incident's existing TrueForge session. It upgrades an existing
-`m2.5-v1` inline session in place to `m2.5-v2`, then requires a dynamic
-`provider-investigator` thread and correlates its read-only
+through the incident's existing TrueForge session. Connection-backed incidents
+use `m2.6b-v1` and the strict connection MCP server. The route then requires a
+dynamic `provider-investigator` thread and correlates its read-only
 `get_webhook_delivery` model tool call and `tool.response`. Only that response
 is normalized as provider evidence. The route returns product state, not a
 TrueForge transcript.
 GitHub caps webhook payloads at 25 MB; the higher transport limit allows for
-the proven bridge's escaped JSON-RPC text envelope while remaining bounded.
+the escaped JSON-RPC text envelope while remaining bounded.
+
 
 The stored `canonicalPayloadSha256` is SHA-256 of Redrive's canonical JSON
 representation of the provider-returned payload. It is not a hash of the

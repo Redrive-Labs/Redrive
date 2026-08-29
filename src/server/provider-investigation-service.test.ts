@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
-  RECOVERY_COORDINATOR_SPEC_VERSION,
+  CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+  RecoveryCoordinatorConfigurationError,
 } from "@/agents/recovery-coordinator";
 import {
   createProviderEvidenceService,
@@ -25,17 +25,15 @@ import {
   TrueForgeSessionUnavailableError,
 } from "@/server/trueforge-session-service";
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
-import { GithubMcpConfigurationError } from "@/server/github-mcp";
 
 const deliveryId = "900719925474099312345678901234567890";
 const repositoryId = "example/receiver";
-const hookId = "hook-42";
-const mcpServerName = "redrive-github";
+const connectionMcpServerName = "redrive-github";
 const environment = {
   NODE_ENV: "test",
   REDRIVE_TRUEFORGE_MODEL: "configured-model",
-  REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: mcpServerName,
-  REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: hookId }),
+  REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: connectionMcpServerName,
+  REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
 } as const;
 
 function makeGithubResult(
@@ -84,27 +82,45 @@ interface StreamOptions {
   toolName?: string;
   toolInfoName?: string;
   toolInfoServerName?: string;
-  hookArgument?: string;
+  connectionArgument?: string;
   deliveryArgument?: string;
+  providerArgumentsText?: string;
+  extraArguments?: Record<string, unknown>;
   expectedDeliveryId?: string;
+  turnId?: string;
+  providerThreadId?: string;
+  providerToolCallId?: string;
+  providerSpawnToolCallId?: string;
   includeResponse?: boolean;
   includeRootToolCall?: boolean;
   includeEmptySpawnResponse?: boolean;
   responseThreadId?: string;
   responseToolCallId?: string;
   responseContent?: string;
+  eventSuffix?: string;
 }
 
 function makeStream(
   options: StreamOptions = {},
 ): AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events: unknown[] } {
-  const providerThreadId = "provider-thread-1";
-  const toolCallId = "github-call-1";
+  const providerThreadId = options.providerThreadId ?? "provider-thread-1";
+  const toolCallId = options.providerToolCallId ?? "github-call-1";
+  const providerSpawnToolCallId =
+    options.providerSpawnToolCallId ?? "spawn-provider-1";
+  const turnId = options.turnId ?? "turn-1";
+  const providerToolArguments = {
+    connection_id: options.connectionArgument ?? "connection-1",
+    delivery_id:
+      options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+    ...options.extraArguments,
+  };
+  const providerToolArgumentsText =
+    options.providerArgumentsText ?? JSON.stringify(providerToolArguments);
   const events: unknown[] = [
     {
       type: "turn.created",
       id: "turn-created-event",
-      turnId: "turn-1",
+      turnId,
       previousTurnId: null,
       state: { status: "running" },
       createdAt: "2026-08-25T10:00:00.000Z",
@@ -117,7 +133,7 @@ function makeStream(
       content: null,
       toolCalls: [
         {
-          id: "spawn-provider-1",
+          id: providerSpawnToolCallId,
           type: "function",
           function: {
             name: "create_sub_agent",
@@ -139,7 +155,7 @@ function makeStream(
       threadId: providerThreadId,
       title: "Provider investigator",
       createdAt: "2026-08-25T10:00:01.000Z",
-      parent: { threadId: "main", toolCallId: "spawn-provider-1" },
+      parent: { threadId: "main", toolCallId: providerSpawnToolCallId },
       agentInfo: {
         type: "dynamic",
         name: options.agentName ?? PROVIDER_INVESTIGATOR_NAME,
@@ -157,17 +173,13 @@ function makeStream(
           type: "function",
           function: {
             name: options.toolName ?? "get_webhook_delivery",
-            arguments: JSON.stringify({
-              hook_id: options.hookArgument ?? hookId,
-              delivery_id:
-                options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
-            }),
+            arguments: providerToolArgumentsText,
           },
           toolInfo: {
             type: "mcp",
             name: options.toolInfoName ?? "get_webhook_delivery",
             serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? mcpServerName,
+            serverName: options.toolInfoServerName ?? connectionMcpServerName,
           },
         },
       ],
@@ -187,7 +199,7 @@ function makeStream(
           function: {
             name: "get_webhook_delivery",
             arguments: JSON.stringify({
-              hook_id: options.hookArgument ?? hookId,
+              connection_id: options.connectionArgument ?? "connection-1",
               delivery_id:
                 options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
             }),
@@ -196,7 +208,7 @@ function makeStream(
             type: "mcp",
             name: "get_webhook_delivery",
             serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? mcpServerName,
+            serverName: options.toolInfoServerName ?? connectionMcpServerName,
           },
         },
       ],
@@ -231,7 +243,7 @@ function makeStream(
         id: "spawn-provider-response-event",
         createdAt: "2026-08-25T10:00:02.500Z",
         threadId: "main",
-        toolCallId: "spawn-provider-1",
+        toolCallId: providerSpawnToolCallId,
         content: "",
       },
     );
@@ -253,6 +265,18 @@ function makeStream(
         typeof event.id === "string"
       ) {
         event.id = `${event.id}-${options.expectedDeliveryId}`;
+      }
+    }
+  }
+  if (options.eventSuffix !== undefined) {
+    for (const event of events) {
+      if (
+        event !== null &&
+        typeof event === "object" &&
+        "id" in event &&
+        typeof event.id === "string"
+      ) {
+        event.id = `${event.id}-${options.eventSuffix}`;
       }
     }
   }
@@ -296,7 +320,7 @@ describe("TrueForge provider investigation", () => {
   let database: SqliteDatabase;
 
   beforeEach(() => {
-    directory = mkdtempSync(path.join(os.tmpdir(), "redrive-provider-investigation-"));
+    directory = mkdtempSync(path.join(os.tmpdir(), "redrive-connection-provider-investigation-"));
     database = openDatabase(path.join(directory, "incidents.sqlite"));
   });
 
@@ -306,17 +330,43 @@ describe("TrueForge provider investigation", () => {
   });
 
   function createIncident(externalDeliveryId = deliveryId) {
-    return createIncidentService(database).create({
+    const incident = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId,
       repositoryId,
     }).incident;
+    const suffix = incident.id.replace(/[^a-zA-Z0-9]/g, "");
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`app-${suffix}`, `app-id-${suffix}`, "redrive", "owner-id", "octocat", "User", `key-${suffix}`, "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO github_installations
+        (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`installation-${suffix}`, `app-${suffix}`, "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT OR IGNORE INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["connection-1", "github", `installation-${suffix}`, repositoryId, repositoryId, `hook-${suffix}`, "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
+    );
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", ["connection-1", incident.id]);
+    return { ...incident, applicationConnectionId: "connection-1" };
   }
 
   function installActiveBinding(
     incidentId: string,
     sessionId = "existing-session",
-    coordinatorSpecVersion: string = LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+    coordinatorSpecVersion: string = CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   ): void {
     database.run(
       `
@@ -360,6 +410,49 @@ describe("TrueForge provider investigation", () => {
     });
     return () => injectedFailure;
   }
+
+  it("uses the durable connection tuple before any TrueForge turn", async () => {
+    const incident = createIncident("connection-delivery");
+    const client = createClient(
+      makeStream({
+        connectionArgument: "connection-1",
+        deliveryArgument: "connection-delivery",
+        toolInfoServerName: connectionMcpServerName,
+        responseContent: JSON.stringify(makeGithubResult({ id: "connection-delivery" })),
+      }),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      incidentId: incident.id,
+      providerStatusCode: 500,
+      trueForgeSessionId: "replacement-session",
+    });
+    expect(client.createSession).toHaveBeenCalledOnce();
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
+    expect(client.createSession.mock.calls[0][0].mcpServers).toEqual([
+      expect.objectContaining({ name: connectionMcpServerName }),
+    ]);
+    expect(client.listTurnEvents).toHaveBeenCalledWith(
+      "replacement-session",
+      "turn-1",
+    );
+    const turnInput = client.createTurnStream.mock.calls[0][1]?.input;
+    expect(JSON.stringify(turnInput)).toContain("connection-1");
+    expect(JSON.stringify(turnInput)).toContain("connection_id");
+    expect(JSON.stringify(turnInput)).toContain("delivery_id");
+    expect(
+      database.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM provider_evidence",
+      )?.count,
+    ).toBe(1);
+  });
 
   it("collects only the exact completed turn, not unrelated session history", async () => {
     const incident = createIncident();
@@ -418,10 +511,79 @@ describe("TrueForge provider investigation", () => {
     );
   });
 
+  it("rejects persisted events for a different turn and does not persist their evidence", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+
+    const persisted = makeStream();
+    const liveEvents = persisted.events
+      .filter(
+        (event) =>
+          event !== null &&
+          typeof event === "object" &&
+          "type" in event &&
+          (event.type === "turn.created" || event.type === "turn.done"),
+      )
+      .map((event) =>
+        event !== null &&
+        typeof event === "object" &&
+        "type" in event &&
+        event.type === "turn.created"
+          ? { ...event, turnId: "turn-A" }
+          : event,
+      );
+    const persistedEvents = persisted.events.map((event) =>
+      event !== null &&
+      typeof event === "object" &&
+      "type" in event &&
+      event.type === "turn.created"
+        ? { ...event, turnId: "turn-B" }
+        : event,
+    );
+    const liveStream = {
+      events: liveEvents,
+      async *[Symbol.asyncIterator]() {
+        for (const event of liveEvents) {
+          yield event as TrueForgeApi.TurnStreamingEvent;
+        }
+      },
+    };
+    const client = createClient(liveStream);
+    client.listTurnEvents.mockResolvedValue(
+      persistedTurnEvents(persistedEvents),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+
+    expect(
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
+    ).toBeNull();
+    expect(
+      service
+        .getWorkflowEvents(incident.id)
+        .find((event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED"),
+    ).toMatchObject({
+      eventType: "PROVIDER_INVESTIGATION_FAILED",
+      trueForgeSessionId: "existing-session",
+      turnId: "turn-A",
+      details: {
+        reason: "ProviderInvestigationTurnError",
+        sourceTrueForgeEventId: "turn-created-event",
+      },
+    });
+  });
+
   it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const existing = evidenceService.captureOrReconcileForIncident(
@@ -453,7 +615,7 @@ describe("TrueForge provider investigation", () => {
       expect.objectContaining({
         input: [
           expect.objectContaining({
-            content: expect.stringContaining(`hook_id=${hookId}`),
+            content: expect.stringContaining("connection_id=connection-1"),
           }),
         ],
       }),
@@ -463,7 +625,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
     expect(evidenceService.getByIncidentId(incident.id)).toEqual(existing);
 
     const events = service.getWorkflowEvents(incident.id);
@@ -491,7 +653,7 @@ describe("TrueForge provider investigation", () => {
     installActiveBinding(
       incident.id,
       "existing-v2-session",
-      RECOVERY_COORDINATOR_SPEC_VERSION,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
     );
     const client = createClient(makeStream());
     const service = createProviderInvestigationService(database, client, environment);
@@ -505,7 +667,7 @@ describe("TrueForge provider investigation", () => {
         model: { name: environment.REDRIVE_TRUEFORGE_MODEL },
         mcpServers: [
           expect.objectContaining({
-            name: environment.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME,
+            name: environment.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME,
           }),
         ],
       }),
@@ -513,6 +675,192 @@ describe("TrueForge provider investigation", () => {
     expect(client.updateSession.mock.invocationCallOrder[0]).toBeLessThan(
       client.createTurnStream.mock.invocationCallOrder[0],
     );
+  });
+
+  it("uses one turn for a valid first attempt and does not retry", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream());
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result.evidenceDisposition).toBe("CAPTURED");
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
+    expect(client.listTurnEvents).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { mcp_server: connectionMcpServerName },
+    { repository_id: repositoryId, webhook_id: "fabricated-hook" },
+  ])(
+    "retries an exact lookup tuple with fabricated extra keys (%s)",
+    async (extraArguments) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const first = makeStream({
+        extraArguments,
+        eventSuffix: "first",
+      });
+      const second = makeStream({
+        turnId: "turn-2",
+        providerThreadId: "provider-thread-2",
+        providerToolCallId: "github-call-2",
+        providerSpawnToolCallId: "spawn-provider-2",
+        eventSuffix: "second",
+      });
+      const client = createClient(first);
+      client.createTurnStream
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(second);
+      client.listTurnEvents.mockImplementation((_sessionId, turnId) =>
+        Promise.resolve(
+          persistedTurnEvents(turnId === "turn-1" ? first.events : second.events),
+        ),
+      );
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      const result = await service.investigateProviderForIncident(incident.id);
+
+      expect(result).toMatchObject({
+        turnId: "turn-2",
+        providerInvestigatorThreadId: "provider-thread-2",
+        evidenceDisposition: "CAPTURED",
+      });
+      expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+      expect(client.createTurnStream.mock.calls[0][0]).toBe("existing-session");
+      expect(client.createTurnStream.mock.calls[1][0]).toBe("existing-session");
+      expect(client.listTurnEvents).toHaveBeenNthCalledWith(
+        2,
+        "existing-session",
+        "turn-2",
+      );
+      const retryInput = JSON.stringify(client.createTurnStream.mock.calls[1][1]?.input);
+      expect(retryInput).toContain("previous provider investigation attempt was rejected");
+      expect(retryInput).toContain("added extra argument keys");
+      expect(retryInput).toContain(
+        JSON.stringify(
+          `EXACTLY: {"connection_id":"connection-1","delivery_id":"${deliveryId}"}`,
+        ).slice(1, -1),
+      );
+      expect(retryInput).toContain("no other properties");
+
+      const events = service.getWorkflowEvents(incident.id);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "PROVIDER_INVESTIGATION_FAILED",
+            turnId: "turn-1",
+            details: expect.objectContaining({
+              attempt: 1,
+              retryEligible: true,
+              reason: "ProviderInvestigationUnexpectedArgumentsError",
+            }),
+          }),
+          expect.objectContaining({
+            eventType: "PROVIDER_EVIDENCE_CAPTURED",
+            turnId: "turn-2",
+            trueForgeEventId: "tool-response-event-second",
+            toolCallId: "github-call-2",
+          }),
+        ]),
+      );
+      expect(events.map((event) => event.trueForgeEventId)).not.toContain(
+        "tool-response-event-first",
+      );
+    },
+  );
+
+  it("does not retry an extra-key attempt when the second attempt also fails", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const first = makeStream({
+      extraArguments: { repository_id: repositoryId },
+      eventSuffix: "first",
+    });
+    const second = makeStream({
+      extraArguments: { webhook_id: "fabricated-hook" },
+      turnId: "turn-2",
+      providerThreadId: "provider-thread-2",
+      providerToolCallId: "github-call-2",
+      providerSpawnToolCallId: "spawn-provider-2",
+      eventSuffix: "second",
+    });
+    const client = createClient(first);
+    client.createTurnStream
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second);
+    client.listTurnEvents.mockImplementation((_sessionId, turnId) =>
+      Promise.resolve(
+        persistedTurnEvents(turnId === "turn-1" ? first.events : second.events),
+      ),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+    expect(createProviderEvidenceService(database).getByIncidentId(incident.id)).toBeNull();
+    expect(
+      service
+        .getWorkflowEvents(incident.id)
+        .filter((event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED"),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attempt: 1,
+            retryEligible: true,
+            reason: "ProviderInvestigationUnexpectedArgumentsError",
+          }),
+        }),
+        expect.objectContaining({
+          turnId: "turn-2",
+          providerInvestigatorThreadId: "provider-thread-2",
+          toolCallId: "github-call-2",
+          details: expect.objectContaining({
+            attempt: 2,
+            retryEligible: false,
+            reason: "ProviderInvestigationUnexpectedArgumentsError",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    ["missing connection_id", JSON.stringify({ delivery_id: deliveryId })],
+    ["missing delivery_id", JSON.stringify({ connection_id: "connection-1" })],
+    ["invalid JSON", "not-json"],
+    ["non-object JSON", JSON.stringify(["connection-1", deliveryId])],
+  ])("does not retry %s arguments", async (_description, providerArgumentsText) => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream({ providerArgumentsText }));
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
   });
 
   it("captures first evidence from the correlated tool.response", async () => {
@@ -529,7 +877,7 @@ describe("TrueForge provider investigation", () => {
     const result = await service.investigateProviderForIncident(incident.id);
 
     expect(result.evidenceDisposition).toBe("CAPTURED");
-    const evidence = createProviderEvidenceService(database, null).getByIncidentId(
+    const evidence = createProviderEvidenceService(database).getByIncidentId(
       incident.id,
     );
     expect(evidence).toMatchObject({
@@ -539,20 +887,20 @@ describe("TrueForge provider investigation", () => {
     });
   });
 
-  it("fails before remote session work when deterministic inputs are unavailable", async () => {
+  it("fails before remote session work when connection MCP configuration is unavailable", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id, "existing-session");
     const client = createClient(makeStream());
-    const environmentWithoutHook: NodeJS.ProcessEnv = { ...environment };
-    delete environmentWithoutHook.REDRIVE_GITHUB_HOOK_IDS;
+    const environmentWithoutMcp: NodeJS.ProcessEnv = { ...environment };
+    delete environmentWithoutMcp.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
     const service = createProviderInvestigationService(
       database,
       client,
-      environmentWithoutHook,
+      environmentWithoutMcp,
     );
 
     await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
-      GithubMcpConfigurationError,
+      RecoveryCoordinatorConfigurationError,
     );
     expect(client.getSession).not.toHaveBeenCalled();
     expect(client.updateSession).not.toHaveBeenCalled();
@@ -582,7 +930,7 @@ describe("TrueForge provider investigation", () => {
     installActiveBinding(
       incident.id,
       "v2-session",
-      RECOVERY_COORDINATOR_SPEC_VERSION,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
     );
     const client = createClient(makeStream());
     client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
@@ -598,7 +946,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
   });
 
   it("rejects root-thread calls, wrong subagents, wrong MCP resources, and wrong IDs", async () => {
@@ -607,7 +955,7 @@ describe("TrueForge provider investigation", () => {
       { agentName: "other-investigator" },
       { toolInfoServerName: "other-server" },
       { toolName: "redeliver_webhook_delivery", toolInfoName: "redeliver_webhook_delivery" },
-      { hookArgument: "wrong-hook" },
+      { connectionArgument: "wrong-connection" },
       { deliveryArgument: "wrong-delivery" },
       { includeRootToolCall: true },
     ];
@@ -627,8 +975,9 @@ describe("TrueForge provider investigation", () => {
       await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
         ProviderInvestigationTurnError,
       );
+      expect(client.createTurnStream).toHaveBeenCalledOnce();
       expect(
-        createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
       ).toBeNull();
     }
   });
@@ -643,7 +992,7 @@ describe("TrueForge provider investigation", () => {
       ProviderInvestigationTurnError,
     );
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(
       service
@@ -657,11 +1006,7 @@ describe("TrueForge provider investigation", () => {
       toolCallId: "github-call-1",
     });
 
-    const proseIncident = createIncidentService(database).create({
-      provider: "github",
-      externalDeliveryId: "prose-delivery",
-      repositoryId,
-    }).incident;
+    const proseIncident = createIncident("prose-delivery");
     installActiveBinding(proseIncident.id, "prose-session");
     const proseClient = createClient(
       makeStream({ includeResponse: false }),
@@ -717,14 +1062,14 @@ describe("TrueForge provider investigation", () => {
       proseService.investigateProviderForIncident(proseIncident.id),
     ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(proseIncident.id),
+      createProviderEvidenceService(database).getByIncidentId(proseIncident.id),
     ).toBeNull();
   });
 
   it("records conflict and leaves the original immutable snapshot untouched", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const original = evidenceService.captureOrReconcileForIncident(
@@ -797,7 +1142,7 @@ describe("TrueForge provider investigation", () => {
     ).rejects.toThrow("does not match the existing durable event");
 
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(workflowEvents.getByTrueForgeEventId("tool-response-event")).toEqual(
       conflictingEvent,
@@ -830,7 +1175,7 @@ describe("TrueForge provider investigation", () => {
       "injected workflow event persistence failure",
     );
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(
       database.get<{ count: number }>(
@@ -846,7 +1191,7 @@ describe("TrueForge provider investigation", () => {
   it("does not append a reobservation event without committing its transaction", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const original = evidenceService.captureOrReconcileForIncident(
@@ -906,10 +1251,7 @@ describe("TrueForge provider investigation", () => {
       providerStatusCode: 500,
     });
 
-    const evidence = createProviderEvidenceService(
-      database,
-      null,
-    ).getByIncidentId(incident.id);
+    const evidence = createProviderEvidenceService(database).getByIncidentId(incident.id);
 
     expect(evidence).toMatchObject({
       providerDeliveryId: deliveryId,

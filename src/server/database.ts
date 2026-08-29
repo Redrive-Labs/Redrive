@@ -132,6 +132,133 @@ const migrations: Migration[] = [
     version: 6,
     sql: incidentWorkflowEventsTableSql,
   },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE github_app_registrations (
+        id TEXT PRIMARY KEY NOT NULL,
+        github_app_id TEXT NOT NULL UNIQUE,
+        slug TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        owner_login TEXT NOT NULL,
+        owner_type TEXT NOT NULL CHECK (owner_type IN ('User', 'Organization')),
+        private_key_ref TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE github_manifest_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        state_hash TEXT NOT NULL UNIQUE,
+        target_type TEXT NOT NULL CHECK (target_type IN ('personal', 'organization')),
+        owner_login TEXT,
+        status TEXT NOT NULL CHECK (
+          status IN ('PENDING', 'EXCHANGING', 'COMPLETED', 'RECOVERY_REQUIRED')
+        ),
+        expires_at TEXT NOT NULL,
+        claimed_at TEXT,
+        app_registration_id TEXT,
+        remote_github_app_id TEXT,
+        remote_slug TEXT,
+        recovery_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY (app_registration_id)
+          REFERENCES github_app_registrations (id)
+          ON DELETE RESTRICT,
+        CHECK (
+          (target_type = 'organization' AND owner_login IS NOT NULL)
+          OR (target_type = 'personal' AND owner_login IS NULL)
+        )
+      );
+
+      CREATE TABLE github_installations (
+        installation_id TEXT PRIMARY KEY NOT NULL,
+        app_registration_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        account_login TEXT NOT NULL,
+        account_type TEXT NOT NULL CHECK (account_type IN ('User', 'Organization')),
+        repository_selection TEXT NOT NULL CHECK (repository_selection IN ('all', 'selected')),
+        last_verified_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (app_registration_id)
+          REFERENCES github_app_registrations (id)
+          ON DELETE RESTRICT
+      );
+
+      CREATE TABLE github_installation_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        state_hash TEXT NOT NULL UNIQUE,
+        app_registration_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('PENDING', 'VERIFYING', 'COMPLETED', 'RECOVERY_REQUIRED')
+        ),
+        expires_at TEXT NOT NULL,
+        claimed_at TEXT,
+        installation_id TEXT,
+        recovery_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY (app_registration_id)
+          REFERENCES github_app_registrations (id)
+          ON DELETE RESTRICT,
+        FOREIGN KEY (installation_id)
+          REFERENCES github_installations (installation_id)
+          ON DELETE RESTRICT
+      );
+
+      CREATE TABLE application_connections (
+        id TEXT PRIMARY KEY NOT NULL,
+        provider TEXT NOT NULL CHECK (provider = 'github'),
+        github_installation_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_full_name TEXT NOT NULL,
+        webhook_id TEXT NOT NULL,
+        webhook_target_display TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state = 'READY'),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (github_installation_id)
+          REFERENCES github_installations (installation_id)
+          ON DELETE RESTRICT,
+        UNIQUE (provider, repository_id, webhook_id)
+      );
+
+      ALTER TABLE incidents
+        ADD COLUMN application_connection_id TEXT
+        REFERENCES application_connections (id)
+        ON DELETE SET NULL;
+
+      CREATE INDEX github_manifest_attempts_status_idx
+        ON github_manifest_attempts (status, expires_at);
+      CREATE INDEX github_installation_attempts_status_idx
+        ON github_installation_attempts (status, expires_at);
+      CREATE INDEX github_installations_app_idx
+        ON github_installations (app_registration_id);
+      CREATE INDEX application_connections_installation_idx
+        ON application_connections (github_installation_id);
+      CREATE INDEX incidents_application_connection_idx
+        ON incidents (application_connection_id);
+    `,
+  },
+  {
+    version: 8,
+    // Conversion checkpoints are nullable so historical attempts remain
+    // readable. No historical row is rewritten or inferred.
+    sql: `
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_id TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_login TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_type TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN private_key_sha256 TEXT;
+    `,
+  },
 ];
 
 export class SqliteDatabase {

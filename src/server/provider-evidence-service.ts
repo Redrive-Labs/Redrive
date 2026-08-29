@@ -4,10 +4,6 @@ import {
   PROVIDER_EVIDENCE_SCHEMA_VERSION,
   type ProviderEvidence,
 } from "@/domain/provider-evidence";
-import {
-  createConfiguredGithubWebhookDeliveryReader,
-  type GithubWebhookDeliveryReader,
-} from "@/server/github-mcp";
 import { normalizeGithubWebhookDelivery } from "@/server/github-provider-evidence";
 import { getConfiguredDatabase, type SqliteDatabase } from "@/server/database";
 import { getServerConfig } from "@/server/config";
@@ -27,12 +23,6 @@ export class UnsupportedProviderEvidenceError extends Error {
   }
 }
 
-export class ProviderEvidenceReadError extends Error {
-  constructor(options?: ErrorOptions) {
-    super("GitHub provider evidence could not be read.", options);
-    this.name = "ProviderEvidenceReadError";
-  }
-}
 
 export type ProviderEvidenceDisposition = "CAPTURED" | "REOBSERVED";
 
@@ -181,7 +171,6 @@ function providerEvidenceMatchesIgnoringCaptureTime(
 
 export function createProviderEvidenceService(
   database: SqliteDatabase,
-  githubDeliveryReader: GithubWebhookDeliveryReader | null,
   now: () => string = () => new Date().toISOString(),
 ) {
   const incidentService = createIncidentService(database);
@@ -245,25 +234,6 @@ export function createProviderEvidenceService(
     );
   }
 
-  async function obtainForIncident(incidentId: string): Promise<unknown> {
-    const incident = getIncidentOrThrow(incidentId);
-    if (incident.provider !== GITHUB_PROVIDER) {
-      throw new UnsupportedProviderEvidenceError(incident.provider);
-    }
-
-    if (githubDeliveryReader === null) {
-      throw new ProviderEvidenceReadError();
-    }
-
-    try {
-      return await githubDeliveryReader.getWebhookDelivery({
-        repositoryId: incident.repositoryId,
-        deliveryId: incident.externalDeliveryId,
-      });
-    } catch (error) {
-      throw new ProviderEvidenceReadError({ cause: error });
-    }
-  }
 
   function serializeEvidence(evidence: ProviderEvidence): string {
     const evidenceJson = JSON.stringify(evidence);
@@ -377,56 +347,24 @@ export function createProviderEvidenceService(
     return persistNormalizedEvidence(incidentId, evidence);
   }
 
-  async function inspectForIncident(
-    incidentId: string,
-  ): Promise<ProviderEvidence> {
-    getIncidentOrThrow(incidentId);
-    const existing = getByIncidentId(incidentId);
-    if (existing !== null) return existing;
-
-    const result = await obtainForIncident(incidentId);
-    return captureOrReconcileForIncident(incidentId, result).evidence;
-  }
 
   return {
     getByIncidentId,
     getCapturedIncidentIds,
     normalizeForIncident,
-    obtainForIncident,
     captureOrReconcileForIncident,
     reconcileNormalizedEvidenceWithinTransaction,
     serializeEvidence,
-    inspectForIncident,
   };
 }
 
 type ProviderEvidenceService = ReturnType<typeof createProviderEvidenceService>;
 
-function createLazyConfiguredGithubReader(): GithubWebhookDeliveryReader {
-  return {
-    getWebhookDelivery(lookup) {
-      return createConfiguredGithubWebhookDeliveryReader().getWebhookDelivery(
-        lookup,
-      );
-    },
-  };
-}
-
 function withConfiguredProviderEvidenceService<T>(
   operation: (service: ProviderEvidenceService) => T,
 ): T {
   const database = getConfiguredDatabase(getServerConfig().databasePath);
-  return operation(
-    createProviderEvidenceService(database, createLazyConfiguredGithubReader()),
-  );
-}
-
-export async function inspectProviderEvidence(
-  incidentId: string,
-): Promise<ProviderEvidence> {
-  return withConfiguredProviderEvidenceService((service) =>
-    service.inspectForIncident(incidentId),
-  );
+  return operation(createProviderEvidenceService(database));
 }
 
 export async function getProviderEvidenceByIncidentId(

@@ -4,20 +4,18 @@ import {
   type ProviderEvidence,
 } from "@/domain/provider-evidence";
 import {
+  CONNECTION_PROVIDER_INVESTIGATION_SKILL_NAME,
+  CONNECTION_TRUEFORGE_GITHUB_MCP_ENV,
   GITHUB_WEBHOOK_DELIVERY_TOOL,
-  getRecoveryCoordinatorAgentSpec,
-  PROVIDER_INVESTIGATION_SKILL_NAME,
+  getConnectionRecoveryCoordinatorAgentSpec,
 } from "@/agents/recovery-coordinator";
-import {
-  GithubMcpConfigurationError,
-  parseGithubMcpToolResultJson,
-  resolveConfiguredGithubHookId,
-} from "@/server/github-mcp";
+import { parseGithubMcpToolResultJson } from "@/server/github-mcp";
 import { createIncidentService } from "@/server/incident-service";
 import {
   createIncidentWorkflowEventService,
   type AppendIncidentWorkflowEventInput,
 } from "@/server/incident-workflow-event-service";
+import type { IncidentWorkflowEventDetails } from "@/domain/incident-workflow-event";
 import {
   createProviderEvidenceService,
   IncidentNotFoundError,
@@ -54,6 +52,16 @@ export class ProviderInvestigationTurnError extends Error {
   }
 }
 
+class ProviderInvestigationUnexpectedArgumentsError extends ProviderInvestigationTurnError {
+  readonly additionalKeys: string[];
+
+  constructor(additionalKeys: string[]) {
+    super("Provider Investigator MCP tool arguments contain unexpected fields.");
+    this.name = "ProviderInvestigationUnexpectedArgumentsError";
+    this.additionalKeys = additionalKeys;
+  }
+}
+
 export class ProviderInvestigationEvidenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -84,14 +92,16 @@ interface ProviderInvestigatorThread {
   agentName: string;
 }
 
+type ProviderToolArguments = {
+  connection_id: string;
+  delivery_id: string;
+};
+
 interface ProviderToolCall {
   toolCallId: string;
   eventId: string;
   threadId: string;
-  arguments: {
-    hook_id: string;
-    delivery_id: string;
-  };
+  arguments: ProviderToolArguments;
 }
 
 interface ObservedToolCall {
@@ -156,7 +166,7 @@ function eventType(event: unknown): string {
 
 function parseToolArguments(
   argumentsText: string,
-  expectedHookId: string,
+  expectedConnectionId: string,
   expectedDeliveryId: string,
 ): ProviderToolCall["arguments"] {
   let parsed: unknown;
@@ -174,24 +184,43 @@ function parseToolArguments(
     );
   }
 
-  const keys = Object.keys(parsed).sort();
-  if (keys.length !== 2 || keys[0] !== "delivery_id" || keys[1] !== "hook_id") {
+  const connectionArgument = parsed.connection_id;
+  const deliveryArgument = parsed.delivery_id;
+  if (
+    typeof connectionArgument !== "string" ||
+    connectionArgument.length === 0
+  ) {
     throw new ProviderInvestigationTurnError(
-      "Provider Investigator MCP tool arguments contain unexpected fields.",
+      "Provider Investigator MCP tool arguments are missing a valid connection_id.",
+    );
+  }
+  if (
+    typeof deliveryArgument !== "string" ||
+    deliveryArgument.length === 0
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator MCP tool arguments are missing a valid delivery_id.",
     );
   }
 
   if (
-    parsed.hook_id !== expectedHookId ||
-    parsed.delivery_id !== expectedDeliveryId
+    connectionArgument !== expectedConnectionId ||
+    deliveryArgument !== expectedDeliveryId
   ) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator MCP tool arguments do not match the deterministic incident lookup.",
     );
   }
 
+  const additionalKeys = Object.keys(parsed)
+    .filter((key) => key !== "connection_id" && key !== "delivery_id")
+    .sort();
+  if (additionalKeys.length > 0) {
+    throw new ProviderInvestigationUnexpectedArgumentsError(additionalKeys);
+  }
+
   return {
-    hook_id: expectedHookId,
+    connection_id: expectedConnectionId,
     delivery_id: expectedDeliveryId,
   };
 }
@@ -237,24 +266,24 @@ export function extractGithubDeliveryFromTrueForgeToolResponse(
 }
 
 function buildProviderInvestigationInput(
-  incident: {
-    id: string;
-    repositoryId: string;
-    externalDeliveryId: string;
-  },
-  hookId: string,
+  connectionId: string,
+  deliveryId: string,
+  corrective = false,
 ): TrueForgeApi.TurnInputItem[] {
   const content = [
-    "Run the provider-only investigation for this Redrive incident.",
-    "The following values are deterministic Redrive inputs. Use them exactly; do not choose, discover, normalize, or infer replacements.",
-    `incident_id=${incident.id}`,
-    `repository_id=${incident.repositoryId}`,
-    `hook_id=${hookId}`,
-    `delivery_id=${incident.externalDeliveryId}`,
-    "The provider delivery attempt ID (delivery_id) is distinct from the logical delivery GUID (X-GitHub-Delivery). The logical GUID is established only by the provider lookup result.",
-    `Create exactly one dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing these exact identities.`,
-    `That subagent, and only that subagent, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with the exact hook_id and delivery_id above.`,
-    "Do not call the GitHub tool from the Coordinator. Do not infer receiver state. Do not redeliver or call any write/consequential tool.",
+    corrective
+      ? "The previous provider investigation attempt was rejected because it added extra argument keys."
+      : "Run the connection-backed provider-only investigation.",
+    "Use the following exact provider lookup tuple. Do not choose, discover, normalize, or infer replacements.",
+    `connection_id=${connectionId}`,
+    `delivery_id=${deliveryId}`,
+    corrective
+      ? `The JSON argument object for ${GITHUB_WEBHOOK_DELIVERY_TOOL} must contain EXACTLY: {"connection_id":"${connectionId}","delivery_id":"${deliveryId}"} and no other properties.`
+      : `Create exactly one dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing only this exact tuple.`,
+    corrective
+      ? `Create exactly one fresh dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing only this exact tuple. It, and only it, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with exactly connection_id and delivery_id.`
+      : `That subagent, and only that subagent, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with exactly connection_id and delivery_id.`,
+    "Do not infer receiver state. Do not redeliver or call any write or consequential tool.",
     "If the provider lookup cannot establish a fact, report uncertainty. The machine tool.response is authoritative; agent prose is not evidence.",
   ].join("\n");
 
@@ -286,6 +315,7 @@ function appendFailure(
   toolCallId: string | null,
   trueForgeEventId: string | null,
   error: unknown,
+  additionalDetails?: IncidentWorkflowEventDetails,
 ): void {
   const reason =
     error instanceof Error ? error.name : "ProviderInvestigationFailure";
@@ -299,6 +329,7 @@ function appendFailure(
     details: {
       reason,
       ...(trueForgeEventId === null ? {} : { sourceTrueForgeEventId: trueForgeEventId }),
+      ...additionalDetails,
     },
   });
 }
@@ -444,7 +475,8 @@ async function collectTurnLifecycle(
 
 async function collectProviderTurn(
   stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
-  expectedHookId: string,
+  expectedTurnId: string,
+  expectedConnectionId: string,
   expectedDeliveryId: string,
   expectedMcpServerName: string,
   onAttribution?: (attribution: ProviderTurnAttribution) => void,
@@ -485,7 +517,13 @@ async function collectProviderTurn(
           "TrueForge emitted more than one turn.created event for the turn.",
         );
       }
-      turnId = requiredString(event, "turnId", "turn.created event");
+      const persistedTurnId = requiredString(event, "turnId", "turn.created event");
+      if (persistedTurnId !== expectedTurnId) {
+        throw new ProviderInvestigationTurnError(
+          "TrueForge persisted provider investigation events do not match the completed live turn.",
+        );
+      }
+      turnId = persistedTurnId;
       const eventState = event.state;
       if (!isRecord(eventState) || eventState.status !== "running") {
         throw new ProviderInvestigationTurnError(
@@ -726,27 +764,47 @@ async function collectProviderTurn(
     );
   }
 
-  const toolCall: ProviderToolCall = {
-    toolCallId: observedToolCall.toolCallId,
-    eventId: observedToolCall.eventId,
-    threadId: observedToolCall.threadId,
-    arguments: parseToolArguments(
-      observedToolCall.argumentsText,
-      expectedHookId,
-      expectedDeliveryId,
-    ),
-  };
-
   const matchingResponses = toolResponses.filter(
     (response) =>
       response.threadId === thread.threadId &&
-      response.toolCallId === toolCall.toolCallId,
+      response.toolCallId === observedToolCall.toolCallId,
   );
-  if (matchingResponses.length !== 1) {
+  if (
+    matchingResponses.length !== 1 ||
+    matchingResponses[0].content.trim().length === 0
+  ) {
     throw new ProviderInvestigationTurnError(
       "TrueForge did not emit exactly one matching Provider Investigator tool.response.",
     );
   }
+
+  let argumentsValue: ProviderToolArguments;
+  try {
+    argumentsValue = parseToolArguments(
+      observedToolCall.argumentsText,
+      expectedConnectionId,
+      expectedDeliveryId,
+    );
+  } catch (error) {
+    if (error instanceof ProviderInvestigationUnexpectedArgumentsError) {
+      // Keep the failed attempt attributable to the model tool-call event,
+      // rather than the later turn terminal event.
+      onAttribution?.({
+        turnId,
+        providerInvestigatorThreadId: thread.threadId,
+        toolCallId: observedToolCall.toolCallId,
+        trueForgeEventId: observedToolCall.eventId,
+      });
+    }
+    throw error;
+  }
+
+  const toolCall: ProviderToolCall = {
+    toolCallId: observedToolCall.toolCallId,
+    eventId: observedToolCall.eventId,
+    threadId: observedToolCall.threadId,
+    arguments: argumentsValue,
+  };
 
   return {
     turnId,
@@ -769,7 +827,7 @@ export function createProviderInvestigationService(
     now,
     environment,
   );
-  const evidenceService = createProviderEvidenceService(database, null, now);
+  const evidenceService = createProviderEvidenceService(database, now);
   const workflowEvents = createIncidentWorkflowEventService(database, now);
 
   async function investigate(
@@ -782,33 +840,24 @@ export function createProviderInvestigationService(
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
     }
+    const connectionId = incident.applicationConnectionId;
+    if (typeof connectionId !== "string" || connectionId.length === 0) {
+      throw new UnsupportedProviderEvidenceError(
+        "legacy provider investigation",
+      );
+    }
 
-    // Validate every deterministic execution input before any remote session
-    // creation, inline update, or turn can occur.
-    getRecoveryCoordinatorAgentSpec(environment);
-
-    const configuredMcpName = environment.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME?.trim();
+    const configuredMcpName = environment[CONNECTION_TRUEFORGE_GITHUB_MCP_ENV]?.trim();
     if (!configuredMcpName) {
       throw new ProviderInvestigationConfigurationError(
-        "REDRIVE_TRUEFORGE_GITHUB_MCP_NAME must be configured.",
+        `${CONNECTION_TRUEFORGE_GITHUB_MCP_ENV} must be configured.`,
       );
     }
 
-    let hookId: string;
-    try {
-      hookId = resolveConfiguredGithubHookId(incident.repositoryId, environment);
-    } catch (error) {
-      if (error instanceof GithubMcpConfigurationError) {
-        throw error;
-      }
-      throw new ProviderInvestigationConfigurationError(
-        "GitHub webhook hook mapping could not be resolved.",
-        { cause: error },
-      );
-    }
+    getConnectionRecoveryCoordinatorAgentSpec(environment);
 
     const ensured = await sessionService.ensureTrueForgeSession(incidentId);
-    const upgraded = await sessionService.ensureCoordinatorV2(
+    const upgraded = await sessionService.ensureCoordinatorForIncident(
       incidentId,
       ensured,
     );
@@ -821,10 +870,10 @@ export function createProviderInvestigationService(
       occurredAt: now(),
       details: {
         repositoryId: incident.repositoryId,
-        hookId,
+        connectionId,
         providerDeliveryId: incident.externalDeliveryId,
         mcpServerName: configuredMcpName,
-        skillName: PROVIDER_INVESTIGATION_SKILL_NAME,
+        skillName: CONNECTION_PROVIDER_INVESTIGATION_SKILL_NAME,
       },
     });
 
@@ -833,52 +882,93 @@ export function createProviderInvestigationService(
     let toolCallId: string | null = null;
     let trueForgeEventId: string | null = null;
 
+    let attemptNumber = 1;
     try {
-      const stream = await trueForgeClient.createTurnStream(
-        upgraded.sessionId,
-        {
-          input: buildProviderInvestigationInput(incident, hookId),
-        },
-      );
-      let collected: CollectedProviderTurn;
-      try {
-        // The live stream is only a turn-creation/terminal-status channel.
-        // Dynamic child events are read from the exact persisted turn after the
-        // server reports the turn completed.
-        const completedTurnId = await collectTurnLifecycle(
-          stream,
-          (attribution) => {
-            turnId = attribution.turnId ?? turnId;
-            trueForgeEventId =
-              attribution.trueForgeEventId ?? trueForgeEventId;
-          },
-        );
-        const persistedEvents = await trueForgeClient.listTurnEvents(
+      const collectAttempt = async (
+        corrective: boolean,
+      ): Promise<CollectedProviderTurn> => {
+        const stream = await trueForgeClient.createTurnStream(
           upgraded.sessionId,
-          completedTurnId,
-        );
-        collected = await collectProviderTurn(
-          persistedEvents,
-          hookId,
-          incident.externalDeliveryId,
-          configuredMcpName,
-          (attribution) => {
-            turnId = attribution.turnId ?? turnId;
-            providerThreadId =
-              attribution.providerInvestigatorThreadId ?? providerThreadId;
-            toolCallId = attribution.toolCallId ?? toolCallId;
-            trueForgeEventId =
-              attribution.trueForgeEventId ?? trueForgeEventId;
+          {
+            input: buildProviderInvestigationInput(
+              connectionId,
+              incident.externalDeliveryId,
+              corrective,
+            ),
           },
         );
-      } catch (error) {
-        if (error instanceof ProviderInvestigationTurnError) {
+        try {
+          // The live stream is only a turn-creation/terminal-status channel.
+          // Dynamic child events are read from the exact persisted turn after the
+          // server reports the turn completed.
+          const completedTurnId = await collectTurnLifecycle(
+            stream,
+            (attribution) => {
+              turnId = attribution.turnId ?? turnId;
+              trueForgeEventId =
+                attribution.trueForgeEventId ?? trueForgeEventId;
+            },
+          );
+          const persistedEvents = await trueForgeClient.listTurnEvents(
+            upgraded.sessionId,
+            completedTurnId,
+          );
+          return await collectProviderTurn(
+            persistedEvents,
+            completedTurnId,
+            connectionId,
+            incident.externalDeliveryId,
+            configuredMcpName,
+            (attribution) => {
+              turnId = attribution.turnId ?? turnId;
+              providerThreadId =
+                attribution.providerInvestigatorThreadId ?? providerThreadId;
+              toolCallId = attribution.toolCallId ?? toolCallId;
+              trueForgeEventId =
+                attribution.trueForgeEventId ?? trueForgeEventId;
+            },
+          );
+        } catch (error) {
+          if (error instanceof ProviderInvestigationTurnError) {
+            throw error;
+          }
+          throw new ProviderInvestigationTurnError(
+            "TrueForge provider investigation events could not be collected.",
+            { cause: error },
+          );
+        }
+      };
+
+      let collected: CollectedProviderTurn;
+      while (true) {
+        try {
+          collected = await collectAttempt(attemptNumber === 2);
+          break;
+        } catch (error) {
+          if (
+            attemptNumber === 1 &&
+            error instanceof ProviderInvestigationUnexpectedArgumentsError
+          ) {
+            appendFailure(
+              workflowEvents.append,
+              incidentId,
+              upgraded.sessionId,
+              turnId,
+              providerThreadId,
+              toolCallId,
+              trueForgeEventId,
+              error,
+              { attempt: 1, retryEligible: true },
+            );
+            attemptNumber = 2;
+            turnId = null;
+            providerThreadId = null;
+            toolCallId = null;
+            trueForgeEventId = null;
+            continue;
+          }
           throw error;
         }
-        throw new ProviderInvestigationTurnError(
-          "TrueForge provider investigation events could not be collected.",
-          { cause: error },
-        );
       }
       turnId = collected.turnId;
       providerThreadId = collected.thread.threadId;
@@ -975,6 +1065,9 @@ export function createProviderInvestigationService(
         toolCallId,
         trueForgeEventId,
         error,
+        attemptNumber === 2
+          ? { attempt: 2, retryEligible: false }
+          : undefined,
       );
       if (error instanceof ProviderInvestigationTurnError) {
         throw error;
