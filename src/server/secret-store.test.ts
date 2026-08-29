@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   mkdtempSync,
   mkdirSync,
@@ -204,6 +205,140 @@ describe("filesystem GitHub secret store", () => {
 
     expect(() => store.putPrivateKey(PEM)).toThrow(SecretStoreError);
     expect(readdirSync(secretDirectory)).toEqual([]);
+  });
+
+  it("reuses an identical deterministic PEM and rejects a different one without replacement", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const filePath = path.join(secretDirectory, reference);
+    const original = readFileSync(filePath);
+
+    expect(store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toBe(reference);
+    expect(readFileSync(filePath)).toEqual(original);
+    expect(() => store.putPrivateKeyForManifestAttempt(attemptId, `${PEM}changed`)).toThrow(
+      SecretStoreError,
+    );
+    expect(readFileSync(filePath)).toEqual(original);
+  });
+
+  it("handles an atomic EEXIST from a concurrent destination without clobbering it", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = `github-app-manifest-${attemptId}.pem`;
+    const destination = path.join(secretDirectory, reference);
+    const concurrentPem = `${PEM}concurrent`;
+    let linkCalls = 0;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      linkSync: (_temporaryPath, finalPath) => {
+        linkCalls += 1;
+        writeFileSync(finalPath, concurrentPem, { mode: 0o600 });
+        const error = new Error("destination appeared") as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      },
+    });
+
+    expect(() => store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toThrow(
+      SecretStoreError,
+    );
+    expect(linkCalls).toBe(1);
+    expect(readFileSync(destination, "utf8")).toBe(concurrentPem);
+  });
+
+  it("reuses an identical destination reported by atomic EEXIST", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = `github-app-manifest-${attemptId}.pem`;
+    const destination = path.join(secretDirectory, reference);
+    let linkCalls = 0;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      linkSync: (_temporaryPath, finalPath) => {
+        linkCalls += 1;
+        writeFileSync(finalPath, PEM, { mode: 0o600 });
+        const error = new Error("destination appeared") as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      },
+    });
+
+    expect(store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toBe(reference);
+    expect(linkCalls).toBe(1);
+    expect(readFileSync(destination, "utf8")).toBe(PEM);
+  });
+
+  it("durably syncs reused files and reconciliation verification", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    let fileSyncs = 0;
+    let directorySyncs = 0;
+    const store = new FilesystemSecretStore(path.join(directory, "secrets"), {
+      fsyncSync: () => { fileSyncs += 1; },
+      syncDirectory: () => { directorySyncs += 1; },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+    const fileSyncsAfterPublish = fileSyncs;
+    const directorySyncsAfterPublish = directorySyncs;
+
+    expect(store.putPrivateKeyForManifestAttempt(attemptId, PEM)).toBe(reference);
+    expect(fileSyncs).toBe(fileSyncsAfterPublish + 2);
+    expect(directorySyncs).toBe(directorySyncsAfterPublish + 1);
+
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(fileSyncs).toBe(fileSyncsAfterPublish + 3);
+    expect(directorySyncs).toBe(directorySyncsAfterPublish + 2);
+  });
+
+  it("verifies a deterministic PEM by digest without returning its contents", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const store = new FilesystemSecretStore(path.join(directory, "secrets"));
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const digest = createHash("sha256").update(Buffer.from(PEM, "utf8")).digest("hex");
+
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, "0".repeat(64))).toThrow(
+      SecretStoreError,
+    );
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, "bad-digest")).toThrow(
+      SecretStoreError,
+    );
+  });
+
+  it("fails closed for missing, oversized, and unsafe reconciliation files", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    const store = new FilesystemSecretStore(secretDirectory);
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const digest = "0".repeat(64);
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+
+    const reference = `github-app-manifest-${attemptId}.pem`;
+    const destination = path.join(secretDirectory, reference);
+    writeFileSync(destination, "x".repeat(128 * 1024 + 1), { mode: 0o600 });
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
+    rmSync(destination);
+    const outside = path.join(directory, "outside.pem");
+    writeFileSync(outside, PEM, { mode: 0o600 });
+    symlinkSync(outside, destination);
+    expect(() => store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toThrow(
+      SecretStoreError,
+    );
   });
 
   it("derives a bounded deterministic manifest reference", () => {

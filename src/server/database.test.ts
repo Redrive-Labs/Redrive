@@ -529,7 +529,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 },
+      { version: 7 }, { version: 8 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -620,7 +620,7 @@ describe("native SQLite persistence", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
-      { version: 7 },
+      { version: 7 }, { version: 8 },
     ]);
     expect(
       database.all<{
@@ -725,7 +725,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 },
+      { version: 7 }, { version: 8 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -859,7 +859,7 @@ describe("native SQLite persistence", () => {
         "SELECT version FROM schema_migrations ORDER BY version",
       )).toEqual([
         { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
-        { version: 5 }, { version: 6 }, { version: 7 },
+        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
       ]);
       expect(upgraded.get("SELECT * FROM incidents")).toEqual({
         ...before.incident,
@@ -910,7 +910,7 @@ describe("native SQLite persistence", () => {
       results.map((result) => JSON.parse(result.stdout)),
     ).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5, 6, 7],
+        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8],
         incidentCount: 0,
       })),
     );
@@ -928,7 +928,7 @@ describe("native SQLite persistence", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
-        { version: 7 },
+        { version: 7 }, { version: 8 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(

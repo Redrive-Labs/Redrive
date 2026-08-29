@@ -244,6 +244,21 @@ const migrations: Migration[] = [
         ON incidents (application_connection_id);
     `,
   },
+  {
+    version: 8,
+    // Conversion checkpoints are nullable so historical attempts remain
+    // readable. No historical row is rewritten or inferred.
+    sql: `
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_id TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_login TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN remote_owner_type TEXT;
+      ALTER TABLE github_manifest_attempts
+        ADD COLUMN private_key_sha256 TEXT;
+    `,
+  },
 ];
 
 export class SqliteDatabase {

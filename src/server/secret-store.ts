@@ -8,14 +8,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
+  linkSync,
   unlinkSync,
   writeSync,
   constants as fsConstants,
   type Stats,
 } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 
 export interface SecretStore {
   putPrivateKey(pem: string): string;
@@ -51,7 +51,7 @@ interface SecretStoreFilesystem {
   closeSync(fileDescriptor: number): void;
   lstatSync(path: string): Stats;
   chmodSync(path: string, mode: number): void;
-  renameSync(oldPath: string, newPath: string): void;
+  linkSync(existingPath: string, newPath: string): void;
   unlinkSync(path: string): void;
   syncDirectory(path: string): void;
 }
@@ -191,6 +191,13 @@ function sameFileIdentity(left: Stats, right: Stats): boolean {
 }
 
 function assertRegularFileMode(stats: Stats): void {
+  if (typeof process.getuid === "function" && typeof stats.uid === "number") {
+    if (stats.uid !== process.getuid()) {
+      throw new SecretStoreError(
+        "The private key file is not owned by the Redrive process user.",
+      );
+    }
+  }
   if (!stats.isFile() || stats.isSymbolicLink()) {
     throw new SecretStoreError("The private key file is not a regular file.");
   }
@@ -248,7 +255,7 @@ const defaultFilesystem: SecretStoreFilesystem = {
   closeSync,
   lstatSync,
   chmodSync,
-  renameSync,
+  linkSync,
   unlinkSync,
   syncDirectory: syncDirectoryWithNodeFs,
 };
@@ -276,6 +283,67 @@ export class FilesystemSecretStore implements SecretStore {
     assertSafeDirectory(this.directory);
   }
 
+  private readPrivateKeyBytesAtPath(
+    filePath: string,
+    ensureDurable = false,
+  ): Buffer {
+    let initialStats: Stats;
+    try {
+      initialStats = this.filesystem.lstatSync(filePath);
+    } catch {
+      throw new SecretStoreError("The referenced private key is unavailable.");
+    }
+    assertRegularFileMode(initialStats);
+    if (initialStats.size > MAX_PRIVATE_KEY_BYTES) {
+      throw new SecretStoreError("The referenced private key is too large.");
+    }
+
+    let fileDescriptor: number | undefined;
+    try {
+      const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+      fileDescriptor = this.filesystem.openSync(
+        filePath,
+        fsConstants.O_RDONLY | noFollow,
+      );
+      const openedStats = this.filesystem.fstatSync(fileDescriptor);
+      assertRegularFileMode(openedStats);
+      if (!sameFileIdentity(initialStats, openedStats)) {
+        throw new SecretStoreError("The referenced private key changed unexpectedly.");
+      }
+      const value = readFileSync(/* turbopackIgnore: true */ fileDescriptor);
+      const finalStats = this.filesystem.fstatSync(fileDescriptor);
+      assertRegularFileMode(finalStats);
+      if (
+        !sameFileIdentity(openedStats, finalStats) ||
+        finalStats.size > MAX_PRIVATE_KEY_BYTES ||
+        finalStats.size !== value.byteLength
+      ) {
+        throw new SecretStoreError("The referenced private key changed unexpectedly.");
+      }
+      if (ensureDurable) {
+        this.filesystem.fsyncSync(fileDescriptor);
+        this.filesystem.syncDirectory(this.directory);
+      }
+      return value;
+    } catch (error) {
+      if (error instanceof SecretStoreError) throw error;
+      throw new SecretStoreError("The referenced private key is unavailable.");
+    } finally {
+      if (fileDescriptor !== undefined) {
+        const descriptor = fileDescriptor;
+        fileDescriptor = undefined;
+        try {
+          this.filesystem.closeSync(descriptor);
+        } catch (error) {
+          if (!(error instanceof SecretStoreError)) {
+            throw new SecretStoreError("The referenced private key could not be closed safely.");
+          }
+          throw error;
+        }
+      }
+    }
+  }
+
   private putPrivateKeyAtReference(reference: string, pem: string): string {
     assertSafeReference(reference);
     if (typeof pem !== "string" || pem.length === 0) {
@@ -292,7 +360,7 @@ export class FilesystemSecretStore implements SecretStore {
     const temporaryPath = path.join(this.directory, temporaryReference);
     const finalPath = path.join(this.directory, reference);
     let fileDescriptor: number | undefined;
-    let renamed = false;
+    let publishedByUs = false;
     let succeeded = false;
     let createdTemporary = false;
     let expectedIdentity: Stats | undefined;
@@ -362,13 +430,24 @@ export class FilesystemSecretStore implements SecretStore {
         throw new SecretStoreError("The temporary private key changed unexpectedly.");
       }
       try {
-        this.filesystem.lstatSync(finalPath);
-        throw new SecretStoreError("The private key reference already exists.");
+        // link(2) is an atomic same-filesystem no-replace publication. Unlike
+        // rename, it fails with EEXIST and can never clobber the destination.
+        this.filesystem.linkSync(temporaryPath, finalPath);
+        publishedByUs = true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const existingBytes = this.readPrivateKeyBytesAtPath(finalPath, true);
+        if (!existingBytes.equals(bytes)) {
+          throw new SecretStoreError("The deterministic private key does not match.");
+        }
+        // The temporary copy is cleaned up by the finally block. Never touch
+        // the already-published deterministic object.
+        return reference;
       }
-      this.filesystem.renameSync(temporaryPath, finalPath);
-      renamed = true;
+
+      // Drop the temporary hard link before validating the final object so the
+      // existing nlink === 1 security invariant remains in force.
+      this.filesystem.unlinkSync(temporaryPath);
       const finalStats = this.filesystem.lstatSync(finalPath);
       assertRegularFileMode(finalStats);
       if (expectedIdentity === undefined || !sameFileIdentity(expectedIdentity, finalStats)) {
@@ -389,16 +468,24 @@ export class FilesystemSecretStore implements SecretStore {
       // cleaned up here.
       if (!succeeded) {
         try {
-          const pathToClean = renamed ? finalPath : temporaryPath;
-          const stats = this.filesystem.lstatSync(pathToClean);
-          if (
-            stats.isFile() &&
-            !stats.isSymbolicLink() &&
-            createdTemporary &&
-            (expectedIdentity === undefined ||
-              sameFileIdentity(expectedIdentity, stats))
-          ) {
-            this.filesystem.unlinkSync(pathToClean);
+          const pathsToClean = publishedByUs
+            ? [finalPath, temporaryPath]
+            : [temporaryPath];
+          for (const pathToClean of pathsToClean) {
+            try {
+              const stats = this.filesystem.lstatSync(pathToClean);
+              if (
+                stats.isFile() &&
+                !stats.isSymbolicLink() &&
+                createdTemporary &&
+                (expectedIdentity === undefined ||
+                  sameFileIdentity(expectedIdentity, stats))
+              ) {
+                this.filesystem.unlinkSync(pathToClean);
+              }
+            } catch {
+              // The operation has already failed; cleanup must not mask its error.
+            }
           }
         } catch {
           // The operation has already failed; cleanup must not mask its error.
@@ -425,59 +512,27 @@ export class FilesystemSecretStore implements SecretStore {
     assertSafeDirectory(this.directory);
     const safeReference = assertSafeReference(reference);
     const filePath = path.join(this.directory, safeReference);
+    return this.readPrivateKeyBytesAtPath(filePath).toString("utf8");
+  }
 
-    let initialStats: Stats;
-    try {
-      initialStats = this.filesystem.lstatSync(filePath);
-    } catch {
-      throw new SecretStoreError("The referenced private key is unavailable.");
+  verifyPrivateKeyForManifestAttempt(
+    attemptId: string,
+    expectedSha256: string,
+  ): string {
+    assertSafeDirectory(this.directory);
+    const reference = manifestPrivateKeyReference(attemptId);
+    if (!/^[0-9a-f]{64}$/.test(expectedSha256)) {
+      throw new SecretStoreError("The private key digest is invalid.");
     }
-    assertRegularFileMode(initialStats);
-    if (initialStats.size > MAX_PRIVATE_KEY_BYTES) {
-      throw new SecretStoreError("The referenced private key is too large.");
+    const bytes = this.readPrivateKeyBytesAtPath(
+      path.join(this.directory, assertSafeReference(reference)),
+      true,
+    );
+    const actual = createHash("sha256").update(bytes).digest();
+    const expected = Buffer.from(expectedSha256, "hex");
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+      throw new SecretStoreError("The deterministic private key does not match.");
     }
-
-    let fileDescriptor: number | undefined;
-    try {
-      const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-      fileDescriptor = this.filesystem.openSync(
-        filePath,
-        fsConstants.O_RDONLY | noFollow,
-      );
-      const openedStats = this.filesystem.fstatSync(fileDescriptor);
-      assertRegularFileMode(openedStats);
-      if (!sameFileIdentity(initialStats, openedStats)) {
-        throw new SecretStoreError("The referenced private key changed unexpectedly.");
-      }
-      const value = readFileSync(
-        /* turbopackIgnore: true */ fileDescriptor,
-        { encoding: "utf8" },
-      );
-      const finalStats = this.filesystem.fstatSync(fileDescriptor);
-      assertRegularFileMode(finalStats);
-      if (
-        !sameFileIdentity(openedStats, finalStats) ||
-        finalStats.size !== Buffer.byteLength(value, "utf8")
-      ) {
-        throw new SecretStoreError("The referenced private key changed unexpectedly.");
-      }
-      return value;
-    } catch (error) {
-      if (error instanceof SecretStoreError) throw error;
-      throw new SecretStoreError("The referenced private key is unavailable.");
-    } finally {
-      if (fileDescriptor !== undefined) {
-        const descriptor = fileDescriptor;
-        fileDescriptor = undefined;
-        try {
-          this.filesystem.closeSync(descriptor);
-        } catch (error) {
-          if (!(error instanceof SecretStoreError)) {
-            throw new SecretStoreError("The referenced private key could not be closed safely.");
-          }
-          throw error;
-        }
-      }
-    }
+    return reference;
   }
 }

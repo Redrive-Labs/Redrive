@@ -10,7 +10,7 @@ import {
   getGithubAppRegistration,
   markManifestAttemptRecovery,
   parseManifestConversion,
-  recordManifestConversionIdentity,
+  recordManifestConversionCheckpoint,
 } from "@/server/github-app-service";
 import {
   deriveRedriveUrl,
@@ -143,7 +143,44 @@ export async function GET(request: Request): Promise<Response> {
       return callbackError(request, "The completed GitHub App requires recovery.", 503);
     }
   } else if (claim.kind === "recovery") {
-    return callbackError(request, "The GitHub App manifest attempt requires recovery.", 503);
+    return callbackError(
+      request,
+      "The original GitHub App key was not retained. Recreate the App and start a new connection.",
+      503,
+    );
+  } else if (claim.kind === "reconciliation") {
+    // A durable checkpoint means conversion must never be repeated. Only the
+    // deterministic, attempt-bound file is checked before local completion.
+    if (claim.attempt.privateKeySha256 === null) {
+      markManifestAttemptRecovery(
+        database,
+        claim.attempt.id,
+        "The conversion checkpoint is incomplete and cannot be reconciled.",
+      );
+      return callbackError(
+        request,
+        "The original GitHub App key was not retained. Recreate the App and start a new connection.",
+        503,
+      );
+    }
+    try {
+      new FilesystemSecretStore(config.secretDir).verifyPrivateKeyForManifestAttempt(
+        claim.attempt.id,
+        claim.attempt.privateKeySha256,
+      );
+      registration = completeManifestAttempt(database, claim.attempt.id);
+    } catch {
+      markManifestAttemptRecovery(
+        database,
+        claim.attempt.id,
+        "The conversion checkpoint could not be matched to its deterministic private-key reference.",
+      );
+      return callbackError(
+        request,
+        "The original GitHub App key was not retained. Recreate the App and start a new connection.",
+        503,
+      );
+    }
   } else {
     const api = createGithubApi();
     let converted: unknown;
@@ -189,17 +226,14 @@ export async function GET(request: Request): Promise<Response> {
     }
 
     try {
-      recordManifestConversionIdentity(
-        database,
-        claim.attempt.id,
-        parsed.githubAppId,
-        parsed.slug,
-      );
+      // This is the only durable conversion identity write. It includes the
+      // integrity fingerprint and is committed before any PEM publication.
+      recordManifestConversionCheckpoint(database, claim.attempt.id, parsed);
     } catch {
       markManifestAttemptRecovery(
         database,
         claim.attempt.id,
-        "GitHub App identity was received but local attempt state could not be updated.",
+        "GitHub App conversion identity could not be durably checkpointed.",
       );
       return callbackError(
         request,
@@ -217,7 +251,7 @@ export async function GET(request: Request): Promise<Response> {
       markManifestAttemptRecovery(
         database,
         claim.attempt.id,
-        "Remote GitHub App identity is durably recorded, but its deterministic private-key reference was not confirmed persisted.",
+        "The conversion checkpoint is durable, but its deterministic private-key reference was not confirmed persisted.",
       );
       if (error instanceof SecretStoreError) {
         return callbackError(
@@ -230,16 +264,12 @@ export async function GET(request: Request): Promise<Response> {
     }
 
     try {
-      registration = completeManifestAttempt(
-        database,
-        claim.attempt.id,
-        parsed,
-      );
+      registration = completeManifestAttempt(database, claim.attempt.id);
     } catch {
       markManifestAttemptRecovery(
         database,
         claim.attempt.id,
-        "Remote GitHub App identity and deterministic private-key reference were persisted, but final local registration failed.",
+        "The conversion checkpoint and deterministic private-key reference were persisted, but final local registration failed.",
       );
       return callbackError(
         request,

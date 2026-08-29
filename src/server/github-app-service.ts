@@ -21,6 +21,7 @@ import {
   parseManifestTarget,
   readOpaqueGithubIdentifier,
   readRequiredText,
+  githubLoginsEqual,
   timingSafeStringEqual,
   validateGithubLogin,
 } from "@/domain/github-integration";
@@ -65,6 +66,10 @@ export interface ManifestAttempt {
   appRegistrationId: string | null;
   remoteGithubAppId: string | null;
   remoteSlug: string | null;
+  remoteOwnerId: string | null;
+  remoteOwnerLogin: string | null;
+  remoteOwnerType: GithubAccountType | null;
+  privateKeySha256: string | null;
   recoveryReason: string | null;
   createdAt: string;
   updatedAt: string;
@@ -95,6 +100,15 @@ export interface ParsedManifestConversion {
   ownerLogin: string;
   ownerType: GithubAccountType;
   privateKeyPem: string;
+}
+
+export interface ManifestConversionCheckpoint {
+  githubAppId: string;
+  slug: string;
+  ownerId: string;
+  ownerLogin: string;
+  ownerType: GithubAccountType;
+  privateKeySha256: string;
 }
 
 export interface CreatedManifestAttempt {
@@ -146,6 +160,17 @@ function readRowNullableText(
   return value;
 }
 
+function readCheckpointNullableText(
+  row: Record<string, unknown>,
+  field: string,
+): string | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+  // Preserve an invalid non-text value as an invalid empty checkpoint value.
+  // Claim/reconciliation then fails closed instead of treating it as absent.
+  return typeof value === "string" ? value : "";
+}
+
 function mapManifestAttempt(row: Record<string, unknown>): ManifestAttempt {
   const status = readRowText(row, "status") as ManifestAttemptStatus;
   if (
@@ -166,6 +191,10 @@ function mapManifestAttempt(row: Record<string, unknown>): ManifestAttempt {
     appRegistrationId: readRowNullableText(row, "app_registration_id"),
     remoteGithubAppId: readRowNullableText(row, "remote_github_app_id"),
     remoteSlug: readRowNullableText(row, "remote_slug"),
+    remoteOwnerId: readCheckpointNullableText(row, "remote_owner_id"),
+    remoteOwnerLogin: readCheckpointNullableText(row, "remote_owner_login"),
+    remoteOwnerType: readCheckpointNullableText(row, "remote_owner_type") as GithubAccountType | null,
+    privateKeySha256: readCheckpointNullableText(row, "private_key_sha256"),
     recoveryReason: readRowNullableText(row, "recovery_reason"),
     createdAt: readRowText(row, "created_at"),
     updatedAt: readRowText(row, "updated_at"),
@@ -317,6 +346,7 @@ export function createManifestAttempt(
   const row = database.get<Record<string, unknown>>(
     `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
             app_registration_id, remote_github_app_id, remote_slug,
+            remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
             recovery_reason, created_at, updated_at, completed_at
        FROM github_manifest_attempts WHERE id = ?`,
     [attemptId],
@@ -343,6 +373,7 @@ function getManifestAttemptByStateHash(
   const row = database.get<Record<string, unknown>>(
     `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
             app_registration_id, remote_github_app_id, remote_slug,
+            remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
             recovery_reason, created_at, updated_at, completed_at, state_hash
        FROM github_manifest_attempts WHERE state_hash = ?`,
     [stateHash],
@@ -355,8 +386,92 @@ function getManifestAttemptByStateHash(
 
 export type ManifestClaim =
   | { kind: "claimed"; attempt: ManifestAttempt }
+  | { kind: "reconciliation"; attempt: ManifestAttempt }
   | { kind: "completed"; attempt: ManifestAttempt }
   | { kind: "recovery"; attempt: ManifestAttempt };
+
+type StoredCheckpoint =
+  | { kind: "absent" }
+  | { kind: "partial" }
+  | { kind: "invalid" }
+  | { kind: "complete"; checkpoint: ManifestConversionCheckpoint };
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+function validateCheckpoint(value: {
+  githubAppId: unknown;
+  slug: unknown;
+  ownerId: unknown;
+  ownerLogin: unknown;
+  ownerType: unknown;
+  privateKeySha256: unknown;
+}): ManifestConversionCheckpoint {
+  const githubAppId = readOpaqueGithubIdentifier(value.githubAppId, "App ID");
+  const slug = readRequiredText(value.slug, "App slug", 255);
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(slug)) {
+    throw new GithubIntegrationValidationError("GitHub App slug is invalid.");
+  }
+  const ownerId = readOpaqueGithubIdentifier(value.ownerId, "owner ID");
+  const ownerLogin = validateGithubLogin(value.ownerLogin, "owner login");
+  const ownerType = value.ownerType;
+  if (ownerType !== "User" && ownerType !== "Organization") {
+    throw new GithubIntegrationValidationError("GitHub App owner type is invalid.");
+  }
+  if (
+    typeof value.privateKeySha256 !== "string" ||
+    !SHA256_HEX_PATTERN.test(value.privateKeySha256)
+  ) {
+    throw new GithubIntegrationValidationError("GitHub App private-key checkpoint is invalid.");
+  }
+  return {
+    githubAppId,
+    slug,
+    ownerId,
+    ownerLogin,
+    ownerType,
+    privateKeySha256: value.privateKeySha256,
+  };
+}
+
+function checkpointForAttempt(attempt: ManifestAttempt): StoredCheckpoint {
+  const values = [
+    attempt.remoteGithubAppId,
+    attempt.remoteSlug,
+    attempt.remoteOwnerId,
+    attempt.remoteOwnerLogin,
+    attempt.remoteOwnerType,
+    attempt.privateKeySha256,
+  ];
+  if (values.every((value) => value === null)) return { kind: "absent" };
+  if (values.some((value) => value === null)) return { kind: "partial" };
+  try {
+    return {
+      kind: "complete",
+      checkpoint: validateCheckpoint({
+        githubAppId: attempt.remoteGithubAppId as string,
+        slug: attempt.remoteSlug as string,
+        ownerId: attempt.remoteOwnerId as string,
+        ownerLogin: attempt.remoteOwnerLogin as string,
+        ownerType: attempt.remoteOwnerType,
+        privateKeySha256: attempt.privateKeySha256,
+      }),
+    };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
+function checkpointMatchesTarget(
+  attempt: Pick<ManifestAttempt, "targetType" | "ownerLogin">,
+  checkpoint: ManifestConversionCheckpoint,
+): boolean {
+  return (
+    (attempt.targetType === "personal" && checkpoint.ownerType === "User") ||
+    (attempt.targetType === "organization" &&
+      checkpoint.ownerType === "Organization" &&
+      githubLoginsEqual(checkpoint.ownerLogin, attempt.ownerLogin ?? ""))
+  );
+}
 
 export function claimManifestAttempt(
   database: SqliteDatabase,
@@ -372,13 +487,80 @@ export function claimManifestAttempt(
       );
     }
 
+    const checkpoint = checkpointForAttempt(attempt);
+    const failClosed = (reason: string): ManifestClaim => {
+      const recovered = database.run(
+        `UPDATE github_manifest_attempts
+            SET status = ?, recovery_reason = ?, updated_at = ?
+          WHERE id = ? AND status = ?`,
+        [
+          MANIFEST_ATTEMPT_RECOVERY_REQUIRED,
+          reason,
+          now.toISOString(),
+          attempt.id,
+          MANIFEST_ATTEMPT_EXCHANGING,
+        ],
+      );
+      if (recovered.changes !== 1) {
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub App manifest attempt is already being resolved.",
+        );
+      }
+      const recoveredRow = database.get<Record<string, unknown>>(
+        `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
+                app_registration_id, remote_github_app_id, remote_slug,
+                remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
+                recovery_reason, created_at, updated_at, completed_at
+           FROM github_manifest_attempts WHERE id = ?`,
+        [attempt.id],
+      );
+      if (recoveredRow === undefined) throw new Error("Manifest recovery could not be read back.");
+      return { kind: "recovery", attempt: mapManifestAttempt(recoveredRow) } as const;
+    };
+
     if (attempt.status === MANIFEST_ATTEMPT_COMPLETED) {
       return { kind: "completed", attempt } as const;
     }
     if (attempt.status === MANIFEST_ATTEMPT_RECOVERY_REQUIRED) {
-      return { kind: "recovery", attempt } as const;
+      if (
+        attempt.appRegistrationId !== null ||
+        checkpoint.kind !== "complete" ||
+        !checkpointMatchesTarget(attempt, checkpoint.checkpoint)
+      ) {
+        return { kind: "recovery", attempt } as const;
+      }
+      const claimedAt = now.toISOString();
+      const claimed = database.run(
+        `UPDATE github_manifest_attempts
+            SET status = ?, claimed_at = ?, recovery_reason = NULL, updated_at = ?
+          WHERE id = ? AND status = ?`,
+        [MANIFEST_ATTEMPT_EXCHANGING, claimedAt, claimedAt, attempt.id, MANIFEST_ATTEMPT_RECOVERY_REQUIRED],
+      );
+      if (claimed.changes !== 1) {
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub App manifest attempt is already being resolved.",
+        );
+      }
+      const row = database.get<Record<string, unknown>>(
+        `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
+                app_registration_id, remote_github_app_id, remote_slug,
+                remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
+                recovery_reason, created_at, updated_at, completed_at
+           FROM github_manifest_attempts WHERE id = ?`,
+        [attempt.id],
+      );
+      if (row === undefined) throw new Error("Manifest reconciliation claim could not be read back.");
+      return { kind: "reconciliation", attempt: mapManifestAttempt(row) } as const;
     }
     if (attempt.status === MANIFEST_ATTEMPT_EXCHANGING) {
+      if (attempt.appRegistrationId !== null) {
+        return failClosed("Manifest attempt has a conflicting registration; manual recovery is required.");
+      }
+      if (checkpoint.kind === "partial" || checkpoint.kind === "invalid") {
+        return failClosed("Manifest conversion checkpoint is incomplete or invalid; manual recovery is required.");
+      }
       const claimedAt = attempt.claimedAt === null ? NaN : Date.parse(attempt.claimedAt);
       const expiresAt = Date.parse(attempt.expiresAt);
       const claimIsStale =
@@ -387,23 +569,29 @@ export function claimManifestAttempt(
         expiresAt <= now.getTime() ||
         now.getTime() - claimedAt >= MANIFEST_CLAIM_STALE_AFTER_MS;
       if (claimIsStale) {
-        const recoveryReason = "Manifest conversion claim became stale; manual recovery is required.";
-        const recovered = database.run(
-          `UPDATE github_manifest_attempts
-              SET status = ?, recovery_reason = ?, updated_at = ?
-            WHERE id = ? AND status = ?`,
-          [
-            MANIFEST_ATTEMPT_RECOVERY_REQUIRED,
-            recoveryReason,
-            now.toISOString(),
-            attempt.id,
-            MANIFEST_ATTEMPT_EXCHANGING,
-          ],
-        );
-        if (recovered.changes === 1) {
-          const recoveredAttempt = getManifestAttemptByStateHash(database, state);
-          if (recoveredAttempt === null) throw new Error("Stale manifest claim could not be read back.");
-          return { kind: "recovery", attempt: recoveredAttempt } as const;
+        if (checkpoint.kind === "complete" && checkpointMatchesTarget(attempt, checkpoint.checkpoint)) {
+          const refreshed = database.run(
+            `UPDATE github_manifest_attempts
+                SET claimed_at = ?, updated_at = ?
+              WHERE id = ? AND status = ?`,
+            [now.toISOString(), now.toISOString(), attempt.id, MANIFEST_ATTEMPT_EXCHANGING],
+          );
+          if (refreshed.changes === 1) {
+            const row = database.get<Record<string, unknown>>(
+              `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
+                      app_registration_id, remote_github_app_id, remote_slug,
+                      remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
+                      recovery_reason, created_at, updated_at, completed_at
+                 FROM github_manifest_attempts WHERE id = ?`,
+              [attempt.id],
+            );
+            if (row === undefined) throw new Error("Manifest reconciliation claim could not be read back.");
+            return { kind: "reconciliation", attempt: mapManifestAttempt(row) } as const;
+          }
+        } else if (checkpoint.kind === "absent") {
+          return failClosed("Manifest conversion claim became stale; manual recovery is required.");
+        } else {
+          return failClosed("Manifest conversion checkpoint is invalid; manual recovery is required.");
         }
       }
       throw new GithubIntegrationStateError(
@@ -411,46 +599,47 @@ export function claimManifestAttempt(
         "The GitHub App manifest attempt is already being resolved.",
       );
     }
+
+    if (attempt.appRegistrationId !== null || checkpoint.kind !== "absent") {
+      // A checkpoint or registration on a pending attempt is contradictory and must never be
+      // used to start conversion or registration.
+      const updated = database.run(
+        `UPDATE github_manifest_attempts
+            SET status = ?, recovery_reason = ?, updated_at = ?
+          WHERE id = ? AND status = ?`,
+        [MANIFEST_ATTEMPT_RECOVERY_REQUIRED, "Manifest checkpoint contradicts pending state; manual recovery is required.", now.toISOString(), attempt.id, MANIFEST_ATTEMPT_PENDING],
+      );
+      if (updated.changes === 1) {
+        const row = getManifestAttemptByStateHash(database, state);
+        if (row === null) throw new Error("Manifest recovery could not be read back.");
+        return { kind: "recovery", attempt: row } as const;
+      }
+      throw new GithubIntegrationStateError("ALREADY_CLAIMED", "The GitHub App manifest attempt is already being resolved.");
+    }
     const expiresAt = Date.parse(attempt.expiresAt);
     if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
-      const updatedAt = now.toISOString();
       database.run(
         `UPDATE github_manifest_attempts
             SET status = ?, recovery_reason = ?, updated_at = ?
           WHERE id = ? AND status = ?`,
-        [
-          MANIFEST_ATTEMPT_RECOVERY_REQUIRED,
-          "Manifest attempt expired before conversion.",
-          updatedAt,
-          attempt.id,
-          MANIFEST_ATTEMPT_PENDING,
-        ],
+        [MANIFEST_ATTEMPT_RECOVERY_REQUIRED, "Manifest attempt expired before conversion.", now.toISOString(), attempt.id, MANIFEST_ATTEMPT_PENDING],
       );
       return { kind: "expired" } as const;
     }
-
     const updatedAt = now.toISOString();
     const update = database.run(
       `UPDATE github_manifest_attempts
           SET status = ?, claimed_at = ?, updated_at = ?
         WHERE id = ? AND status = ?`,
-      [
-        MANIFEST_ATTEMPT_EXCHANGING,
-        updatedAt,
-        updatedAt,
-        attempt.id,
-        MANIFEST_ATTEMPT_PENDING,
-      ],
+      [MANIFEST_ATTEMPT_EXCHANGING, updatedAt, updatedAt, attempt.id, MANIFEST_ATTEMPT_PENDING],
     );
     if (update.changes !== 1) {
-      throw new GithubIntegrationStateError(
-        "ALREADY_CLAIMED",
-        "The GitHub App manifest attempt is already being resolved.",
-      );
+      throw new GithubIntegrationStateError("ALREADY_CLAIMED", "The GitHub App manifest attempt is already being resolved.");
     }
     const claimed = database.get<Record<string, unknown>>(
       `SELECT id, target_type, owner_login, status, expires_at, claimed_at,
               app_registration_id, remote_github_app_id, remote_slug,
+              remote_owner_id, remote_owner_login, remote_owner_type, private_key_sha256,
               recovery_reason, created_at, updated_at, completed_at
          FROM github_manifest_attempts WHERE id = ?`,
       [attempt.id],
@@ -460,29 +649,70 @@ export function claimManifestAttempt(
   }, "immediate");
 
   if (result.kind === "expired") {
-    throw new GithubIntegrationStateError(
-      "EXPIRED_STATE",
-      "The GitHub App manifest state has expired.",
-    );
+    throw new GithubIntegrationStateError("EXPIRED_STATE", "The GitHub App manifest state has expired.");
   }
   return result;
 }
 
-export function recordManifestConversionIdentity(
+export function recordManifestConversionCheckpoint(
   database: SqliteDatabase,
   attemptId: string,
-  githubAppId: string,
-  slug: string,
+  conversion: ParsedManifestConversion,
+  now = new Date(),
 ): void {
-  const result = database.run(
-    `UPDATE github_manifest_attempts
-        SET remote_github_app_id = ?, remote_slug = ?, updated_at = ?
-      WHERE id = ? AND status = ?`,
-    [githubAppId, slug, new Date().toISOString(), attemptId, MANIFEST_ATTEMPT_EXCHANGING],
+  const privateKeySha256 = createHash("sha256")
+    .update(Buffer.from(conversion.privateKeyPem, "utf8"))
+    .digest("hex");
+  const checkpoint = validateCheckpoint({ ...conversion, privateKeySha256 });
+  const row = database.get<Record<string, unknown>>(
+    `SELECT id, target_type, owner_login, status,
+            remote_github_app_id, remote_slug, remote_owner_id,
+            remote_owner_login, remote_owner_type, private_key_sha256
+       FROM github_manifest_attempts WHERE id = ?`,
+    [attemptId],
   );
-  if (result.changes !== 1) {
+  if (row === undefined) throw new Error("GitHub manifest attempt was not found.");
+  const attempt = {
+    id: readRowText(row, "id"),
+    targetType: readRowText(row, "target_type") as ManifestTargetType,
+    ownerLogin: readRowNullableText(row, "owner_login"),
+    status: readRowText(row, "status") as ManifestAttemptStatus,
+    remoteGithubAppId: readCheckpointNullableText(row, "remote_github_app_id"),
+    remoteSlug: readCheckpointNullableText(row, "remote_slug"),
+    remoteOwnerId: readCheckpointNullableText(row, "remote_owner_id"),
+    remoteOwnerLogin: readCheckpointNullableText(row, "remote_owner_login"),
+    remoteOwnerType: readCheckpointNullableText(row, "remote_owner_type") as GithubAccountType | null,
+    privateKeySha256: readCheckpointNullableText(row, "private_key_sha256"),
+  };
+  if (attempt.status !== MANIFEST_ATTEMPT_EXCHANGING) {
     throw new Error("GitHub manifest attempt is no longer exchanging.");
   }
+  if (!checkpointMatchesTarget(attempt, checkpoint)) {
+    throw new Error("GitHub App owner did not match the state-bound target.");
+  }
+  const existingFields = [
+    attempt.remoteGithubAppId,
+    attempt.remoteSlug,
+    attempt.remoteOwnerId,
+    attempt.remoteOwnerLogin,
+    attempt.remoteOwnerType,
+    attempt.privateKeySha256,
+  ];
+  if (existingFields.some((value) => value !== null)) {
+    throw new Error("GitHub manifest conversion checkpoint conflicts with stored state.");
+  }
+  const result = database.run(
+    `UPDATE github_manifest_attempts
+        SET remote_github_app_id = ?, remote_slug = ?, remote_owner_id = ?,
+            remote_owner_login = ?, remote_owner_type = ?, private_key_sha256 = ?,
+            updated_at = ?
+      WHERE id = ? AND status = ?
+        AND remote_github_app_id IS NULL AND remote_slug IS NULL
+        AND remote_owner_id IS NULL AND remote_owner_login IS NULL
+        AND remote_owner_type IS NULL AND private_key_sha256 IS NULL`,
+    [checkpoint.githubAppId, checkpoint.slug, checkpoint.ownerId, checkpoint.ownerLogin, checkpoint.ownerType, checkpoint.privateKeySha256, toIso(now), attemptId, MANIFEST_ATTEMPT_EXCHANGING],
+  );
+  if (result.changes !== 1) throw new Error("GitHub manifest conversion checkpoint conflicts with stored state.");
 }
 
 export function markManifestAttemptRecovery(
@@ -557,7 +787,6 @@ export function parseManifestConversion(value: unknown): ParsedManifestConversio
 export function completeManifestAttempt(
   database: SqliteDatabase,
   attemptId: string,
-  conversion: ParsedManifestConversion,
   now = new Date(),
 ): GithubAppRegistration {
   const timestamp = toIso(now);
@@ -565,6 +794,56 @@ export function completeManifestAttempt(
   // prevents a caller from persisting a non-recoverable or unrelated path.
   const privateKeyRef = manifestPrivateKeyReference(attemptId);
   return database.transaction(() => {
+    const row = database.get<Record<string, unknown>>(
+      `SELECT id, target_type, owner_login, status, app_registration_id,
+              remote_github_app_id, remote_slug, remote_owner_id,
+              remote_owner_login, remote_owner_type, private_key_sha256
+         FROM github_manifest_attempts WHERE id = ?`,
+      [attemptId],
+    );
+    if (row === undefined) throw new Error("GitHub manifest attempt was not found.");
+    const status = readRowText(row, "status");
+    if (status !== MANIFEST_ATTEMPT_EXCHANGING) {
+      throw new Error("GitHub manifest attempt is no longer claimable.");
+    }
+    if (readRowNullableText(row, "app_registration_id") !== null) {
+      throw new Error("GitHub manifest attempt has a conflicting registration.");
+    }
+    const fields = [
+      readCheckpointNullableText(row, "remote_github_app_id"),
+      readCheckpointNullableText(row, "remote_slug"),
+      readCheckpointNullableText(row, "remote_owner_id"),
+      readCheckpointNullableText(row, "remote_owner_login"),
+      readCheckpointNullableText(row, "remote_owner_type"),
+      readCheckpointNullableText(row, "private_key_sha256"),
+    ];
+    if (fields.some((value) => value === null)) {
+      throw new Error("GitHub manifest conversion checkpoint is incomplete.");
+    }
+    let checkpoint: ManifestConversionCheckpoint;
+    try {
+      checkpoint = validateCheckpoint({
+        githubAppId: fields[0] as string,
+        slug: fields[1] as string,
+        ownerId: fields[2] as string,
+        ownerLogin: fields[3] as string,
+        ownerType: fields[4],
+        privateKeySha256: fields[5],
+      });
+    } catch {
+      throw new Error("GitHub manifest conversion checkpoint is invalid.");
+    }
+    const targetType = readRowText(row, "target_type") as ManifestTargetType;
+    const targetOwnerLogin = readRowNullableText(row, "owner_login");
+    if (
+      !checkpointMatchesTarget(
+        { targetType, ownerLogin: targetOwnerLogin },
+        checkpoint,
+      )
+    ) {
+      throw new Error("GitHub App owner did not match the state-bound target.");
+    }
+
     const registrationId = randomUUID();
     database.run(
       `
@@ -578,11 +857,11 @@ export function completeManifestAttempt(
       `,
       {
         id: registrationId,
-        githubAppId: conversion.githubAppId,
-        slug: conversion.slug,
-        ownerId: conversion.ownerId,
-        ownerLogin: conversion.ownerLogin,
-        ownerType: conversion.ownerType,
+        githubAppId: checkpoint.githubAppId,
+        slug: checkpoint.slug,
+        ownerId: checkpoint.ownerId,
+        ownerLogin: checkpoint.ownerLogin,
+        ownerType: checkpoint.ownerType,
         privateKeyRef,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -591,27 +870,20 @@ export function completeManifestAttempt(
     const result = database.run(
       `UPDATE github_manifest_attempts
           SET status = ?, app_registration_id = ?, completed_at = ?, updated_at = ?
-        WHERE id = ? AND status = ?`,
-      [
-        MANIFEST_ATTEMPT_COMPLETED,
-        registrationId,
-        timestamp,
-        timestamp,
-        attemptId,
-        MANIFEST_ATTEMPT_EXCHANGING,
-      ],
+        WHERE id = ? AND status = ? AND app_registration_id IS NULL`,
+      [MANIFEST_ATTEMPT_COMPLETED, registrationId, timestamp, timestamp, attemptId, MANIFEST_ATTEMPT_EXCHANGING],
     );
     if (result.changes !== 1) {
       throw new Error("GitHub manifest attempt is no longer claimable.");
     }
-    const row = database.get<Record<string, unknown>>(
+    const registrationRow = database.get<Record<string, unknown>>(
       `SELECT id, github_app_id, slug, owner_id, owner_login, owner_type,
               private_key_ref, created_at, updated_at
          FROM github_app_registrations WHERE id = ?`,
       [registrationId],
     );
-    if (row === undefined) throw new Error("GitHub App registration could not be read back.");
-    return mapRegistration(row);
+    if (registrationRow === undefined) throw new Error("GitHub App registration could not be read back.");
+    return mapRegistration(registrationRow);
   }, "immediate");
 }
 

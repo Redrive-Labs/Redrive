@@ -166,7 +166,7 @@ describe("GitHub App manifest routes", () => {
         status: "RECOVERY_REQUIRED",
         remote_github_app_id: "900719925474099312345678901234567890",
         remote_slug: "redrive-recovery",
-        recovery_reason: "Remote GitHub App identity is durably recorded, but its deterministic private-key reference was not confirmed persisted.",
+        recovery_reason: "The conversion checkpoint is durable, but its deterministic private-key reference was not confirmed persisted.",
       });
       expect(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM github_app_registrations")?.count).toBe(0);
     } finally { database.close(); }
@@ -298,7 +298,7 @@ describe("GitHub App manifest routes", () => {
         status: "RECOVERY_REQUIRED",
         remote_github_app_id: "900719925474099312345678901234567890",
         remote_slug: "redrive-recovery",
-        recovery_reason: "Remote GitHub App identity and deterministic private-key reference were persisted, but final local registration failed.",
+        recovery_reason: "The conversion checkpoint and deterministic private-key reference were persisted, but final local registration failed.",
       });
       expect(afterFailure.get<{ count: number }>("SELECT COUNT(*) AS count FROM github_app_registrations")?.count).toBe(0);
     } finally {
@@ -308,7 +308,8 @@ describe("GitHub App manifest routes", () => {
     const second = await manifestCallback(
       new Request(callbackUrl, { headers: { accept: "application/json" } }),
     );
-    expect(second.status).toBe(503);
+    expect(second.status).toBe(200);
+    expect((await second.json() as { status: string }).status).toBe("APP_CREATED");
     expect(fetchImplementation).toHaveBeenCalledTimes(1);
     finalizationFailure.mockRestore();
   });

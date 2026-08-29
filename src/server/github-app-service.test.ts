@@ -15,7 +15,7 @@ import {
   MANIFEST_ATTEMPT_TTL_MS,
   MANIFEST_CLAIM_STALE_AFTER_MS,
   parseManifestConversion,
-  recordManifestConversionIdentity,
+  recordManifestConversionCheckpoint,
 } from "@/server/github-app-service";
 import { manifestPrivateKeyReference } from "@/server/secret-store";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
@@ -195,28 +195,7 @@ describe("GitHub App manifest state machine", () => {
         )?.recovery_reason,
       ).toBe("Manifest conversion claim became stale; manual recovery is required.");
 
-      expect(() =>
-        recordManifestConversionIdentity(
-          database,
-          created.attempt.id,
-          "remote-app-from-stale-worker",
-          "stale-slug",
-        ),
-      ).toThrow();
-      expect(() =>
-        completeManifestAttempt(
-          database,
-          created.attempt.id,
-          {
-            githubAppId: "remote-app-from-stale-worker",
-            slug: "stale-slug",
-            ownerId: "owner-id",
-            ownerLogin: "octocat",
-            ownerType: "User",
-            privateKeyPem: "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-          },
-        ),
-      ).toThrow();
+      expect(() => completeManifestAttempt(database, created.attempt.id)).toThrow();
       expect(
         recoveryDatabase.get<{
           status: string;
@@ -261,19 +240,15 @@ describe("GitHub App manifest state machine", () => {
     const created = createManifestAttempt(database, { targetType: "organization", ownerLogin: "acme" }, "https://redrive.example", now);
     const claim = claimManifestAttempt(database, created.state, now);
     if (claim.kind !== "claimed") throw new Error("fixture was not claimed");
-    const registration = completeManifestAttempt(
-      database,
-      claim.attempt.id,
-      {
-        githubAppId: "900719925474099312345678901234567890",
-        slug: "redrive-recovery",
-        ownerId: "9007199254740993",
-        ownerLogin: "acme",
-        ownerType: "Organization",
-        privateKeyPem: "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
-      },
-      now,
-    );
+    recordManifestConversionCheckpoint(database, claim.attempt.id, {
+      githubAppId: "900719925474099312345678901234567890",
+      slug: "redrive-recovery",
+      ownerId: "9007199254740993",
+      ownerLogin: "acme",
+      ownerType: "Organization",
+      privateKeyPem: "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+    }, now);
+    const registration = completeManifestAttempt(database, claim.attempt.id, now);
     expect(registration).toMatchObject({
       githubAppId: "900719925474099312345678901234567890",
       ownerId: "9007199254740993",
