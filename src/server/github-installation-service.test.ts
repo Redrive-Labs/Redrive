@@ -9,7 +9,7 @@ import {
   GithubInstallationVerificationError,
   verifyAndPersistGithubInstallation,
 } from "@/server/github-installation-service";
-import { GithubRestError, type GithubApi } from "@/server/github-rest";
+import { GithubApi, GithubRestError } from "@/server/github-rest";
 import type { SecretStore } from "@/server/secret-store";
 
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -32,6 +32,16 @@ describe("GitHub installation verification", () => {
       rmSync(resource.directory, { recursive: true, force: true });
     }
   });
+
+  function responseApi(
+    status: number,
+    headers: Record<string, string> = {},
+    body = "{}",
+  ): GithubApi {
+    return new GithubApi({
+      fetchImplementation: vi.fn(async () => new Response(body, { status, headers })),
+    });
+  }
 
   function fixture() {
     const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-installation-test-"));
@@ -238,6 +248,188 @@ describe("GitHub installation verification", () => {
       "SELECT status FROM github_installation_attempts WHERE id = ?",
       [created.attempt.id],
     )?.status).toBe("PENDING");
+  });
+
+  it("returns a GitHub 429 to pending for a later callback retry", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const api = responseApi(429);
+
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("PENDING");
+  });
+
+  it("returns a header-confirmed rate-limited 403 to pending", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const api = responseApi(403, {
+      "X-RateLimit-Remaining": "0",
+      "X-RateLimit-Reset": "1893456000",
+    });
+
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("PENDING");
+  });
+
+  it("accepts Retry-After as rate-limit evidence for a 403", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const api = responseApi(403, { "Retry-After": "30" });
+
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      retryAfterSeconds: 30,
+      message: "GitHub installation verification is temporarily unavailable; retry the callback. Retry after approximately 30 seconds.",
+    });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("PENDING");
+  });
+
+  it("keeps an ordinary 403 fail-closed", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const api = responseApi(403, {
+      "Retry-After": "foo Jan 1 2030",
+      "X-RateLimit-Remaining": "1",
+      "X-RateLimit-Reset": "1893456000",
+    });
+
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("RECOVERY_REQUIRED");
+  });
+
+  it.each([400, 401, 404, 422])("keeps HTTP %s fail-closed", async (status) => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const api = responseApi(status);
+
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("RECOVERY_REQUIRED");
+  });
+
+  it("releases the same state-bound attempt after rate limiting and completes on a later callback", async () => {
+    const { database, registration } = fixture();
+    const startedAt = new Date("2026-01-01T00:00:00.000Z");
+    const created = createInstallationAttempt(database, registration, startedAt);
+    const installationId = "900719925474099312345678901234567892";
+    const success = {
+      id: installationId,
+      app_id: registration.githubAppId,
+      account: {
+        id: registration.ownerId,
+        login: registration.ownerLogin,
+        type: registration.ownerType,
+      },
+      repository_selection: "selected",
+    };
+    const fetchImplementation = vi.fn()
+      .mockResolvedValueOnce(new Response("rate limited", {
+        status: 403,
+        headers: {
+          "X-RateLimit-Remaining": "0",
+          "X-RateLimit-Reset": "1893456000",
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(success), {
+        status: 200,
+        headers: { "content-type": "application/vnd.github+json" },
+      }));
+    const api = new GithubApi({ fetchImplementation });
+    const firstOptions = {
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:01:00.000Z"),
+    };
+
+    await expect(verifyAndPersistGithubInstallation(firstOptions))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(database.get<{
+      status: string;
+      app_registration_id: string;
+      expires_at: string;
+      installation_id: string | null;
+      claimed_at: string | null;
+      recovery_reason: string | null;
+    }>(
+      `SELECT status, app_registration_id, expires_at, installation_id,
+              claimed_at, recovery_reason
+         FROM github_installation_attempts WHERE id = ?`,
+      [created.attempt.id],
+    )).toEqual({
+      status: "PENDING",
+      app_registration_id: registration.id,
+      expires_at: created.attempt.expiresAt,
+      installation_id: null,
+      claimed_at: null,
+      recovery_reason: null,
+    });
+
+    const result = await verifyAndPersistGithubInstallation({
+      ...firstOptions,
+      now: new Date("2026-01-01T00:02:00.000Z"),
+    });
+
+    expect(result.repeated).toBe(false);
+    expect(result.installation.installationId).toBe(installationId);
+    expect(result.installation.appRegistrationId).toBe(registration.id);
+    expect(result.installation.accountId).toBe(registration.ownerId);
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
+    expect(database.get<{ status: string; installation_id: string }>(
+      "SELECT status, installation_id FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )).toEqual({ status: "COMPLETED", installation_id: installationId });
   });
 
   it("reclaims the same state-bound attempt after a transient failure and completes it", async () => {

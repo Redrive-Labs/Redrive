@@ -5,8 +5,10 @@ import {
   parseGithubRestJson,
 } from "@/server/github-rest-json";
 import {
+  GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
   GITHUB_REST_MAX_PAGES,
   GithubApi,
+  GithubRestError,
 } from "@/server/github-rest";
 
 function deliveryResponse(value: unknown, link?: string): Response {
@@ -20,6 +22,102 @@ function deliveryResponse(value: unknown, link?: string): Response {
 }
 
 describe("lossless GitHub REST JSON decoding", () => {
+  it("preserves bounded rate-limit metadata without retaining error bodies or credentials", async () => {
+    const credential = "app-jwt-secret";
+    const responseBody = `{"message":"rate limited; credential=${credential}"}`;
+    const fetchImplementation = vi.fn(async () =>
+      new Response(responseBody, {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "Retry-After": "172800",
+          "X-RateLimit-Remaining": "0",
+          "X-RateLimit-Reset": "1893456000",
+        },
+      }),
+    );
+    const api = new GithubApi({ fetchImplementation });
+
+    let caught: unknown;
+    try {
+      await api.getInstallation("42", credential);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(GithubRestError);
+    const error = caught as GithubRestError;
+    expect(error).toMatchObject({
+      code: "HTTP",
+      status: 429,
+      retryAfterSeconds: GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
+      rateLimitRemaining: 0,
+      rateLimitResetEpochSeconds: 1893456000,
+      rateLimit: {
+        retryAfterSeconds: GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
+        rateLimitRemaining: 0,
+        rateLimitResetEpochSeconds: 1893456000,
+      },
+    });
+    expect(error.message).not.toContain(responseBody);
+    expect(error.message).not.toContain(credential);
+    expect(error).not.toHaveProperty("body");
+    expect(error).not.toHaveProperty("response");
+  });
+
+  it.each([
+    "foo Jan 1 2030",
+    "Wed, 02 Jan 2030 00:00:30 UTC",
+    "Wed, 02 Jan 2030 00:00:30 GMT trailing",
+    "Wed, 2 Jan 2030 00:00:30 GMT",
+    "Tue, 02 Jan 2030 00:00:30 GMT",
+  ])("rejects non-IMF Retry-After date %s", async (retryAfter) => {
+    const fetchImplementation = vi.fn(async () =>
+      new Response("forbidden", {
+        status: 403,
+        headers: {
+          "Retry-After": retryAfter,
+          "X-RateLimit-Remaining": "1",
+        },
+      }),
+    );
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.getInstallation("42", "app-jwt")).rejects.toMatchObject({
+      status: 403,
+      retryAfterSeconds: null,
+      rateLimitRemaining: 1,
+      rateLimitResetEpochSeconds: null,
+      rateLimit: {
+        retryAfterSeconds: null,
+        rateLimitRemaining: 1,
+        rateLimitResetEpochSeconds: null,
+      },
+    });
+  });
+
+  it("accepts a strictly validated IMF-fixdate Retry-After value", async () => {
+    const now = Date.UTC(2030, 0, 1, 0, 0, 0);
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fetchImplementation = vi.fn(async () =>
+        new Response("rate limited", {
+          status: 403,
+          headers: { "Retry-After": "Tue, 01 Jan 2030 00:00:30 GMT" },
+        }),
+      );
+      const api = new GithubApi({ fetchImplementation });
+
+      await expect(api.getInstallation("42", "app-jwt")).rejects.toMatchObject({
+        status: 403,
+        retryAfterSeconds: 30,
+        rateLimit: { retryAfterSeconds: 30 },
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it("preserves unsafe integer IDs as exact strings without touching quoted values", () => {
     const appId = "900719925474099312345678901234567890";
     const parsed = parseGithubRestJson(

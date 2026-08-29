@@ -9,6 +9,24 @@ export const GITHUB_API_BASE_URL = "https://api.github.com" as const;
 export const GITHUB_API_VERSION = "2026-03-10" as const;
 export const GITHUB_REST_TIMEOUT_MS = 12_000;
 export const GITHUB_REST_MAX_PAGES = 20;
+// Retry timing is advisory metadata only. Keep it bounded so an untrusted
+// response header cannot create an unbounded value for callers to display or
+// persist.
+export const GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60;
+const MAX_RATE_LIMIT_REMAINING = 1_000_000_000;
+const MAX_RATE_LIMIT_RESET_EPOCH_SECONDS = 9_999_999_999;
+
+export interface GithubRateLimitMetadata {
+  readonly retryAfterSeconds: number | null;
+  readonly rateLimitRemaining: number | null;
+  readonly rateLimitResetEpochSeconds: number | null;
+}
+
+const EMPTY_RATE_LIMIT_METADATA: GithubRateLimitMetadata = {
+  retryAfterSeconds: null,
+  rateLimitRemaining: null,
+  rateLimitResetEpochSeconds: null,
+};
 
 export class GithubRestError extends Error {
   readonly status: number | null;
@@ -19,16 +37,27 @@ export class GithubRestError extends Error {
     | "HTTP"
     | "INVALID_RESPONSE"
     | "UNSUPPORTED_MEDIA";
+  // These are parsed, bounded values only. Raw response headers and bodies are
+  // deliberately never retained on the error.
+  readonly rateLimit: GithubRateLimitMetadata;
+  readonly retryAfterSeconds: number | null;
+  readonly rateLimitRemaining: number | null;
+  readonly rateLimitResetEpochSeconds: number | null;
 
   constructor(
     code: GithubRestError["code"],
     message: string,
     status: number | null = null,
+    rateLimit: GithubRateLimitMetadata = EMPTY_RATE_LIMIT_METADATA,
   ) {
     super(message);
     this.name = "GithubRestError";
     this.code = code;
     this.status = status;
+    this.rateLimit = rateLimit;
+    this.retryAfterSeconds = rateLimit.retryAfterSeconds;
+    this.rateLimitRemaining = rateLimit.rateLimitRemaining;
+    this.rateLimitResetEpochSeconds = rateLimit.rateLimitResetEpochSeconds;
   }
 }
 
@@ -185,6 +214,107 @@ function isJsonMediaType(response: Response): boolean {
   );
 }
 
+function parseBoundedHeaderInteger(
+  value: string | null,
+  maximum: number,
+): number | null {
+  if (value === null || !/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value.trim());
+  if (!Number.isFinite(parsed)) return null;
+  return Math.min(parsed, maximum);
+}
+
+const IMF_FIXDATE_PATTERN = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat), ([0-9]{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([0-9]{4}) ([0-9]{2}):([0-9]{2}):([0-9]{2}) GMT$/;
+const IMF_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+const IMF_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+
+function parseImfFixdate(value: string): number | null {
+  const match = IMF_FIXDATE_PATTERN.exec(value);
+  if (match === null) return null;
+
+  const [, weekday, dayText, monthText, yearText, hourText, minuteText, secondText] = match;
+  const monthIndex = IMF_MONTHS.indexOf(monthText as (typeof IMF_MONTHS)[number]);
+  const day = Number(dayText);
+  const year = Number(yearText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (monthIndex < 0 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+    return null;
+  }
+
+  // Build the UTC value from the validated fields, then compare every field
+  // back to the input. This rejects impossible dates and mismatched weekdays
+  // without allowing Date.parse to accept non-IMF date forms.
+  const date = new Date(0);
+  date.setUTCFullYear(year, monthIndex, day);
+  date.setUTCHours(hour, minute, second, 0);
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== monthIndex ||
+    date.getUTCDate() !== day ||
+    date.getUTCHours() !== hour ||
+    date.getUTCMinutes() !== minute ||
+    date.getUTCSeconds() !== second ||
+    IMF_WEEKDAYS[date.getUTCDay()] !== weekday
+  ) {
+    return null;
+  }
+  return date.getTime();
+}
+
+function parseRetryAfter(
+  value: string | null,
+  nowMs: number,
+): number | null {
+  if (value === null) return null;
+  const normalized = value.trim();
+  const deltaSeconds = parseBoundedHeaderInteger(
+    normalized,
+    GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
+  );
+  if (deltaSeconds !== null) return deltaSeconds;
+
+  const retryAtMs = parseImfFixdate(normalized);
+  if (retryAtMs === null) return null;
+  return Math.min(
+    Math.max(0, Math.ceil((retryAtMs - nowMs) / 1000)),
+    GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
+  );
+}
+
+function readGithubRateLimitMetadata(
+  headers: Headers,
+  nowMs = Date.now(),
+): GithubRateLimitMetadata {
+  const rateLimitRemaining = parseBoundedHeaderInteger(
+    headers.get("x-ratelimit-remaining"),
+    MAX_RATE_LIMIT_REMAINING,
+  );
+  const rateLimitResetEpochSeconds = parseBoundedHeaderInteger(
+    headers.get("x-ratelimit-reset"),
+    MAX_RATE_LIMIT_RESET_EPOCH_SECONDS,
+  );
+  const headerRetryAfterSeconds = parseRetryAfter(
+    headers.get("retry-after"),
+    nowMs,
+  );
+  const retryAfterSeconds =
+    headerRetryAfterSeconds ??
+    (rateLimitRemaining === 0 && rateLimitResetEpochSeconds !== null
+      ? Math.min(
+          Math.max(0, rateLimitResetEpochSeconds - Math.floor(nowMs / 1000)),
+          GITHUB_RATE_LIMIT_MAX_RETRY_AFTER_SECONDS,
+        )
+      : null);
+
+  return {
+    retryAfterSeconds,
+    rateLimitRemaining,
+    rateLimitResetEpochSeconds,
+  };
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -257,6 +387,7 @@ export class GithubApi {
 
     try {
       if (!response.ok) {
+        const rateLimit = readGithubRateLimitMetadata(response.headers);
         // Read and bound the body so a hostile error response cannot remain an
         // unbounded stream. The body is deliberately not included in the error.
         try {
@@ -274,6 +405,7 @@ export class GithubApi {
           "HTTP",
           `GitHub REST request failed with HTTP ${response.status}.`,
           response.status,
+          rateLimit,
         );
       }
       if (!isJsonMediaType(response)) {

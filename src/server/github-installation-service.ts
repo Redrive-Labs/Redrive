@@ -18,14 +18,17 @@ import type { SecretStore } from "@/server/secret-store";
 
 export class GithubInstallationVerificationError extends Error {
   readonly code: "INVALID_STATE" | "EXPIRED_STATE" | "ALREADY_CLAIMED" | "RECOVERY_REQUIRED" | "REMOTE_INVALID";
+  readonly retryAfterSeconds: number | null;
 
   constructor(
     code: GithubInstallationVerificationError["code"],
     message: string,
+    retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = "GithubInstallationVerificationError";
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -41,14 +44,17 @@ function stateErrorCode(error: GithubIntegrationStateError): GithubInstallationV
 }
 
 function isRetryableInstallationVerificationError(error: unknown): boolean {
+  if (!(error instanceof GithubRestError)) return false;
+  if (error.code === "TIMEOUT" || error.code === "NETWORK") return true;
+  if (error.code !== "HTTP" || error.status === null) return false;
+  if (error.status >= 500 && error.status <= 599) return true;
+  if (error.status === 429) return true;
+  // GitHub uses 403 for some rate limits. Only a valid Retry-After or an
+  // exhausted X-RateLimit-Remaining header confirms that case. Other 403s,
+  // including authorization failures, remain fail-closed.
   return (
-    error instanceof GithubRestError &&
-    (error.code === "TIMEOUT" ||
-      error.code === "NETWORK" ||
-      (error.code === "HTTP" &&
-        error.status !== null &&
-        error.status >= 500 &&
-        error.status <= 599))
+    error.status === 403 &&
+    (error.retryAfterSeconds !== null || error.rateLimitRemaining === 0)
   );
 }
 
@@ -164,9 +170,16 @@ export async function verifyAndPersistGithubInstallation(options: {
         now,
       );
       if (released) {
+        const retryAfter =
+          error instanceof GithubRestError ? error.retryAfterSeconds : null;
+        const retryHint =
+          retryAfter === null
+            ? ""
+            : ` Retry after approximately ${retryAfter} seconds.`;
         throw new GithubInstallationVerificationError(
           "RECOVERY_REQUIRED",
-          "GitHub installation verification is temporarily unavailable; retry the callback.",
+          `GitHub installation verification is temporarily unavailable; retry the callback.${retryHint}`,
+          retryAfter,
         );
       }
     }
