@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface RepositoryChoice {
   id: string;
@@ -56,6 +56,11 @@ export function GithubConnectionFlow() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState<Connection | null>(null);
+  const webhookRequestGeneration = useRef(0);
+  const activeWebhookSelection = useRef<{ installationId: string | null; repositoryId: string }>({
+    installationId: null,
+    repositoryId: "",
+  });
 
   async function loadConnections() {
     const response = await fetch("/api/integrations/github/connections", {
@@ -100,6 +105,8 @@ export function GithubConnectionFlow() {
         }
       });
       if (nextInstallationId !== null && nextInstallationId.length > 0) {
+        webhookRequestGeneration.current += 1;
+        activeWebhookSelection.current = { installationId: nextInstallationId, repositoryId: "" };
         setInstallationId(nextInstallationId);
         void loadRepositories(nextInstallationId);
       }
@@ -110,25 +117,44 @@ export function GithubConnectionFlow() {
   }, []);
 
   async function handleRepositoryChange(nextRepositoryId: string) {
+    const requestGeneration = ++webhookRequestGeneration.current;
+    const requestInstallationId = installationId;
+    activeWebhookSelection.current = {
+      installationId: requestInstallationId,
+      repositoryId: nextRepositoryId,
+    };
+    const isCurrentRequest = () =>
+      webhookRequestGeneration.current === requestGeneration &&
+      activeWebhookSelection.current.installationId === requestInstallationId &&
+      activeWebhookSelection.current.repositoryId === nextRepositoryId;
+
     setRepositoryId(nextRepositoryId);
     setWebhookId("");
     setWebhooks([]);
-    if (installationId === null || nextRepositoryId.length === 0) return;
+    if (requestInstallationId === null || nextRepositoryId.length === 0) {
+      setLoadingWebhooks(false);
+      return;
+    }
     setLoadingWebhooks(true);
     setError(null);
     try {
-      const query = new URLSearchParams({ installationId, repositoryId: nextRepositoryId });
+      const query = new URLSearchParams({
+        installationId: requestInstallationId,
+        repositoryId: nextRepositoryId,
+      });
       const response = await fetch(`/api/integrations/github/webhooks?${query}`, {
         cache: "no-store",
       });
       const result = await readJson<{ webhooks: WebhookChoice[] }>(response);
       if (!response.ok) throw new Error(errorMessage(result));
       if (result === null || !("webhooks" in result)) throw new Error("Webhook response was invalid.");
-      setWebhooks(result.webhooks);
+      if (isCurrentRequest()) setWebhooks(result.webhooks);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Webhooks could not be loaded.");
+      if (isCurrentRequest()) {
+        setError(reason instanceof Error ? reason.message : "Webhooks could not be loaded.");
+      }
     } finally {
-      setLoadingWebhooks(false);
+      if (isCurrentRequest()) setLoadingWebhooks(false);
     }
   }
 
