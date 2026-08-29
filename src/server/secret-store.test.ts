@@ -14,6 +14,9 @@ import {
   linkSync as nativeLinkSync,
   unlinkSync as nativeUnlinkSync,
   writeSync as nativeWriteSync,
+  openSync as nativeOpenSync,
+  closeSync as nativeCloseSync,
+  renameSync as nativeRenameSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -97,6 +100,197 @@ describe("filesystem GitHub secret store", () => {
     expect(readFileSync(finalPath, "utf8")).toBe(PEM);
     expect(readdirSync(secretDirectory)).toEqual([reference]);
     expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("treats a concurrent stale-link ENOENT as idempotent after final revalidation", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let staleCleanup = false;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (staleCleanup && path.basename(filePath).startsWith(".tmp-")) {
+          nativeUnlinkSync(filePath);
+          const error = new Error("concurrent cleanup") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        nativeUnlinkSync(filePath);
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    const temporaryPath = path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000006.secret");
+    nativeLinkSync(path.join(secretDirectory, reference), temporaryPath);
+    staleCleanup = true;
+    const digest = createHash("sha256").update(PEM).digest("hex");
+
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(statSync(path.join(secretDirectory, reference)).nlink).toBe(1);
+  });
+
+
+
+  it("treats a temp path disappearing during reconciliation scan as idempotent", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let scanTempPath = "";
+    let armed = false;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      lstatSync: (filePath) => {
+        if (armed && filePath === scanTempPath) {
+          nativeUnlinkSync(filePath);
+          const error = new Error("concurrent cleanup") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return nativeLstatSync(filePath);
+      },
+      syncDirectory: () => {},
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    scanTempPath = path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000010.secret");
+    nativeLinkSync(path.join(secretDirectory, reference), scanTempPath);
+    armed = true;
+    const digest = createHash("sha256").update(PEM).digest("hex");
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+    expect(statSync(path.join(secretDirectory, reference)).nlink).toBe(1);
+  });
+
+  it.each(["missing", "different"] as const)("fails closed when an ENOENT race leaves a %s final inode", (outcome) => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let finalPath = "";
+    let armed = false;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (armed && path.basename(filePath).startsWith(".tmp-")) {
+          nativeUnlinkSync(filePath);
+          if (outcome === "missing") nativeUnlinkSync(finalPath);
+          else {
+            const replacement = `${finalPath}.replacement`;
+            writeFileSync(replacement, PEM, { mode: 0o600 });
+            nativeUnlinkSync(finalPath);
+            nativeRenameSync(replacement, finalPath);
+          }
+          const error = new Error("concurrent cleanup") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        nativeUnlinkSync(filePath);
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    finalPath = path.join(secretDirectory, reference);
+    nativeLinkSync(finalPath, path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000008.secret"));
+    armed = true;
+    const digest = createHash("sha256").update(PEM).digest("hex");
+    let caught: unknown;
+    try { store.verifyPrivateKeyForManifestAttempt(attemptId, digest); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ retryable: false });
+  });
+
+  it.each(["stat", "open", "close"] as const)("keeps post-unlink %s revalidation uncertainty retryable", (stage) => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let finalPath = "";
+    let armed = false;
+    let finalStatsCalls = 0;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      unlinkSync: (filePath) => {
+        if (armed && path.basename(filePath).startsWith(".tmp-")) {
+          nativeUnlinkSync(filePath);
+          const error = new Error("concurrent cleanup") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        nativeUnlinkSync(filePath);
+      },
+      lstatSync: (filePath) => {
+        if (armed && stage === "stat" && filePath === finalPath && ++finalStatsCalls === 2) {
+          throw new Error("transient stat failure");
+        }
+        return nativeLstatSync(filePath);
+      },
+      openSync: (filePath, flags, mode) => {
+        if (armed && stage === "open" && filePath === finalPath) throw new Error("transient open failure");
+        return nativeOpenSync(filePath, flags, mode);
+      },
+      closeSync: (fileDescriptor) => {
+        if (armed && stage === "close") throw new Error("transient close failure");
+        nativeCloseSync(fileDescriptor);
+      },
+      syncDirectory: () => {},
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    finalPath = path.join(secretDirectory, reference);
+    nativeLinkSync(finalPath, path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000009.secret"));
+    armed = true;
+    const digest = createHash("sha256").update(PEM).digest("hex");
+    let caught: unknown;
+    try { store.verifyPrivateKeyForManifestAttempt(attemptId, digest); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ retryable: true });
+  });
+
+
+  it("keeps a later reconciliation retryable after a prior unlink failure", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let syncs = 0;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      syncDirectory: () => {
+        syncs += 1;
+        if (syncs === 2) throw new Error("transient directory fsync failure");
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    nativeLinkSync(
+      path.join(secretDirectory, reference),
+      path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000011.secret"),
+    );
+    const digest = createHash("sha256").update(PEM).digest("hex");
+    let firstError: unknown;
+    try { store.verifyPrivateKeyForManifestAttempt(attemptId, digest); } catch (error) { firstError = error; }
+    expect(firstError).toMatchObject({ retryable: true });
+    expect(statSync(path.join(secretDirectory, reference)).nlink).toBe(1);
+    expect(store.verifyPrivateKeyForManifestAttempt(attemptId, digest)).toBe(reference);
+  });
+
+  it("keeps post-unlink durability uncertainty retryable", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "redrive-secret-test-"));
+    directories.push(directory);
+    const secretDirectory = path.join(directory, "secrets");
+    let syncs = 0;
+    const store = new FilesystemSecretStore(secretDirectory, {
+      syncDirectory: () => {
+        syncs += 1;
+        if (syncs > 1) throw new Error("transient directory fsync failure");
+      },
+    });
+    const attemptId = "12345678-1234-1234-1234-123456789abc";
+    const reference = store.putPrivateKeyForManifestAttempt(attemptId, PEM);
+    nativeLinkSync(
+      path.join(secretDirectory, reference),
+      path.join(secretDirectory, ".tmp-00000000-0000-0000-0000-000000000007.secret"),
+    );
+    const digest = createHash("sha256").update(PEM).digest("hex");
+
+    let caught: unknown;
+    try {
+      store.verifyPrivateKeyForManifestAttempt(attemptId, digest);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ retryable: true });
+    expect(statSync(path.join(secretDirectory, reference)).nlink).toBe(1);
   });
 
   it("keeps the published PEM when temp unlink outcome is ambiguous", () => {

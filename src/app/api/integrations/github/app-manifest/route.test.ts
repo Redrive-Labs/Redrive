@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeConfiguredDatabase, getConfiguredDatabase, openDatabase } from "@/server/database";
-import { manifestPrivateKeyReference } from "@/server/secret-store";
+import { FilesystemSecretStore, manifestPrivateKeyReference, SecretStoreError } from "@/server/secret-store";
 import { POST as startManifest } from "./route";
 import { GET as manifestCallback } from "./callback/route";
 
@@ -312,6 +312,40 @@ describe("GitHub App manifest routes", () => {
     expect((await second.json() as { status: string }).status).toBe("APP_CREATED");
     expect(fetchImplementation).toHaveBeenCalledTimes(1);
     finalizationFailure.mockRestore();
+  });
+
+
+  it("tells the operator to retry, not recreate, after transient reconciliation failure", async () => {
+    const started = await start("personal");
+    const state = new URL(started.githubRegistrationUrl).searchParams.get("state") as string;
+    const digest = "a".repeat(64);
+    const database = openDatabase(databasePath);
+    database.run(
+      `UPDATE github_manifest_attempts
+          SET status = ?, remote_github_app_id = ?, remote_slug = ?,
+              remote_owner_id = ?, remote_owner_login = ?, remote_owner_type = ?,
+              private_key_sha256 = ?, recovery_reason = ?
+        WHERE id = ?`,
+      ["RECOVERY_REQUIRED", "app-1", "redrive-recovery", "owner-1", "octocat", "User", digest, "prior failure", started.attemptId],
+    );
+    database.close();
+    const verification = vi.spyOn(FilesystemSecretStore.prototype, "verifyPrivateKeyForManifestAttempt")
+      .mockImplementation(() => {
+        throw new SecretStoreError("temporary stat failure", true);
+      });
+    try {
+      const callbackUrl = new URL("https://configured.redrive.example/base/api/integrations/github/app-manifest/callback");
+      callbackUrl.searchParams.set("code", "unused");
+      callbackUrl.searchParams.set("state", state);
+      const response = await manifestCallback(new Request(callbackUrl, { headers: { accept: "application/json" } }));
+      expect(response.status).toBe(503);
+      const body = await response.json() as { error: string };
+      expect(body.error).toContain("retry later");
+      expect(body.error).not.toContain("Recreate");
+      expect(verification).toHaveBeenCalledTimes(1);
+    } finally {
+      verification.mockRestore();
+    }
   });
 
 });

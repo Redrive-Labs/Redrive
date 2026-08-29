@@ -990,6 +990,54 @@ export function claimInstallationAttempt(
     if (attempt.status === INSTALLATION_ATTEMPT_RECOVERY_REQUIRED) {
       return { kind: "recovery", attempt } as const;
     }
+
+    const claimPendingAttempt = () => {
+      const expiresAt = Date.parse(attempt.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
+        database.run(
+          `UPDATE github_installation_attempts
+              SET status = ?, recovery_reason = ?, updated_at = ?
+            WHERE id = ? AND status = ?`,
+          [
+            INSTALLATION_ATTEMPT_RECOVERY_REQUIRED,
+            "Installation attempt expired before verification.",
+            now.toISOString(),
+            attempt.id,
+            INSTALLATION_ATTEMPT_PENDING,
+          ],
+        );
+        return { kind: "expired" } as const;
+      }
+      const updatedAt = now.toISOString();
+      const update = database.run(
+        `UPDATE github_installation_attempts
+            SET status = ?, claimed_at = ?, updated_at = ?
+          WHERE id = ? AND status = ?`,
+        [
+          INSTALLATION_ATTEMPT_VERIFYING,
+          updatedAt,
+          updatedAt,
+          attempt.id,
+          INSTALLATION_ATTEMPT_PENDING,
+        ],
+      );
+      if (update.changes !== 1) {
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub installation attempt is already being verified.",
+        );
+      }
+      const row = database.get<Record<string, unknown>>(
+        `SELECT id, app_registration_id, status, expires_at, claimed_at,
+                installation_id, recovery_reason, created_at, updated_at,
+                completed_at
+           FROM github_installation_attempts WHERE id = ?`,
+        [attempt.id],
+      );
+      if (row === undefined) throw new Error("Installation claim could not be read back.");
+      return { kind: "claimed", attempt: mapInstallationAttempt(row) } as const;
+    };
+
     if (attempt.status === INSTALLATION_ATTEMPT_VERIFYING) {
       const claimedAt = attempt.claimedAt === null ? NaN : Date.parse(attempt.claimedAt);
       const expiresAt = Date.parse(attempt.expiresAt);
@@ -998,75 +1046,67 @@ export function claimInstallationAttempt(
         !Number.isFinite(expiresAt) ||
         expiresAt <= now.getTime() ||
         now.getTime() - claimedAt >= INSTALLATION_CLAIM_STALE_AFTER_MS;
-      if (claimIsStale) {
-        const recoveryReason = "Installation verification claim became stale; manual recovery is required.";
+      if (!claimIsStale) {
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub installation attempt is already being verified.",
+        );
+      }
+
+      // A stale verification is safe to reclaim because it performs only an
+      // idempotent GitHub GET. Keep the same row and App registration binding;
+      // the completion CAS below still permits at most one winner.
+      if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
         const recovered = database.run(
           `UPDATE github_installation_attempts
               SET status = ?, recovery_reason = ?, updated_at = ?
             WHERE id = ? AND status = ?`,
           [
             INSTALLATION_ATTEMPT_RECOVERY_REQUIRED,
-            recoveryReason,
+            "Installation attempt expired before verification.",
             now.toISOString(),
             attempt.id,
             INSTALLATION_ATTEMPT_VERIFYING,
           ],
         );
-        if (recovered.changes === 1) {
-          const recoveredAttempt = getInstallationAttemptByStateHash(database, state);
-          if (recoveredAttempt === null) throw new Error("Stale installation claim could not be read back.");
-          return { kind: "recovery", attempt: recoveredAttempt } as const;
-        }
+        if (recovered.changes === 1) return { kind: "expired" } as const;
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub installation attempt is already being verified.",
+        );
       }
-      throw new GithubIntegrationStateError(
-        "ALREADY_CLAIMED",
-        "The GitHub installation attempt is already being verified.",
-      );
-    }
-    const expiresAt = Date.parse(attempt.expiresAt);
-    if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
-      database.run(
+
+      const reclaimedAt = now.toISOString();
+      // SQLite's `= NULL` is never true. Preserve an optimistic CAS for both
+      // a missing observed claim timestamp and a malformed/text timestamp.
+      const observedClaimPredicate = attempt.claimedAt === null
+        ? "claimed_at IS NULL"
+        : "claimed_at = ?";
+      const observedClaimParams = attempt.claimedAt === null ? [] : [attempt.claimedAt];
+      const reclaimed = database.run(
         `UPDATE github_installation_attempts
-            SET status = ?, recovery_reason = ?, updated_at = ?
-          WHERE id = ? AND status = ?`,
-        [
-          INSTALLATION_ATTEMPT_RECOVERY_REQUIRED,
-          "Installation attempt expired before verification.",
-          now.toISOString(),
-          attempt.id,
-          INSTALLATION_ATTEMPT_PENDING,
-        ],
+            SET claimed_at = ?, recovery_reason = NULL, updated_at = ?
+          WHERE id = ? AND status = ? AND ${observedClaimPredicate}`,
+        [reclaimedAt, reclaimedAt, attempt.id, INSTALLATION_ATTEMPT_VERIFYING, ...observedClaimParams],
       );
-      return { kind: "expired" } as const;
-    }
-    const updatedAt = now.toISOString();
-    const update = database.run(
-      `UPDATE github_installation_attempts
-          SET status = ?, claimed_at = ?, updated_at = ?
-        WHERE id = ? AND status = ?`,
-      [
-        INSTALLATION_ATTEMPT_VERIFYING,
-        updatedAt,
-        updatedAt,
-        attempt.id,
-        INSTALLATION_ATTEMPT_PENDING,
-      ],
-    );
-    if (update.changes !== 1) {
-      throw new GithubIntegrationStateError(
-        "ALREADY_CLAIMED",
-        "The GitHub installation attempt is already being verified.",
+      if (reclaimed.changes !== 1) {
+        throw new GithubIntegrationStateError(
+          "ALREADY_CLAIMED",
+          "The GitHub installation attempt is already being verified.",
+        );
+      }
+      const row = database.get<Record<string, unknown>>(
+        `SELECT id, app_registration_id, status, expires_at, claimed_at,
+                installation_id, recovery_reason, created_at, updated_at,
+                completed_at
+           FROM github_installation_attempts WHERE id = ?`,
+        [attempt.id],
       );
+      if (row === undefined) throw new Error("Stale installation claim could not be read back.");
+      return { kind: "claimed", attempt: mapInstallationAttempt(row) } as const;
     }
-    const row = database.get<Record<string, unknown>>(
-      `SELECT id, app_registration_id, status, expires_at, claimed_at,
-              installation_id, recovery_reason, created_at, updated_at,
-              completed_at
-         FROM github_installation_attempts WHERE id = ?`,
-      [attempt.id],
-    );
-    if (row === undefined) throw new Error("Installation claim could not be read back.");
-    return { kind: "claimed", attempt: mapInstallationAttempt(row) } as const;
+
+    return claimPendingAttempt();
   }, "immediate");
 
   if (result.kind === "expired") {
@@ -1077,20 +1117,31 @@ export function claimInstallationAttempt(
   }
   return result;
 }
+function claimTokenPredicate(
+  expectedClaimedAt: string | null | undefined,
+): { sql: string; params: string[] } {
+  if (expectedClaimedAt === undefined) return { sql: "", params: [] };
+  if (expectedClaimedAt === null) return { sql: " AND claimed_at IS NULL", params: [] };
+  return { sql: " AND claimed_at = ?", params: [expectedClaimedAt] };
+}
+
 export function releaseInstallationAttemptForRetry(
   database: SqliteDatabase,
   attemptId: string,
   now = new Date(),
+  expectedClaimedAt?: string | null,
 ): boolean {
+  const claim = claimTokenPredicate(expectedClaimedAt);
   const result = database.run(
     `UPDATE github_installation_attempts
         SET status = ?, claimed_at = NULL, recovery_reason = NULL, updated_at = ?
-      WHERE id = ? AND status = ?`,
+      WHERE id = ? AND status = ?${claim.sql}`,
     [
       INSTALLATION_ATTEMPT_PENDING,
       now.toISOString(),
       attemptId,
       INSTALLATION_ATTEMPT_VERIFYING,
+      ...claim.params,
     ],
   );
   return result.changes === 1;
@@ -1100,17 +1151,20 @@ export function markInstallationAttemptRecovery(
   database: SqliteDatabase,
   attemptId: string,
   reason = "GitHub installation verification requires recovery.",
+  expectedClaimedAt?: string | null,
 ): void {
+  const claim = claimTokenPredicate(expectedClaimedAt);
   database.run(
     `UPDATE github_installation_attempts
         SET status = ?, recovery_reason = ?, updated_at = ?
-      WHERE id = ? AND status = ?`,
+      WHERE id = ? AND status = ?${claim.sql}`,
     [
       INSTALLATION_ATTEMPT_RECOVERY_REQUIRED,
       reason.slice(0, 512),
       new Date().toISOString(),
       attemptId,
       INSTALLATION_ATTEMPT_VERIFYING,
+      ...claim.params,
     ],
   );
 }
@@ -1120,6 +1174,7 @@ export function completeInstallationAttempt(
   attemptId: string,
   installation: Omit<GithubInstallation, "createdAt" | "updatedAt">,
   now = new Date(),
+  expectedClaimedAt?: string | null,
 ): GithubInstallation {
   const timestamp = toIso(now);
   return database.transaction(() => {
@@ -1170,10 +1225,18 @@ export function completeInstallationAttempt(
         updatedAt: timestamp,
       },
     );
+    const claimPredicate = expectedClaimedAt === undefined
+      ? ""
+      : expectedClaimedAt === null
+        ? " AND claimed_at IS NULL"
+        : " AND claimed_at = ?";
+    const claimParams = expectedClaimedAt === undefined || expectedClaimedAt === null
+      ? []
+      : [expectedClaimedAt];
     const updated = database.run(
       `UPDATE github_installation_attempts
           SET status = ?, installation_id = ?, completed_at = ?, updated_at = ?
-        WHERE id = ? AND status = ?`,
+        WHERE id = ? AND status = ?${claimPredicate}`,
       [
         INSTALLATION_ATTEMPT_COMPLETED,
         installation.installationId,
@@ -1181,6 +1244,7 @@ export function completeInstallationAttempt(
         timestamp,
         attemptId,
         INSTALLATION_ATTEMPT_VERIFYING,
+        ...claimParams,
       ],
     );
     if (updated.changes !== 1) {

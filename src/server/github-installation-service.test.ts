@@ -489,4 +489,200 @@ describe("GitHub installation verification", () => {
     )?.status).toBe("RECOVERY_REQUIRED");
     expect(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM github_installations")?.count).toBe(0);
   });
+
+  it("reclaims a stale VERIFYING attempt with a null claim timestamp", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration, new Date("2026-01-01T00:00:00Z"));
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = NULL WHERE id = ?",
+      ["VERIFYING", created.attempt.id],
+    );
+    const installationId = "900719925474099312345678901234567892";
+    const api = { getInstallation: vi.fn(async () => ({
+      id: installationId,
+      app_id: registration.githubAppId,
+      account: { id: registration.ownerId, login: registration.ownerLogin, type: registration.ownerType },
+      repository_selection: "selected",
+    })) } as unknown as GithubApi;
+
+    const result = await verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:01:00Z"),
+    });
+    expect(result.repeated).toBe(false);
+    expect(result.installation.appRegistrationId).toBe(registration.id);
+    expect(api.getInstallation).toHaveBeenCalledTimes(1);
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("COMPLETED");
+  });
+
+  it("allows a later callback to complete a stale unexpired VERIFYING attempt", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration, new Date("2026-01-01T00:00:00Z"));
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = ? WHERE id = ?",
+      ["VERIFYING", "2026-01-01T00:00:00Z", created.attempt.id],
+    );
+    const installationId = "900719925474099312345678901234567892";
+    const api = { getInstallation: vi.fn(async () => ({
+      id: installationId,
+      app_id: registration.githubAppId,
+      account: { id: registration.ownerId, login: registration.ownerLogin, type: registration.ownerType },
+      repository_selection: "selected",
+    })) } as unknown as GithubApi;
+
+    const result = await verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:06:00Z"),
+    });
+    expect(result.installation.installationId).toBe(installationId);
+    expect(database.get<{ app_registration_id: string; status: string }>(
+      "SELECT app_registration_id, status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )).toEqual({ app_registration_id: registration.id, status: "COMPLETED" });
+  });
+
+  it("does not double-complete concurrent callbacks after stale reclaim", async () => {
+    const { directory, database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration, new Date("2026-01-01T00:00:00Z"));
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = ? WHERE id = ?",
+      ["VERIFYING", "2026-01-01T00:00:00Z", created.attempt.id],
+    );
+    const secondDatabase = openDatabase(path.join(directory, "records.sqlite"));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const installationId = "900719925474099312345678901234567892";
+    const api = { getInstallation: vi.fn(async () => {
+      await gate;
+      return {
+        id: installationId,
+        app_id: registration.githubAppId,
+        account: { id: registration.ownerId, login: registration.ownerLogin, type: registration.ownerType },
+        repository_selection: "selected",
+      };
+    }) } as unknown as GithubApi;
+    const options = {
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:06:00Z"),
+    };
+    const first = verifyAndPersistGithubInstallation({ ...options, database });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const second = verifyAndPersistGithubInstallation({ ...options, database: secondDatabase });
+    const secondResult = await Promise.allSettled([second]);
+    release();
+    const firstResult = await Promise.allSettled([first]);
+    expect(firstResult[0].status).toBe("fulfilled");
+    expect(secondResult[0].status).toBe("rejected");
+    expect(api.getInstallation).toHaveBeenCalledTimes(1);
+    expect(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM github_installations")?.count).toBe(1);
+    secondDatabase.close();
+  });
+
+  it("does not make an expired stale VERIFYING attempt indefinitely retryable", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration, new Date("2026-01-01T00:00:00Z"));
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = ? WHERE id = ?",
+      ["VERIFYING", "2026-01-01T00:00:00Z", created.attempt.id],
+    );
+    const options = {
+      database,
+      api: responseApi(200),
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+      now: new Date("2026-01-01T00:31:00Z"),
+    };
+    await expect(verifyAndPersistGithubInstallation(options)).rejects.toMatchObject({ code: "EXPIRED_STATE" });
+    await expect(verifyAndPersistGithubInstallation(options)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("RECOVERY_REQUIRED");
+  });
+
+  it("keeps credential failures fail-closed", async () => {
+    const { database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration);
+    const secretStore = new MemorySecretStore();
+    secretStore.readPrivateKey = () => { throw new Error("credential unavailable"); };
+    await expect(verifyAndPersistGithubInstallation({
+      database,
+      api: responseApi(200),
+      secretStore,
+      state: created.state,
+      installationId: "900719925474099312345678901234567892",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )?.status).toBe("RECOVERY_REQUIRED");
+  });
+
+
+  it("fences a delayed stale worker from releasing or recovery-marking the new claim", async () => {
+    const { directory, database, registration } = fixture();
+    const created = createInstallationAttempt(database, registration, new Date("2026-01-01T00:00:00Z"));
+    const secondDatabase = openDatabase(path.join(directory, "records.sqlite"));
+    let releaseOld!: () => void;
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+    const installationId = "900719925474099312345678901234567892";
+    let calls = 0;
+    const api = {
+      getInstallation: vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) {
+          await oldGate;
+          throw new GithubRestError("NETWORK", "old worker delayed");
+        }
+        return {
+          id: installationId,
+          app_id: registration.githubAppId,
+          account: { id: registration.ownerId, login: registration.ownerLogin, type: registration.ownerType },
+          repository_selection: "selected",
+        };
+      }),
+    } as unknown as GithubApi;
+    const oldWorker = verifyAndPersistGithubInstallation({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:00:00Z"),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const newWorker = verifyAndPersistGithubInstallation({
+      database: secondDatabase,
+      api,
+      secretStore: new MemorySecretStore(),
+      state: created.state,
+      installationId,
+      now: new Date("2026-01-01T00:06:00Z"),
+    });
+    await expect(newWorker).resolves.toMatchObject({ repeated: false });
+    releaseOld();
+    await expect(oldWorker).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(database.get<{ status: string; recovery_reason: string | null }>(
+      "SELECT status, recovery_reason FROM github_installation_attempts WHERE id = ?",
+      [created.attempt.id],
+    )).toEqual({ status: "COMPLETED", recovery_reason: null });
+    expect(api.getInstallation).toHaveBeenCalledTimes(2);
+    secondDatabase.close();
+  });
+
 });

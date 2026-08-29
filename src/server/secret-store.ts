@@ -25,9 +25,12 @@ export interface SecretStore {
 }
 
 export class SecretStoreError extends Error {
-  constructor(message: string) {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable = false) {
     super(message);
     this.name = "SecretStoreError";
+    this.retryable = retryable;
   }
 }
 
@@ -330,12 +333,18 @@ export class FilesystemSecretStore implements SecretStore {
   private readPrivateKeyBytesAtPath(
     filePath: string,
     ensureDurable = false,
+    retryableOnFailure = false,
   ): Buffer {
     let initialStats: Stats;
     try {
       initialStats = this.filesystem.lstatSync(filePath);
-    } catch {
-      throw new SecretStoreError("The referenced private key is unavailable.");
+    } catch (error) {
+      // A missing deterministic object is key loss, not an operation that a
+      // retry can repair. Other filesystem failures may be transient.
+      throw new SecretStoreError(
+        "The referenced private key is unavailable.",
+        retryableOnFailure && (error as NodeJS.ErrnoException).code !== "ENOENT",
+      );
     }
     assertRegularFileMode(initialStats);
     if (initialStats.size > MAX_PRIVATE_KEY_BYTES) {
@@ -343,6 +352,7 @@ export class FilesystemSecretStore implements SecretStore {
     }
 
     let fileDescriptor: number | undefined;
+    let operationFailed = false;
     try {
       const noFollow = fsConstants.O_NOFOLLOW ?? 0;
       fileDescriptor = this.filesystem.openSync(
@@ -370,8 +380,12 @@ export class FilesystemSecretStore implements SecretStore {
       }
       return value;
     } catch (error) {
+      operationFailed = true;
       if (error instanceof SecretStoreError) throw error;
-      throw new SecretStoreError("The referenced private key is unavailable.");
+      throw new SecretStoreError(
+        "The referenced private key is unavailable.",
+        retryableOnFailure && (error as NodeJS.ErrnoException).code !== "ENOENT",
+      );
     } finally {
       if (fileDescriptor !== undefined) {
         const descriptor = fileDescriptor;
@@ -379,10 +393,16 @@ export class FilesystemSecretStore implements SecretStore {
         try {
           this.filesystem.closeSync(descriptor);
         } catch (error) {
-          if (!(error instanceof SecretStoreError)) {
-            throw new SecretStoreError("The referenced private key could not be closed safely.");
+          // Never let a close failure mask a deterministic validation error.
+          if (!operationFailed) {
+            if (!(error instanceof SecretStoreError)) {
+              throw new SecretStoreError(
+                "The referenced private key could not be closed safely.",
+                retryableOnFailure,
+              );
+            }
+            throw error;
           }
-          throw error;
         }
       }
     }
@@ -575,7 +595,17 @@ export class FilesystemSecretStore implements SecretStore {
     expectedIdentity: Stats,
   ): void {
     try {
-      const finalStats = this.filesystem.lstatSync(finalPath);
+      let finalStats: Stats;
+      try {
+        finalStats = this.filesystem.lstatSync(finalPath);
+      } catch (error) {
+        // ENOENT is a deterministic loss/contradiction. Other failures while
+        // checking the already-published object can be retried safely.
+        throw new SecretStoreError(
+          "The published private key could not be revalidated safely.",
+          (error as NodeJS.ErrnoException).code !== "ENOENT",
+        );
+      }
       assertRecoverableFileMetadata(finalStats);
       if (
         typeof finalStats.nlink !== "number" ||
@@ -588,13 +618,29 @@ export class FilesystemSecretStore implements SecretStore {
       }
 
       let fileDescriptor: number | undefined;
+      let validationFailed = false;
       try {
         const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-        fileDescriptor = this.filesystem.openSync(
-          finalPath,
-          fsConstants.O_RDONLY | noFollow,
-        );
-        const openedStats = this.filesystem.fstatSync(fileDescriptor);
+        try {
+          fileDescriptor = this.filesystem.openSync(
+            finalPath,
+            fsConstants.O_RDONLY | noFollow,
+          );
+        } catch (error) {
+          throw new SecretStoreError(
+            "The deterministic private key could not be revalidated safely.",
+            (error as NodeJS.ErrnoException).code !== "ENOENT",
+          );
+        }
+        let openedStats: Stats;
+        try {
+          openedStats = this.filesystem.fstatSync(fileDescriptor);
+        } catch {
+          throw new SecretStoreError(
+            "The deterministic private key could not be revalidated safely.",
+            true,
+          );
+        }
         assertRecoverableFileMetadata(openedStats);
         if (
           typeof openedStats.nlink !== "number" ||
@@ -605,28 +651,52 @@ export class FilesystemSecretStore implements SecretStore {
             "The published private key changed unexpectedly.",
           );
         }
+      } catch (error) {
+        validationFailed = true;
+        throw error;
       } finally {
         if (fileDescriptor !== undefined) {
-          this.filesystem.closeSync(fileDescriptor);
+          try {
+            this.filesystem.closeSync(fileDescriptor);
+          } catch (error) {
+            // Never let a close failure mask a deterministic identity or
+            // metadata contradiction found while validating the inode.
+            if (!validationFailed) {
+              if (error instanceof SecretStoreError) throw error;
+              throw new SecretStoreError(
+                "The deterministic private key could not be closed safely.",
+                true,
+              );
+            }
+          }
         }
       }
     } catch (error) {
       if (error instanceof SecretStoreError) throw error;
       throw new SecretStoreError(
         "The deterministic private key could not be revalidated safely.",
+        true,
       );
     }
   }
 
-  private recoverStaleTemporaryLink(finalPath: string): void {
+  // Returns true when a stale temporary link was reconciled. Callers use this
+  // to preserve retryability for transient failures in the subsequent durable
+  // read, while deterministic identity and metadata contradictions remain
+  // fail-closed.
+  private recoverStaleTemporaryLink(finalPath: string): boolean {
     let initialStats: Stats;
     try {
       initialStats = this.filesystem.lstatSync(finalPath);
-    } catch {
-      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw new SecretStoreError(
+        "The deterministic private key could not be inspected safely.",
+        true,
+      );
     }
     if (typeof initialStats.nlink !== "number" || initialStats.nlink <= 1) {
-      return;
+      return false;
     }
 
     try {
@@ -646,6 +716,7 @@ export class FilesystemSecretStore implements SecretStore {
         .readdirSync(this.directory)
         .filter((entry) => TEMPORARY_REFERENCE_PATTERN.test(entry));
       const matchingTemporaryPaths: string[] = [];
+      let temporaryPathDisappeared = false;
       for (const temporaryReference of temporaryReferences) {
         const temporaryPath = path.join(this.directory, temporaryReference);
         if (
@@ -655,7 +726,16 @@ export class FilesystemSecretStore implements SecretStore {
           throw new SecretStoreError("The temporary private key path is not safe.");
         }
 
-        const temporaryStats = this.filesystem.lstatSync(temporaryPath);
+        let temporaryStats: Stats;
+        try {
+          temporaryStats = this.filesystem.lstatSync(temporaryPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            temporaryPathDisappeared = true;
+            continue;
+          }
+          throw error;
+        }
         if (!hasRequiredFileIdentity(temporaryStats)) {
           throw new SecretStoreError(
             "The temporary private key identity could not be verified.",
@@ -676,18 +756,40 @@ export class FilesystemSecretStore implements SecretStore {
       }
 
       if (matchingTemporaryPaths.length !== 1) {
+        if (temporaryPathDisappeared) {
+          // A concurrent reconciler may have removed the matching path between
+          // readdir and lstat. The final inode must prove that it won the race.
+          this.revalidateRecoveredPrivateKey(finalPath, initialStats);
+          this.filesystem.syncDirectory(this.directory);
+          this.revalidateRecoveredPrivateKey(finalPath, initialStats);
+          return true;
+        }
         throw new SecretStoreError(
           "The deterministic private key has no unique stale temporary link.",
         );
       }
 
-      this.filesystem.unlinkSync(matchingTemporaryPaths[0]);
+      try {
+        this.filesystem.unlinkSync(matchingTemporaryPaths[0]);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // Another reconciler won the unlink race. Re-stat and revalidate the
+        // final inode before accepting the race as idempotent.
+        this.revalidateRecoveredPrivateKey(finalPath, initialStats);
+      }
+      // A directory sync failure after unlink leaves a complete checkpoint and
+      // a safe retry path. Do not turn that uncertainty into key loss.
       this.filesystem.syncDirectory(this.directory);
       this.revalidateRecoveredPrivateKey(finalPath, initialStats);
+      return true;
     } catch (error) {
       if (error instanceof SecretStoreError) throw error;
+      // Every raw filesystem error is an operation uncertainty. Security and
+      // identity contradictions are raised as SecretStoreError above and stay
+      // deterministic; operational errors remain retryable even before unlink.
       throw new SecretStoreError(
         "The deterministic private key could not be recovered safely.",
+        true,
       );
     }
   }
@@ -706,7 +808,11 @@ export class FilesystemSecretStore implements SecretStore {
       assertSafeReference(reference),
     );
     this.recoverStaleTemporaryLink(finalPath);
-    const bytes = this.readPrivateKeyBytesAtPath(finalPath, true);
+    // Every call is reconciliation against a complete checkpoint. Keep raw
+    // non-ENOENT read/durability failures retryable even after an earlier call
+    // removed the stale link; deterministic metadata and digest failures remain
+    // SecretStoreError instances with retryable=false.
+    const bytes = this.readPrivateKeyBytesAtPath(finalPath, true, true);
     const actual = createHash("sha256").update(bytes).digest();
     const expected = Buffer.from(expectedSha256, "hex");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {

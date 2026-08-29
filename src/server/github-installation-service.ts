@@ -115,6 +115,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub App registration is unavailable.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "RECOVERY_REQUIRED",
@@ -130,6 +131,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub App private key is unavailable.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "RECOVERY_REQUIRED",
@@ -149,6 +151,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub App JWT could not be created.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "RECOVERY_REQUIRED",
@@ -168,6 +171,7 @@ export async function verifyAndPersistGithubInstallation(options: {
         options.database,
         claim.attempt.id,
         now,
+        claim.attempt.claimedAt,
       );
       if (released) {
         const retryAfter =
@@ -187,6 +191,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub installation verification had an uncertain outcome.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "RECOVERY_REQUIRED",
@@ -215,6 +220,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub returned an installation that could not be verified.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "REMOTE_INVALID",
@@ -232,6 +238,7 @@ export async function verifyAndPersistGithubInstallation(options: {
         lastVerifiedAt: now.toISOString(),
       },
       now,
+      claim.attempt.claimedAt,
     );
     return { installation, repeated: false };
   } catch {
@@ -239,6 +246,7 @@ export async function verifyAndPersistGithubInstallation(options: {
       options.database,
       claim.attempt.id,
       "GitHub installation was verified but local persistence failed.",
+      claim.attempt.claimedAt,
     );
     throw new GithubInstallationVerificationError(
       "RECOVERY_REQUIRED",

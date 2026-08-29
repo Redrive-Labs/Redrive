@@ -122,4 +122,69 @@ describe("GitHub installation callback route", () => {
       expect(database.get<{ status: string }>("SELECT status FROM github_installation_attempts WHERE id = ?", [attempt.attempt.id])?.status).toBe("RECOVERY_REQUIRED");
     } finally { database.close(); }
   });
+
+  it("reclaims a stale VERIFYING callback and succeeds later on the same attempt", async () => {
+    const attempt = createAttempt();
+    const database = openDatabase(databasePath);
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = ? WHERE id = ?",
+      ["VERIFYING", "2000-01-01T00:00:00.000Z", attempt.attempt.id],
+    );
+    database.close();
+    const api = vi.fn(async () => new Response(
+      `{"id":9007199254740993124,"app_id":9007199254740993123,"account":{"id":9007199254740993125,"login":"octocat","type":"User"},"repository_selection":"selected"}`,
+      { status: 200, headers: { "content-type": "application/vnd.github+json" } },
+    ));
+    vi.stubGlobal("fetch", api);
+    const url = new URL("https://redrive.example/api/integrations/github/install/callback");
+    url.searchParams.set("state", attempt.state);
+    url.searchParams.set("installation_id", "9007199254740993124");
+    const response = await GET(new Request(url, { headers: { accept: "application/json" } }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ repeated: false });
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns gone and permanently closes an expired stale VERIFYING callback", async () => {
+    const attempt = createAttempt();
+    const database = openDatabase(databasePath);
+    database.run(
+      "UPDATE github_installation_attempts SET status = ?, claimed_at = ?, expires_at = ? WHERE id = ?",
+      ["VERIFYING", "2000-01-01T00:00:00.000Z", "2000-01-01T00:01:00.000Z", attempt.attempt.id],
+    );
+    database.close();
+    const api = vi.fn(async () => new Response("should not call", { status: 200 }));
+    vi.stubGlobal("fetch", api);
+    const url = new URL("https://redrive.example/api/integrations/github/install/callback");
+    url.searchParams.set("state", attempt.state);
+    url.searchParams.set("installation_id", "9007199254740993124");
+    const response = await GET(new Request(url, { headers: { accept: "application/json" } }));
+    expect(response.status).toBe(410);
+    expect(api).not.toHaveBeenCalled();
+    const after = openDatabase(databasePath);
+    try {
+      expect(after.get<{ status: string }>("SELECT status FROM github_installation_attempts WHERE id = ?", [attempt.attempt.id])?.status).toBe("RECOVERY_REQUIRED");
+    } finally { after.close(); }
+  });
+
+  it("fails closed when the bound App credential is unavailable", async () => {
+    const attempt = createAttempt();
+    const database = openDatabase(databasePath);
+    const registration = database.get<{ private_key_ref: string }>("SELECT private_key_ref FROM github_app_registrations WHERE id = ?", ["registration-1"]);
+    database.close();
+    rmSync(path.join(directory, "secrets", registration?.private_key_ref ?? ""), { force: true });
+    const api = vi.fn(async () => new Response("should not call", { status: 200 }));
+    vi.stubGlobal("fetch", api);
+    const url = new URL("https://redrive.example/api/integrations/github/install/callback");
+    url.searchParams.set("state", attempt.state);
+    url.searchParams.set("installation_id", "9007199254740993124");
+    const response = await GET(new Request(url, { headers: { accept: "application/json" } }));
+    expect(response.status).toBe(503);
+    expect(api).not.toHaveBeenCalled();
+    const after = openDatabase(databasePath);
+    try {
+      expect(after.get<{ status: string }>("SELECT status FROM github_installation_attempts WHERE id = ?", [attempt.attempt.id])?.status).toBe("RECOVERY_REQUIRED");
+    } finally { after.close(); }
+  });
+
 });

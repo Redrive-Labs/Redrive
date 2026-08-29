@@ -169,12 +169,21 @@ export async function GET(request: Request): Promise<Response> {
         claim.attempt.privateKeySha256,
       );
       registration = completeManifestAttempt(database, claim.attempt.id);
-    } catch {
+    } catch (error) {
       markManifestAttemptRecovery(
         database,
         claim.attempt.id,
-        "The conversion checkpoint could not be matched to its deterministic private-key reference.",
+        error instanceof SecretStoreError && error.retryable
+          ? "The conversion checkpoint is intact, but private-key reconciliation was temporarily unavailable; retry later."
+          : "The conversion checkpoint could not be matched to its deterministic private-key reference.",
       );
+      if (error instanceof SecretStoreError && error.retryable) {
+        return callbackError(
+          request,
+          "The GitHub App key could not be reconciled temporarily; retry later without recreating the App.",
+          503,
+        );
+      }
       return callbackError(
         request,
         "The original GitHub App key was not retained. Recreate the App and start a new connection.",

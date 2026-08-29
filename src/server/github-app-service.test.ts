@@ -263,7 +263,7 @@ describe("GitHub App manifest state machine", () => {
       database,
       install.state,
       new Date(now.getTime() + INSTALLATION_CLAIM_STALE_AFTER_MS + 1),
-    ).kind).toBe("recovery");
+    ).kind).toBe("claimed");
   });
 
   it("does not retry an explicitly marked uncertain conversion", () => {
