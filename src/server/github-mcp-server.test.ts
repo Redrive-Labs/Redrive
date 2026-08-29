@@ -112,57 +112,6 @@ describe("production connection-backed GitHub MCP", () => {
     expect(await initialized.text()).toBe("");
   });
 
-  it("accepts distinct legacy and connection credentials", async () => {
-    const deliveryService = {
-      getFullFailedDelivery: vi.fn(),
-    };
-    const mcp = createGithubMcpServer({
-      deliveryService,
-      environment: {
-        NODE_ENV: "test",
-        REDRIVE_GITHUB_MCP_TOKEN: "legacy-token",
-        REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "connection-token",
-      },
-    });
-
-    const response = await mcp.handleRequest(
-      request(
-        { jsonrpc: "2.0", id: "distinct", method: "tools/list" },
-        { token: "connection-token" },
-      ),
-    );
-
-    expect(response.status).toBe(200);
-    expect(deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
-  });
-
-  it("fails closed when legacy and connection credentials are equal", async () => {
-    const deliveryService = {
-      getFullFailedDelivery: vi.fn(),
-    };
-    const mcp = createGithubMcpServer({
-      deliveryService,
-      environment: {
-        NODE_ENV: "test",
-        REDRIVE_GITHUB_MCP_TOKEN: "shared-token",
-        REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "shared-token",
-      },
-    });
-
-    const response = await mcp.handleRequest(
-      request(
-        { jsonrpc: "2.0", id: "equal", method: "tools/list" },
-        { token: "shared-token" },
-      ),
-    );
-
-    expect(response.status).toBe(503);
-    expect(JSON.stringify(await responseJson(response))).not.toContain(
-      "shared-token",
-    );
-    expect(deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
-  });
-
   it("rejects unauthenticated requests before provider lookup", async () => {
     const { server: mcp, deliveryService } = server();
     const missing = await mcp.handleRequest(
@@ -296,16 +245,5 @@ describe("production connection-backed GitHub MCP", () => {
     );
     expect(response.status).toBe(503);
 
-    const legacyCredentialOnly = createGithubMcpServer({
-      deliveryService: { getFullFailedDelivery: vi.fn() },
-      environment: {
-        NODE_ENV: "test",
-        REDRIVE_GITHUB_MCP_TOKEN: TOKEN,
-      },
-    });
-    const legacyCredentialResponse = await legacyCredentialOnly.handleRequest(
-      request({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
-    );
-    expect(legacyCredentialResponse.status).toBe(503);
   });
 });

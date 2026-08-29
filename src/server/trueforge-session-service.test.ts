@@ -4,10 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getConnectionRecoveryCoordinatorAgentSpec,
-  getRecoveryCoordinatorAgentSpec,
   CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
-  LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
-  RECOVERY_COORDINATOR_SPEC_VERSION,
   RecoveryCoordinatorConfigurationError,
 } from "@/agents/recovery-coordinator";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
@@ -40,7 +37,6 @@ describe("TrueForge incident session spine", () => {
   let databasePath: string;
   let database: SqliteDatabase;
   const configuredModel = "openrouter/free-model";
-  const configuredMcpName = "legacy-github";
   const configuredConnectionMcpName = "redrive-github";
   const makeConnectionEnvironment = () => ({
     ...process.env,
@@ -51,14 +47,15 @@ describe("TrueForge incident session spine", () => {
   let originalModel: string | undefined;
   let originalMcpName: string | undefined;
   let originalConnectionMcpName: string | undefined;
+  let originalConnectionMcpToken: string | undefined;
 
   beforeEach(() => {
     originalModel = process.env.REDRIVE_TRUEFORGE_MODEL;
-    originalMcpName = process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME;
     originalConnectionMcpName = process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME;
+    originalConnectionMcpToken = process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
     process.env.REDRIVE_TRUEFORGE_MODEL = configuredModel;
-    process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME = configuredMcpName;
     process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME = configuredConnectionMcpName;
+    process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN = "test-connection-mcp-token";
     testDirectory = mkdtempSync(
       path.join(os.tmpdir(), "redrive-trueforge-session-"),
     );
@@ -74,15 +71,15 @@ describe("TrueForge incident session spine", () => {
     } else {
       process.env.REDRIVE_TRUEFORGE_MODEL = originalModel;
     }
-    if (originalMcpName === undefined) {
-      delete process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME;
-    } else {
-      process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME = originalMcpName;
-    }
     if (originalConnectionMcpName === undefined) {
       delete process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME;
     } else {
       process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME = originalConnectionMcpName;
+    }
+    if (originalConnectionMcpToken === undefined) {
+      delete process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
+    } else {
+      process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN = originalConnectionMcpToken;
     }
 
     const resolvedDirectory = path.resolve(testDirectory);
@@ -178,7 +175,7 @@ describe("TrueForge incident session spine", () => {
       [
         incidentId,
         creationToken,
-        RECOVERY_COORDINATOR_SPEC_VERSION,
+        CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
         createdAt,
         createdAt,
       ],
@@ -550,15 +547,12 @@ describe("TrueForge incident session spine", () => {
     });
     expect(client.createSession).toHaveBeenCalledTimes(1);
     expect(client.createSession).toHaveBeenCalledWith(
-      getRecoveryCoordinatorAgentSpec({
-        ...process.env,
-        REDRIVE_TRUEFORGE_MODEL: configuredModel,
-      }),
+      getConnectionRecoveryCoordinatorAgentSpec(makeConnectionEnvironment()),
     );
     expect(result.binding).toMatchObject({
       incidentId: incident.id,
       trueForgeSessionId: "tf-session-1",
-      coordinatorSpecVersion: RECOVERY_COORDINATOR_SPEC_VERSION,
+      coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     expect(
@@ -794,126 +788,6 @@ describe("TrueForge incident session spine", () => {
     expect(service.getBindingByIncidentId(incident.id)?.state).toBe("ACTIVE");
   });
 
-  it("upgrades an existing v1 binding in place and never creates a replacement", async () => {
-    const incident = createIncident();
-    insertActiveBinding(incident.id, LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    const service = createTrueForgeSessionService(
-      database,
-      client,
-      () => "2026-01-01T01:00:00.000Z",
-    );
-
-    const result = await service.ensureCoordinatorV2(incident.id);
-
-    expect(result.state).toBe("ACTIVE");
-    expect(result.binding.coordinatorSpecVersion).toBe(
-      RECOVERY_COORDINATOR_SPEC_VERSION,
-    );
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledTimes(1);
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-session",
-      getRecoveryCoordinatorAgentSpec({
-        ...process.env,
-        REDRIVE_TRUEFORGE_MODEL: configuredModel,
-        REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: configuredMcpName,
-      }),
-    );
-  });
-
-  it("does not record v2 when the inline session update fails", async () => {
-    const incident = createIncident();
-    insertActiveBinding(incident.id, LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    client.updateSession.mockRejectedValue(new Error("TrueForge unavailable"));
-    const service = createTrueForgeSessionService(database, client);
-
-    await expect(service.ensureCoordinatorV2(incident.id)).rejects.toBeInstanceOf(
-      TrueForgeSessionSpecUpgradeError,
-    );
-    expect(
-      service.getBindingByIncidentId(incident.id)?.coordinatorSpecVersion,
-    ).toBe(LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION);
-  });
-
-  it("reconciles an already-v2 binding with the current desired AgentSpec", async () => {
-    const incident = createIncident();
-    insertActiveBinding(incident.id, RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    const service = createTrueForgeSessionService(database, client);
-
-    const result = await service.ensureCoordinatorV2(incident.id);
-
-    expect(result.binding.coordinatorSpecVersion).toBe(
-      RECOVERY_COORDINATOR_SPEC_VERSION,
-    );
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-session",
-      getRecoveryCoordinatorAgentSpec({
-        ...process.env,
-        REDRIVE_TRUEFORGE_MODEL: configuredModel,
-        REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: configuredMcpName,
-      }),
-    );
-  });
-
-  it("reconciles a changed configured model onto the same v2 session", async () => {
-    const incident = createIncident();
-    insertActiveBinding(incident.id, RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    const environment = {
-      ...process.env,
-      REDRIVE_TRUEFORGE_MODEL: "replacement-model",
-      REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: configuredMcpName,
-    };
-    const service = createTrueForgeSessionService(
-      database,
-      client,
-      undefined,
-      environment,
-    );
-
-    await service.ensureCoordinatorV2(incident.id);
-
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-session",
-      getRecoveryCoordinatorAgentSpec(environment),
-    );
-  });
-
-  it("reconciles a changed configured GitHub MCP onto the same v2 session", async () => {
-    const incident = createIncident();
-    insertActiveBinding(incident.id, RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    const environment = {
-      ...process.env,
-      REDRIVE_TRUEFORGE_MODEL: configuredModel,
-      REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: "replacement-github-mcp",
-    };
-    const service = createTrueForgeSessionService(
-      database,
-      client,
-      undefined,
-      environment,
-    );
-
-    await service.ensureCoordinatorV2(incident.id);
-
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-session",
-      getRecoveryCoordinatorAgentSpec(environment),
-    );
-  });
-
   it("creates a connection-backed session with the m2.6b spec", async () => {
     const incident = createIncident();
     makeConnectionBacked(incident.id);
@@ -941,35 +815,6 @@ describe("TrueForge incident session spine", () => {
     );
   });
 
-  it("upgrades a legacy connection session in place without a replacement", async () => {
-    const incident = createIncident();
-    makeConnectionBacked(incident.id);
-    insertActiveBinding(incident.id, LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION);
-    const client = createFakeClient();
-    client.getSession.mockResolvedValue({ id: "existing-session" });
-    const connectionEnvironment = makeConnectionEnvironment();
-
-    const service = createTrueForgeSessionService(
-      database,
-      client,
-      undefined,
-      connectionEnvironment,
-    );
-
-    const result = await service.ensureCoordinatorForIncident(incident.id);
-
-    expect(result).toMatchObject({
-      state: "ACTIVE",
-      sessionId: "existing-session",
-      binding: { coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION },
-    });
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-session",
-      getConnectionRecoveryCoordinatorAgentSpec(connectionEnvironment),
-    );
-  });
-
   it("never silently downgrades an unsupported newer Coordinator version", async () => {
     const incident = createIncident();
     insertActiveBinding(incident.id, "m2.5-v9");
@@ -977,7 +822,7 @@ describe("TrueForge incident session spine", () => {
     client.getSession.mockResolvedValue({ id: "existing-session" });
     const service = createTrueForgeSessionService(database, client);
 
-    await expect(service.ensureCoordinatorV2(incident.id)).rejects.toBeInstanceOf(
+    await expect(service.ensureCoordinatorForIncident(incident.id)).rejects.toBeInstanceOf(
       TrueForgeUnsupportedCoordinatorSpecError,
     );
     expect(client.createSession).not.toHaveBeenCalled();

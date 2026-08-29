@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { RecoveryCoordinatorConfigurationError } from "@/agents/recovery-coordinator";
-import { GithubMcpConfigurationError } from "@/server/github-mcp";
 import {
   IncidentNotFoundError,
   ProviderEvidenceConflictError,
@@ -60,7 +59,6 @@ function providerInvestigationErrorResponse(error: unknown): Response {
   if (
     error instanceof RecoveryCoordinatorConfigurationError ||
     error instanceof TrueForgeConfigurationError ||
-    error instanceof GithubMcpConfigurationError ||
     error instanceof ProviderInvestigationConfigurationError
   ) {
     return NextResponse.json(

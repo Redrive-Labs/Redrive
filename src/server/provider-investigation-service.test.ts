@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
-  RECOVERY_COORDINATOR_SPEC_VERSION,
+  CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+  RecoveryCoordinatorConfigurationError,
 } from "@/agents/recovery-coordinator";
 import {
   createProviderEvidenceService,
@@ -25,19 +25,15 @@ import {
   TrueForgeSessionUnavailableError,
 } from "@/server/trueforge-session-service";
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
-import { GithubMcpConfigurationError } from "@/server/github-mcp";
 
 const deliveryId = "900719925474099312345678901234567890";
 const repositoryId = "example/receiver";
-const hookId = "hook-42";
-const mcpServerName = "legacy-github";
 const connectionMcpServerName = "redrive-github";
 const environment = {
   NODE_ENV: "test",
   REDRIVE_TRUEFORGE_MODEL: "configured-model",
-  REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: mcpServerName,
   REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: connectionMcpServerName,
-  REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: hookId }),
+  REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
 } as const;
 
 function makeGithubResult(
@@ -86,9 +82,7 @@ interface StreamOptions {
   toolName?: string;
   toolInfoName?: string;
   toolInfoServerName?: string;
-  hookArgument?: string;
   connectionArgument?: string;
-  useConnectionArguments?: boolean;
   deliveryArgument?: string;
   expectedDeliveryId?: string;
   includeResponse?: boolean;
@@ -104,17 +98,11 @@ function makeStream(
 ): AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events: unknown[] } {
   const providerThreadId = "provider-thread-1";
   const toolCallId = "github-call-1";
-  const providerToolArguments = options.useConnectionArguments
-    ? {
-        connection_id: options.connectionArgument ?? "connection-1",
-        delivery_id:
-          options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
-      }
-    : {
-        hook_id: options.hookArgument ?? hookId,
-        delivery_id:
-          options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
-      };
+  const providerToolArguments = {
+    connection_id: options.connectionArgument ?? "connection-1",
+    delivery_id:
+      options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+  };
   const events: unknown[] = [
     {
       type: "turn.created",
@@ -178,7 +166,7 @@ function makeStream(
             type: "mcp",
             name: options.toolInfoName ?? "get_webhook_delivery",
             serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? mcpServerName,
+            serverName: options.toolInfoServerName ?? connectionMcpServerName,
           },
         },
       ],
@@ -198,7 +186,7 @@ function makeStream(
           function: {
             name: "get_webhook_delivery",
             arguments: JSON.stringify({
-              hook_id: options.hookArgument ?? hookId,
+              connection_id: options.connectionArgument ?? "connection-1",
               delivery_id:
                 options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
             }),
@@ -207,7 +195,7 @@ function makeStream(
             type: "mcp",
             name: "get_webhook_delivery",
             serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? mcpServerName,
+            serverName: options.toolInfoServerName ?? connectionMcpServerName,
           },
         },
       ],
@@ -307,7 +295,7 @@ describe("TrueForge provider investigation", () => {
   let database: SqliteDatabase;
 
   beforeEach(() => {
-    directory = mkdtempSync(path.join(os.tmpdir(), "redrive-provider-investigation-"));
+    directory = mkdtempSync(path.join(os.tmpdir(), "redrive-connection-provider-investigation-"));
     database = openDatabase(path.join(directory, "incidents.sqlite"));
   });
 
@@ -317,17 +305,43 @@ describe("TrueForge provider investigation", () => {
   });
 
   function createIncident(externalDeliveryId = deliveryId) {
-    return createIncidentService(database).create({
+    const incident = createIncidentService(database).create({
       provider: "github",
       externalDeliveryId,
       repositoryId,
     }).incident;
+    const suffix = incident.id.replace(/[^a-zA-Z0-9]/g, "");
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`app-${suffix}`, `app-id-${suffix}`, "redrive", "owner-id", "octocat", "User", `key-${suffix}`, "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO github_installations
+        (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`installation-${suffix}`, `app-${suffix}`, "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT OR IGNORE INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["connection-1", "github", `installation-${suffix}`, repositoryId, repositoryId, `hook-${suffix}`, "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
+    );
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", ["connection-1", incident.id]);
+    return { ...incident, applicationConnectionId: "connection-1" };
   }
 
   function installActiveBinding(
     incidentId: string,
     sessionId = "existing-session",
-    coordinatorSpecVersion: string = LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+    coordinatorSpecVersion: string = CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   ): void {
     database.run(
       `
@@ -372,45 +386,11 @@ describe("TrueForge provider investigation", () => {
     return () => injectedFailure;
   }
 
-  it("fails closed for a connection-backed incident before legacy hook or TrueForge lookup", async () => {
+  it("uses the durable connection tuple before any TrueForge turn", async () => {
     const incident = createIncident("connection-delivery");
-    database.run(
-      `INSERT INTO github_app_registrations
-        (id, github_app_id, slug, owner_id, owner_login, owner_type,
-         private_key_ref, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["app-connection", "app-id", "redrive", "owner-id", "octocat", "User", "key", "2026-01-01", "2026-01-01"],
-    );
-    database.run(
-      `INSERT INTO github_installations
-        (installation_id, app_registration_id, account_id, account_login,
-         account_type, repository_selection, last_verified_at, created_at,
-         updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["installation-connection", "app-connection", "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
-    );
-    database.run(
-      `INSERT INTO application_connections
-        (id, provider, github_installation_id, repository_id,
-         repository_full_name, webhook_id, webhook_target_display, state,
-         created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["connection-incident", "github", "installation-connection", repositoryId, repositoryId, "hook-A", "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
-    );
-    database.run(
-      "UPDATE incidents SET application_connection_id = ? WHERE id = ?",
-      ["connection-incident", incident.id],
-    );
-
-    const environmentWithLegacyHook = {
-      ...environment,
-      REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
-      REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: "hook-B" }),
-    };
     const client = createClient(
       makeStream({
-        useConnectionArguments: true,
-        connectionArgument: "connection-incident",
+        connectionArgument: "connection-1",
         deliveryArgument: "connection-delivery",
         toolInfoServerName: connectionMcpServerName,
         responseContent: JSON.stringify(makeGithubResult({ id: "connection-delivery" })),
@@ -419,7 +399,7 @@ describe("TrueForge provider investigation", () => {
     const service = createProviderInvestigationService(
       database,
       client,
-      environmentWithLegacyHook,
+      environment,
     );
 
     const result = await service.investigateProviderForIncident(incident.id);
@@ -439,9 +419,9 @@ describe("TrueForge provider investigation", () => {
       "turn-1",
     );
     const turnInput = client.createTurnStream.mock.calls[0][1]?.input;
-    expect(JSON.stringify(turnInput)).toContain("connection-incident");
+    expect(JSON.stringify(turnInput)).toContain("connection-1");
     expect(JSON.stringify(turnInput)).toContain("connection_id");
-    expect(JSON.stringify(turnInput)).not.toContain("hook-B");
+    expect(JSON.stringify(turnInput)).toContain("delivery_id");
     expect(
       database.get<{ count: number }>(
         "SELECT COUNT(*) AS count FROM provider_evidence",
@@ -558,7 +538,7 @@ describe("TrueForge provider investigation", () => {
     ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
 
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(
       service
@@ -578,7 +558,7 @@ describe("TrueForge provider investigation", () => {
   it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const existing = evidenceService.captureOrReconcileForIncident(
@@ -610,7 +590,7 @@ describe("TrueForge provider investigation", () => {
       expect.objectContaining({
         input: [
           expect.objectContaining({
-            content: expect.stringContaining(`hook_id=${hookId}`),
+            content: expect.stringContaining("connection_id=connection-1"),
           }),
         ],
       }),
@@ -620,7 +600,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
     expect(evidenceService.getByIncidentId(incident.id)).toEqual(existing);
 
     const events = service.getWorkflowEvents(incident.id);
@@ -648,7 +628,7 @@ describe("TrueForge provider investigation", () => {
     installActiveBinding(
       incident.id,
       "existing-v2-session",
-      RECOVERY_COORDINATOR_SPEC_VERSION,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
     );
     const client = createClient(makeStream());
     const service = createProviderInvestigationService(database, client, environment);
@@ -662,7 +642,7 @@ describe("TrueForge provider investigation", () => {
         model: { name: environment.REDRIVE_TRUEFORGE_MODEL },
         mcpServers: [
           expect.objectContaining({
-            name: environment.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME,
+            name: environment.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME,
           }),
         ],
       }),
@@ -686,7 +666,7 @@ describe("TrueForge provider investigation", () => {
     const result = await service.investigateProviderForIncident(incident.id);
 
     expect(result.evidenceDisposition).toBe("CAPTURED");
-    const evidence = createProviderEvidenceService(database, null).getByIncidentId(
+    const evidence = createProviderEvidenceService(database).getByIncidentId(
       incident.id,
     );
     expect(evidence).toMatchObject({
@@ -696,20 +676,20 @@ describe("TrueForge provider investigation", () => {
     });
   });
 
-  it("fails before remote session work when deterministic inputs are unavailable", async () => {
+  it("fails before remote session work when connection MCP configuration is unavailable", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id, "existing-session");
     const client = createClient(makeStream());
-    const environmentWithoutHook: NodeJS.ProcessEnv = { ...environment };
-    delete environmentWithoutHook.REDRIVE_GITHUB_HOOK_IDS;
+    const environmentWithoutMcp: NodeJS.ProcessEnv = { ...environment };
+    delete environmentWithoutMcp.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
     const service = createProviderInvestigationService(
       database,
       client,
-      environmentWithoutHook,
+      environmentWithoutMcp,
     );
 
     await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
-      GithubMcpConfigurationError,
+      RecoveryCoordinatorConfigurationError,
     );
     expect(client.getSession).not.toHaveBeenCalled();
     expect(client.updateSession).not.toHaveBeenCalled();
@@ -739,7 +719,7 @@ describe("TrueForge provider investigation", () => {
     installActiveBinding(
       incident.id,
       "v2-session",
-      RECOVERY_COORDINATOR_SPEC_VERSION,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
     );
     const client = createClient(makeStream());
     client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
@@ -755,7 +735,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
   });
 
   it("rejects root-thread calls, wrong subagents, wrong MCP resources, and wrong IDs", async () => {
@@ -764,7 +744,7 @@ describe("TrueForge provider investigation", () => {
       { agentName: "other-investigator" },
       { toolInfoServerName: "other-server" },
       { toolName: "redeliver_webhook_delivery", toolInfoName: "redeliver_webhook_delivery" },
-      { hookArgument: "wrong-hook" },
+      { connectionArgument: "wrong-connection" },
       { deliveryArgument: "wrong-delivery" },
       { includeRootToolCall: true },
     ];
@@ -785,7 +765,7 @@ describe("TrueForge provider investigation", () => {
         ProviderInvestigationTurnError,
       );
       expect(
-        createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
       ).toBeNull();
     }
   });
@@ -800,7 +780,7 @@ describe("TrueForge provider investigation", () => {
       ProviderInvestigationTurnError,
     );
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(
       service
@@ -814,11 +794,7 @@ describe("TrueForge provider investigation", () => {
       toolCallId: "github-call-1",
     });
 
-    const proseIncident = createIncidentService(database).create({
-      provider: "github",
-      externalDeliveryId: "prose-delivery",
-      repositoryId,
-    }).incident;
+    const proseIncident = createIncident("prose-delivery");
     installActiveBinding(proseIncident.id, "prose-session");
     const proseClient = createClient(
       makeStream({ includeResponse: false }),
@@ -874,14 +850,14 @@ describe("TrueForge provider investigation", () => {
       proseService.investigateProviderForIncident(proseIncident.id),
     ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(proseIncident.id),
+      createProviderEvidenceService(database).getByIncidentId(proseIncident.id),
     ).toBeNull();
   });
 
   it("records conflict and leaves the original immutable snapshot untouched", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const original = evidenceService.captureOrReconcileForIncident(
@@ -954,7 +930,7 @@ describe("TrueForge provider investigation", () => {
     ).rejects.toThrow("does not match the existing durable event");
 
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(workflowEvents.getByTrueForgeEventId("tool-response-event")).toEqual(
       conflictingEvent,
@@ -987,7 +963,7 @@ describe("TrueForge provider investigation", () => {
       "injected workflow event persistence failure",
     );
     expect(
-      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
     ).toBeNull();
     expect(
       database.get<{ count: number }>(
@@ -1003,7 +979,7 @@ describe("TrueForge provider investigation", () => {
   it("does not append a reobservation event without committing its transaction", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const evidenceService = createProviderEvidenceService(database, null, () =>
+    const evidenceService = createProviderEvidenceService(database, () =>
       "2026-08-25T09:00:00.000Z",
     );
     const original = evidenceService.captureOrReconcileForIncident(
@@ -1063,10 +1039,7 @@ describe("TrueForge provider investigation", () => {
       providerStatusCode: 500,
     });
 
-    const evidence = createProviderEvidenceService(
-      database,
-      null,
-    ).getByIncidentId(incident.id);
+    const evidence = createProviderEvidenceService(database).getByIncidentId(incident.id);
 
     expect(evidence).toMatchObject({
       providerDeliveryId: deliveryId,

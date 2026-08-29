@@ -37,7 +37,6 @@ function rpcRequest(body: unknown, authorization = `Bearer ${token}`): Request {
 }
 
 describe("production GitHub MCP route", () => {
-  const originalToken = process.env.REDRIVE_GITHUB_MCP_TOKEN;
   const originalConnectionToken = process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
 
   beforeEach(() => {
@@ -51,8 +50,6 @@ describe("production GitHub MCP route", () => {
   });
 
   afterEach(() => {
-    if (originalToken === undefined) delete process.env.REDRIVE_GITHUB_MCP_TOKEN;
-    else process.env.REDRIVE_GITHUB_MCP_TOKEN = originalToken;
     if (originalConnectionToken === undefined) {
       delete process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
     } else {
@@ -104,18 +101,6 @@ describe("production GitHub MCP route", () => {
       ),
     );
     expect(response.status).toBe(401);
-    expect(mocks.deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
-  });
-
-  it("fails closed when the legacy credential equals the connection credential", async () => {
-    process.env.REDRIVE_GITHUB_MCP_TOKEN = token;
-
-    const response = await POST(
-      rpcRequest({ jsonrpc: "2.0", id: "equal-credentials", method: "tools/list" }),
-    );
-
-    expect(response.status).toBe(503);
-    expect(mocks.getServerConfig).not.toHaveBeenCalled();
     expect(mocks.deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
   });
 

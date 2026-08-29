@@ -7,16 +7,9 @@ import {
   CONNECTION_PROVIDER_INVESTIGATION_SKILL_NAME,
   CONNECTION_TRUEFORGE_GITHUB_MCP_ENV,
   GITHUB_WEBHOOK_DELIVERY_TOOL,
-  LEGACY_TRUEFORGE_GITHUB_MCP_ENV,
   getConnectionRecoveryCoordinatorAgentSpec,
-  getRecoveryCoordinatorAgentSpec,
-  PROVIDER_INVESTIGATION_SKILL_NAME,
 } from "@/agents/recovery-coordinator";
-import {
-  GithubMcpConfigurationError,
-  parseGithubMcpToolResultJson,
-  resolveConfiguredGithubHookId,
-} from "@/server/github-mcp";
+import { parseGithubMcpToolResultJson } from "@/server/github-mcp";
 import { createIncidentService } from "@/server/incident-service";
 import {
   createIncidentWorkflowEventService,
@@ -88,29 +81,10 @@ interface ProviderInvestigatorThread {
   agentName: string;
 }
 
-type LegacyProviderLookup = {
-  mode: "legacy";
-  hookId: string;
-  deliveryId: string;
+type ProviderToolArguments = {
+  connection_id: string;
+  delivery_id: string;
 };
-
-type ConnectionProviderLookup = {
-  mode: "connection";
-  connectionId: string;
-  deliveryId: string;
-};
-
-type ProviderLookup = LegacyProviderLookup | ConnectionProviderLookup;
-
-type ProviderToolArguments =
-  | {
-      hook_id: string;
-      delivery_id: string;
-    }
-  | {
-      connection_id: string;
-      delivery_id: string;
-    };
 
 interface ProviderToolCall {
   toolCallId: string;
@@ -181,7 +155,8 @@ function eventType(event: unknown): string {
 
 function parseToolArguments(
   argumentsText: string,
-  expectedLookup: ProviderLookup,
+  expectedConnectionId: string,
+  expectedDeliveryId: string,
 ): ProviderToolCall["arguments"] {
   let parsed: unknown;
   try {
@@ -198,14 +173,11 @@ function parseToolArguments(
     );
   }
 
-  const expectedKeys =
-    expectedLookup.mode === "connection"
-      ? ["connection_id", "delivery_id"]
-      : ["delivery_id", "hook_id"];
   const keys = Object.keys(parsed).sort();
   if (
-    keys.length !== expectedKeys.length ||
-    keys.some((key, index) => key !== expectedKeys[index])
+    keys.length !== 2 ||
+    keys[0] !== "connection_id" ||
+    keys[1] !== "delivery_id"
   ) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator MCP tool arguments contain unexpected fields.",
@@ -213,25 +185,18 @@ function parseToolArguments(
   }
 
   if (
-    parsed.delivery_id !== expectedLookup.deliveryId ||
-    (expectedLookup.mode === "connection"
-      ? parsed.connection_id !== expectedLookup.connectionId
-      : parsed.hook_id !== expectedLookup.hookId)
+    parsed.connection_id !== expectedConnectionId ||
+    parsed.delivery_id !== expectedDeliveryId
   ) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator MCP tool arguments do not match the deterministic incident lookup.",
     );
   }
 
-  return expectedLookup.mode === "connection"
-    ? {
-        connection_id: expectedLookup.connectionId,
-        delivery_id: expectedLookup.deliveryId,
-      }
-    : {
-        hook_id: expectedLookup.hookId,
-        delivery_id: expectedLookup.deliveryId,
-      };
+  return {
+    connection_id: expectedConnectionId,
+    delivery_id: expectedDeliveryId,
+  };
 }
 
 /**
@@ -275,43 +240,17 @@ export function extractGithubDeliveryFromTrueForgeToolResponse(
 }
 
 function buildProviderInvestigationInput(
-  incident: {
-    id: string;
-    repositoryId: string;
-    externalDeliveryId: string;
-  },
-  lookup: ProviderLookup,
+  connectionId: string,
+  deliveryId: string,
 ): TrueForgeApi.TurnInputItem[] {
-  if (lookup.mode === "connection") {
-    // This is the connection trust boundary. Keep the parent prompt limited to
-    // the tuple that the production MCP server accepts; do not copy any
-    // repository, hook, installation, credential, URL, or legacy setting into
-    // model context.
-    const content = [
-      "Run the connection-backed provider-only investigation.",
-      "Use the following exact provider lookup tuple. Do not choose, discover, normalize, or infer replacements.",
-      `connection_id=${lookup.connectionId}`,
-      `delivery_id=${lookup.deliveryId}`,
-      `Create exactly one dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing only this exact tuple.`,
-      `That subagent, and only that subagent, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with exactly connection_id and delivery_id.`,
-      "Do not infer receiver state. Do not redeliver or call any write or consequential tool.",
-      "If the provider lookup cannot establish a fact, report uncertainty. The machine tool.response is authoritative; agent prose is not evidence.",
-    ].join("\n");
-
-    return [{ type: "user.message", content }];
-  }
-
   const content = [
-    "Run the provider-only investigation for this Redrive incident.",
-    "The following values are deterministic Redrive inputs. Use them exactly; do not choose, discover, normalize, or infer replacements.",
-    `incident_id=${incident.id}`,
-    `repository_id=${incident.repositoryId}`,
-    `hook_id=${lookup.hookId}`,
-    `delivery_id=${lookup.deliveryId}`,
-    "The provider delivery attempt ID (delivery_id) is distinct from the logical delivery GUID (X-GitHub-Delivery). The logical GUID is established only by the provider lookup result.",
-    `Create exactly one dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing these exact identities.`,
-    `That subagent, and only that subagent, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with the exact hook_id and delivery_id above.`,
-    "Do not call the GitHub tool from the Coordinator. Do not infer receiver state. Do not redeliver or call any write/consequential tool.",
+    "Run the connection-backed provider-only investigation.",
+    "Use the following exact provider lookup tuple. Do not choose, discover, normalize, or infer replacements.",
+    `connection_id=${connectionId}`,
+    `delivery_id=${deliveryId}`,
+    `Create exactly one dynamic subagent named ${PROVIDER_INVESTIGATOR_NAME}. Give it a self-contained provider-only task containing only this exact tuple.`,
+    `That subagent, and only that subagent, must call ${GITHUB_WEBHOOK_DELIVERY_TOOL} on the configured GitHub MCP server with exactly connection_id and delivery_id.`,
+    "Do not infer receiver state. Do not redeliver or call any write or consequential tool.",
     "If the provider lookup cannot establish a fact, report uncertainty. The machine tool.response is authoritative; agent prose is not evidence.",
   ].join("\n");
 
@@ -502,7 +441,8 @@ async function collectTurnLifecycle(
 async function collectProviderTurn(
   stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
   expectedTurnId: string,
-  expectedLookup: ProviderLookup,
+  expectedConnectionId: string,
+  expectedDeliveryId: string,
   expectedMcpServerName: string,
   onAttribution?: (attribution: ProviderTurnAttribution) => void,
 ): Promise<CollectedProviderTurn> {
@@ -795,7 +735,8 @@ async function collectProviderTurn(
     threadId: observedToolCall.threadId,
     arguments: parseToolArguments(
       observedToolCall.argumentsText,
-      expectedLookup,
+      expectedConnectionId,
+      expectedDeliveryId,
     ),
   };
 
@@ -831,7 +772,7 @@ export function createProviderInvestigationService(
     now,
     environment,
   );
-  const evidenceService = createProviderEvidenceService(database, null, now);
+  const evidenceService = createProviderEvidenceService(database, now);
   const workflowEvents = createIncidentWorkflowEventService(database, now);
 
   async function investigate(
@@ -844,72 +785,24 @@ export function createProviderInvestigationService(
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
     }
-    const connectionBacked =
-      incident.applicationConnectionId !== undefined &&
-      incident.applicationConnectionId !== null;
-
-    // Select the TrueForge MCP resource exclusively from durable incident
-    // state. Legacy sessions keep the hook-shaped bridge; connection-backed
-    // sessions use the separate strict connection route. Sharing one resource
-    // would make one of the two exact argument contracts fail closed.
-    const mcpNameEnvironmentKey = connectionBacked
-      ? CONNECTION_TRUEFORGE_GITHUB_MCP_ENV
-      : LEGACY_TRUEFORGE_GITHUB_MCP_ENV;
-    const configuredMcpName = environment[mcpNameEnvironmentKey]?.trim();
-    if (!configuredMcpName) {
-      throw new ProviderInvestigationConfigurationError(
-        `${mcpNameEnvironmentKey} must be configured.`,
+    const connectionId = incident.applicationConnectionId;
+    if (typeof connectionId !== "string" || connectionId.length === 0) {
+      throw new UnsupportedProviderEvidenceError(
+        "legacy provider investigation",
       );
     }
 
-    // Validate every deterministic execution input before any remote session
-    // creation, inline update, or turn can occur. The semantic spec is
-    // deliberately selected from durable incident state and never from a
-    // model-controlled or request-controlled selector.
-    if (connectionBacked) {
-      getConnectionRecoveryCoordinatorAgentSpec(environment);
-    } else {
-      getRecoveryCoordinatorAgentSpec(environment);
+    const configuredMcpName = environment[CONNECTION_TRUEFORGE_GITHUB_MCP_ENV]?.trim();
+    if (!configuredMcpName) {
+      throw new ProviderInvestigationConfigurationError(
+        `${CONNECTION_TRUEFORGE_GITHUB_MCP_ENV} must be configured.`,
+      );
     }
 
-    let lookup: ProviderLookup;
-    if (connectionBacked) {
-      // Connection-backed incidents must use this exact durable connection and
-      // opaque provider delivery ID. There is intentionally no legacy hook
-      // resolution or fallback in this branch.
-      const connectionId = incident.applicationConnectionId;
-      if (typeof connectionId !== "string") {
-        throw new ProviderInvestigationConfigurationError(
-          "The connection-backed incident has no valid ApplicationConnection identifier.",
-        );
-      }
-      lookup = {
-        mode: "connection",
-        connectionId,
-        deliveryId: incident.externalDeliveryId,
-      };
-    } else {
-      let hookId: string;
-      try {
-        hookId = resolveConfiguredGithubHookId(incident.repositoryId, environment);
-      } catch (error) {
-        if (error instanceof GithubMcpConfigurationError) {
-          throw error;
-        }
-        throw new ProviderInvestigationConfigurationError(
-          "GitHub webhook hook mapping could not be resolved.",
-          { cause: error },
-        );
-      }
-      lookup = {
-        mode: "legacy",
-        hookId,
-        deliveryId: incident.externalDeliveryId,
-      };
-    }
+    getConnectionRecoveryCoordinatorAgentSpec(environment);
 
     const ensured = await sessionService.ensureTrueForgeSession(incidentId);
-    const upgraded = await sessionService.ensureCoordinatorV2(
+    const upgraded = await sessionService.ensureCoordinatorForIncident(
       incidentId,
       ensured,
     );
@@ -922,15 +815,10 @@ export function createProviderInvestigationService(
       occurredAt: now(),
       details: {
         repositoryId: incident.repositoryId,
-        ...(lookup.mode === "connection"
-          ? { connectionId: lookup.connectionId }
-          : { hookId: lookup.hookId }),
-        providerDeliveryId: lookup.deliveryId,
+        connectionId,
+        providerDeliveryId: incident.externalDeliveryId,
         mcpServerName: configuredMcpName,
-        skillName:
-          lookup.mode === "connection"
-            ? CONNECTION_PROVIDER_INVESTIGATION_SKILL_NAME
-            : PROVIDER_INVESTIGATION_SKILL_NAME,
+        skillName: CONNECTION_PROVIDER_INVESTIGATION_SKILL_NAME,
       },
     });
 
@@ -943,7 +831,10 @@ export function createProviderInvestigationService(
       const stream = await trueForgeClient.createTurnStream(
         upgraded.sessionId,
         {
-          input: buildProviderInvestigationInput(incident, lookup),
+          input: buildProviderInvestigationInput(
+            connectionId,
+            incident.externalDeliveryId,
+          ),
         },
       );
       let collected: CollectedProviderTurn;
@@ -966,7 +857,8 @@ export function createProviderInvestigationService(
         collected = await collectProviderTurn(
           persistedEvents,
           completedTurnId,
-          lookup,
+          connectionId,
+          incident.externalDeliveryId,
           configuredMcpName,
           (attribution) => {
             turnId = attribution.turnId ?? turnId;

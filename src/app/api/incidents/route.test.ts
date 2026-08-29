@@ -8,19 +8,12 @@ import {
 } from "@/server/database";
 import { POST } from "./route";
 import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
-import {
-  GET as GETProviderEvidence,
-  POST as POSTProviderEvidence,
-} from "./[incidentId]/provider-evidence/route";
+import { GET as GETProviderEvidence } from "./[incidentId]/provider-evidence/route";
 
 describe("incident route", () => {
   let testDirectory: string;
   let databasePath: string;
   const originalDatabasePath = process.env.REDRIVE_DATABASE_PATH;
-  const originalMcpUrl = process.env.REDRIVE_GITHUB_MCP_URL;
-  const originalMcpToken = process.env.REDRIVE_GITHUB_MCP_TOKEN;
-  const originalHookId = process.env.REDRIVE_GITHUB_HOOK_ID;
-  const originalHookIds = process.env.REDRIVE_GITHUB_HOOK_IDS;
 
   beforeEach(() => {
     testDirectory = mkdtempSync(
@@ -28,10 +21,6 @@ describe("incident route", () => {
     );
     databasePath = path.join(testDirectory, "incidents.sqlite");
     process.env.REDRIVE_DATABASE_PATH = databasePath;
-    delete process.env.REDRIVE_GITHUB_MCP_URL;
-    delete process.env.REDRIVE_GITHUB_MCP_TOKEN;
-    delete process.env.REDRIVE_GITHUB_HOOK_ID;
-    delete process.env.REDRIVE_GITHUB_HOOK_IDS;
   });
 
   afterEach(() => {
@@ -42,19 +31,6 @@ describe("incident route", () => {
       delete process.env.REDRIVE_DATABASE_PATH;
     } else {
       process.env.REDRIVE_DATABASE_PATH = originalDatabasePath;
-    }
-
-    for (const [key, value] of [
-      ["REDRIVE_GITHUB_MCP_URL", originalMcpUrl],
-      ["REDRIVE_GITHUB_MCP_TOKEN", originalMcpToken],
-      ["REDRIVE_GITHUB_HOOK_ID", originalHookId],
-      ["REDRIVE_GITHUB_HOOK_IDS", originalHookIds],
-    ] as const) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
     }
 
     const resolvedDirectory = path.resolve(testDirectory);
@@ -435,83 +411,6 @@ describe("incident route", () => {
     expect(response.status).toBe(404);
   });
 
-  it("POST captures provider evidence and GET returns the persisted snapshot", async () => {
-    process.env.REDRIVE_GITHUB_MCP_URL = "https://mcp.example.test/mcp";
-    process.env.REDRIVE_GITHUB_HOOK_ID = "670245925";
-    const providerDeliveryId = "900719925474099312345678901234567890";
-    const deliveryGuid = "guid-route-001";
-    const toolResult = {
-      full: {
-        http_status: 200,
-        body: {
-          id: providerDeliveryId,
-          guid: deliveryGuid,
-          event: "push",
-          status: "Invalid HTTP Response: 500",
-          status_code: 500,
-          delivered_at: "2026-08-25T09:56:40.78Z",
-          redelivery: false,
-          repository_id: 1345932290,
-          request: {
-            headers: { "X-GitHub-Delivery": deliveryGuid },
-            payload: {
-              repository: {
-                id: 1345932290,
-                full_name: "example/receiver",
-              },
-            },
-          },
-          response: { headers: {}, payload: "receiver failed" },
-        },
-      },
-    };
-    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
-      const request = JSON.parse(String(init?.body)) as { id: string };
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          content: [{ type: "text", text: JSON.stringify(toolResult) }],
-        },
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }));
-
-    const createResponse = await POST(new Request("http://localhost/api/incidents", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        provider: "github",
-        externalDeliveryId: providerDeliveryId,
-        repositoryId: "example/receiver",
-      }),
-    }));
-    const { incident } = await createResponse.json() as { incident: { id: string } };
-    const context = { params: Promise.resolve({ incidentId: incident.id }) };
-
-    const captureResponse = await POSTProviderEvidence(
-      new Request(`http://localhost/api/incidents/${incident.id}/provider-evidence`, {
-        method: "POST",
-      }),
-      context,
-    );
-    expect(captureResponse.status).toBe(200);
-    const captured = await captureResponse.json();
-    expect(captured).toMatchObject({
-      evidence: { providerDeliveryId, deliveryGuid },
-    });
-
-    const readResponse = await GETProviderEvidence(
-      new Request(`http://localhost/api/incidents/${incident.id}/provider-evidence`),
-      context,
-    );
-    expect(readResponse.status).toBe(200);
-    await expect(readResponse.json()).resolves.toEqual(captured);
-    expect(fetch).toHaveBeenCalledTimes(1);
-  });
-
   it("GET reads persisted state without requiring or contacting MCP", async () => {
     const createResponse = await POST(
       new Request("http://localhost/api/incidents", {
@@ -540,24 +439,5 @@ describe("incident route", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ evidence: null });
 
-    const captureResponse = await POSTProviderEvidence(
-      new Request(
-        `http://localhost/api/incidents/${incident.id}/provider-evidence`,
-        { method: "POST" },
-      ),
-      { params: Promise.resolve({ incidentId: incident.id }) },
-    );
-    expect(captureResponse.status).toBe(503);
-
-    const database = await openDatabase(databasePath);
-    try {
-      expect(
-        database.get<{ count: number }>(
-          "SELECT COUNT(*) AS count FROM provider_evidence",
-        )?.count,
-      ).toBe(0);
-    } finally {
-      database.close();
-    }
   });
 });
