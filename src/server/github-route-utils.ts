@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { IncidentIdentityConflictError } from "@/server/incident-service";
 import { GithubConnectionError } from "@/server/github-connection-service";
 import { GithubIntegrationValidationError } from "@/domain/github-integration";
 import { ServerConfigurationError } from "@/server/config";
@@ -87,6 +88,9 @@ export function githubErrorResponse(error: unknown): Response {
       },
       { status: 400 },
     );
+  }
+  if (error instanceof IncidentIdentityConflictError) {
+    return NextResponse.json({ error: error.message }, { status: 409 });
   }
   if (error instanceof GithubConnectionError) {
     const status =

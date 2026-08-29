@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import { createGithubDeliveryService } from "@/server/github-delivery-service";
-import type { GithubApi } from "@/server/github-rest";
+import { GithubRestError, type GithubApi } from "@/server/github-rest";
 import type { SecretStore } from "@/server/secret-store";
 
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -60,6 +60,26 @@ describe("connection-based GitHub delivery discovery", () => {
       expect.objectContaining({ id: "900719925474099312345678901234567899", status: "Failed", statusCode: 500 }),
     ]);
     await expect(service.getFailedDelivery("connection-1", "900719925474099312345678901234567899")).resolves.toMatchObject({ id: "900719925474099312345678901234567899" });
+    await expect(
+      service.getFullFailedDelivery(
+        "connection-1",
+        "900719925474099312345678901234567899",
+      ),
+    ).resolves.toEqual({
+      id: "900719925474099312345678901234567899",
+      status: "Failed",
+      status_code: 500,
+      guid: "failed-guid",
+      delivered_at: "2026-01-01T00:00:00Z",
+      event: "push",
+      redelivery: false,
+    });
+    expect(api.getWebhookDelivery).toHaveBeenCalledWith(
+      "octocat/receiver",
+      WEBHOOK_ID,
+      "900719925474099312345678901234567899",
+      "temporary-token",
+    );
     expect(JSON.stringify(database.all("SELECT * FROM application_connections"))).not.toContain("temporary-token");
   });
 
@@ -120,6 +140,87 @@ describe("connection-based GitHub delivery discovery", () => {
     ).toEqual({
       repository_full_name: "octocat/renamed-receiver",
       webhook_target_display: "https://receiver.example/changed",
+    });
+  });
+
+  it("keeps a read-only MCP delivery lookup from refreshing canonical metadata", async () => {
+    const { database } = fixture();
+    const api = {
+      createInstallationToken: vi.fn(async () => ({ token: "installation-token" })),
+      listInstallationRepositories: vi.fn(async () => [
+        { id: REPOSITORY_ID, full_name: "octocat/renamed-receiver", private: true },
+      ]),
+      getRepositoryHook: vi.fn(async () => ({
+        id: WEBHOOK_ID,
+        name: "web",
+        active: true,
+        events: [],
+        config: { url: "https://receiver.example/changed" },
+      })),
+      getWebhookDelivery: vi.fn(async () => ({
+        id: "delivery-1",
+        status: "Failed",
+        status_code: 500,
+        guid: "delivery-guid",
+        delivered_at: "2026-01-01T00:00:00Z",
+        event: "push",
+        redelivery: false,
+      })),
+    } as unknown as GithubApi;
+    const service = createGithubDeliveryService({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+    });
+
+    await service.getFullFailedDelivery("connection-1", "delivery-1");
+
+    expect(api.getWebhookDelivery).toHaveBeenCalledWith(
+      "octocat/renamed-receiver",
+      WEBHOOK_ID,
+      "delivery-1",
+      "installation-token",
+    );
+    expect(
+      database.get<{ repository_full_name: string; webhook_target_display: string }>(
+        "SELECT repository_full_name, webhook_target_display FROM application_connections WHERE id = ?",
+        ["connection-1"],
+      ),
+    ).toEqual({
+      repository_full_name: "octocat/receiver",
+      webhook_target_display: "https://receiver.example/webhooks/github",
+    });
+  });
+
+  it("distinguishes a provider-authoritative missing delivery", async () => {
+    const { database } = fixture();
+    const api = {
+      createInstallationToken: vi.fn(async () => ({ token: "token" })),
+      listInstallationRepositories: vi.fn(async () => [
+        { id: REPOSITORY_ID, full_name: "octocat/receiver", private: true },
+      ]),
+      getRepositoryHook: vi.fn(async () => ({
+        id: WEBHOOK_ID,
+        name: "web",
+        active: true,
+        events: [],
+        config: { url: "https://receiver.example/webhook" },
+      })),
+      getWebhookDelivery: vi.fn(async () => {
+        throw new GithubRestError("HTTP", "provider 404", 404);
+      }),
+    } as unknown as GithubApi;
+    const service = createGithubDeliveryService({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+    });
+
+    await expect(
+      service.getFullFailedDelivery("connection-1", "missing-delivery"),
+    ).rejects.toMatchObject({
+      name: "GithubConnectionError",
+      code: "NOT_FOUND",
     });
   });
 

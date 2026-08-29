@@ -130,7 +130,7 @@ describe("connection-scoped incident route", () => {
           `{"id":${WEBHOOK_ID},"name":"web","active":true,"events":["push"],"config":{"url":"https://receiver.example/webhook?token=secret"}}`,
         );
       }
-      if (url.endsWith(`/repos/octocat/receiver/hooks/${WEBHOOK_ID}/deliveries?per_page=100&page=1`)) {
+      if (url.endsWith(`/repos/octocat/receiver/hooks/${WEBHOOK_ID}/deliveries?per_page=100`)) {
         return githubResponse(`[${deliveryBody}]`);
       }
       if (
@@ -190,7 +190,7 @@ describe("connection-scoped incident route", () => {
 
     const response = await post();
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(404);
     expect(fetchImplementation).toHaveBeenCalled();
     const database = openDatabase(databasePath);
     try {
@@ -257,6 +257,48 @@ describe("connection-scoped incident route", () => {
       });
     } finally {
       database.close();
+    }
+  });
+
+  it("rejects a legacy identity collision instead of returning the wrong incident", async () => {
+    stubGithub(failedDelivery);
+    const database = openDatabase(databasePath);
+    try {
+      database.run(
+        `INSERT INTO incidents
+          (id, provider, external_delivery_id, repository_id, status,
+           created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          "legacy-collision",
+          "github",
+          DELIVERY_ID,
+          REPOSITORY_ID,
+          "OPEN",
+          "2026-01-01",
+          "2026-01-01",
+        ],
+      );
+    } finally {
+      database.close();
+    }
+
+    const response = await post();
+
+    expect(response.status).toBe(409);
+    const persisted = openDatabase(databasePath);
+    try {
+      expect(
+        persisted.get<{ count: number }>("SELECT COUNT(*) AS count FROM incidents")?.count,
+      ).toBe(1);
+      expect(
+        persisted.get<{ application_connection_id: string | null }>(
+          "SELECT application_connection_id FROM incidents WHERE id = ?",
+          ["legacy-collision"],
+        )?.application_connection_id,
+      ).toBeNull();
+    } finally {
+      persisted.close();
     }
   });
 

@@ -10,7 +10,7 @@ import {
   GithubConnectionError,
 } from "@/server/github-connection-service";
 import type { SqliteDatabase } from "@/server/database";
-import type { GithubApi } from "@/server/github-rest";
+import { GithubRestError, type GithubApi } from "@/server/github-rest";
 import type { SecretStore } from "@/server/secret-store";
 import { createIncidentService } from "@/server/incident-service";
 
@@ -45,6 +45,10 @@ function makeVerifiedGithubFailedDelivery(
   });
 }
 
+interface VerifiedConnectionOptions {
+  refreshDisplayMetadata?: boolean;
+}
+
 export function createGithubDeliveryService(options: {
   database: SqliteDatabase;
   api: GithubApi;
@@ -52,7 +56,10 @@ export function createGithubDeliveryService(options: {
 }) {
   const access = createGithubInstallationAccessService(options);
 
-  async function getVerifiedConnection(connectionId: unknown): Promise<{
+  async function getVerifiedConnection(
+    connectionId: unknown,
+    verificationOptions: VerifiedConnectionOptions = {},
+  ): Promise<{
     connection: NonNullable<ReturnType<typeof getApplicationConnection>>;
     context: GithubInstallationContext;
     token: string;
@@ -91,8 +98,17 @@ export function createGithubDeliveryService(options: {
         connection.webhookId,
         credential.token,
       );
-    } catch {
-      throw new GithubConnectionError("NOT_ACCESSIBLE", "The connected webhook is no longer accessible.");
+    } catch (error) {
+      if (error instanceof GithubRestError && error.status === 404) {
+        throw new GithubConnectionError(
+          "NOT_FOUND",
+          "The connected webhook was not found.",
+        );
+      }
+      throw new GithubConnectionError(
+        "NOT_ACCESSIBLE",
+        "The connected webhook is no longer accessible.",
+      );
     }
     const webhook = parseGithubWebhook(hookResponse);
     if (webhook.id !== connection.webhookId) {
@@ -107,25 +123,36 @@ export function createGithubDeliveryService(options: {
       repository.fullName !== connection.repositoryFullName ||
       webhook.targetDisplay !== connection.webhookTargetDisplay
     ) {
-      const updatedAt = new Date().toISOString();
-      options.database.run(
-        `UPDATE application_connections
-            SET repository_full_name = ?, webhook_target_display = ?, updated_at = ?
-          WHERE id = ? AND repository_id = ? AND webhook_id = ?`,
-        [
-          repository.fullName,
-          webhook.targetDisplay,
-          updatedAt,
-          connection.id,
-          connection.repositoryId,
-          connection.webhookId,
-        ],
-      );
-      const refreshed = getApplicationConnection(options.database, connection.id);
-      if (refreshed === null) {
-        throw new GithubConnectionError("RECOVERY_REQUIRED", "The connected webhook display could not be refreshed.");
+      // Use the remote-verified name for the current API call even when this
+      // read-only path deliberately avoids rewriting the canonical row.
+      const refreshedConnection = {
+        ...connection,
+        repositoryFullName: repository.fullName,
+        webhookTargetDisplay: webhook.targetDisplay,
+      };
+      if (verificationOptions.refreshDisplayMetadata === false) {
+        connection = refreshedConnection;
+      } else {
+        const updatedAt = new Date().toISOString();
+        options.database.run(
+          `UPDATE application_connections
+              SET repository_full_name = ?, webhook_target_display = ?, updated_at = ?
+            WHERE id = ? AND repository_id = ? AND webhook_id = ?`,
+          [
+            repository.fullName,
+            webhook.targetDisplay,
+            updatedAt,
+            connection.id,
+            connection.repositoryId,
+            connection.webhookId,
+          ],
+        );
+        const refreshed = getApplicationConnection(options.database, connection.id);
+        if (refreshed === null) {
+          throw new GithubConnectionError("RECOVERY_REQUIRED", "The connected webhook display could not be refreshed.");
+        }
+        connection = refreshed;
       }
-      connection = refreshed;
     }
     return { connection, context, token: credential.token };
   }
@@ -165,10 +192,15 @@ export function createGithubDeliveryService(options: {
     return failed;
   }
 
-  async function getFailedDelivery(
+  async function readFailedDelivery(
     connectionId: unknown,
     deliveryId: unknown,
-  ): Promise<VerifiedGithubFailedDelivery> {
+    verificationOptions: VerifiedConnectionOptions = {},
+  ): Promise<{
+    connection: NonNullable<ReturnType<typeof getApplicationConnection>>;
+    delivery: GithubWebhookDeliveryChoice;
+    response: unknown;
+  }> {
     if (
       typeof deliveryId !== "string" ||
       deliveryId.length === 0 ||
@@ -176,7 +208,10 @@ export function createGithubDeliveryService(options: {
     ) {
       throw new GithubConnectionError("INVALID_INPUT", "Delivery ID is required.");
     }
-    const { connection, token } = await getVerifiedConnection(connectionId);
+    const { connection, token } = await getVerifiedConnection(
+      connectionId,
+      verificationOptions,
+    );
     let response: unknown;
     try {
       response = await options.api.getWebhookDelivery(
@@ -185,13 +220,59 @@ export function createGithubDeliveryService(options: {
         deliveryId,
         token,
       );
-    } catch {
-      throw new GithubConnectionError("NOT_ACCESSIBLE", "The selected webhook delivery is not accessible.");
+    } catch (error) {
+      // A provider-authoritative 404 is different from a timeout, 5xx, or
+      // network failure. Preserve that distinction while keeping the public
+      // error text free of provider response details.
+      if (error instanceof GithubRestError && error.status === 404) {
+        throw new GithubConnectionError(
+          "NOT_FOUND",
+          "The selected webhook delivery was not found.",
+        );
+      }
+      throw new GithubConnectionError(
+        "NOT_ACCESSIBLE",
+        "The selected webhook delivery is not accessible.",
+      );
     }
     const delivery = parseGithubWebhookDelivery(response);
-    if (delivery.id !== deliveryId || !isFailedGithubWebhookDelivery(delivery)) {
-      throw new GithubConnectionError("REMOTE_INVALID", "The selected delivery is not a verified failure.");
+    if (delivery.id !== deliveryId) {
+      throw new GithubConnectionError(
+        "REMOTE_INVALID",
+        "The selected webhook delivery identity does not match the request.",
+      );
     }
+    if (!isFailedGithubWebhookDelivery(delivery)) {
+      throw new GithubConnectionError(
+        "REMOTE_INVALID",
+        "The selected delivery is not a verified failure.",
+      );
+    }
+    return { connection, delivery, response };
+  }
+
+  async function getFullFailedDelivery(
+    connectionId: unknown,
+    deliveryId: unknown,
+  ): Promise<unknown> {
+    // The production MCP advertises this as a read-only operation. Do not
+    // refresh display metadata on its path; authoritative connection and
+    // delivery verification still occurs, but no canonical row is rewritten.
+    return (
+      await readFailedDelivery(connectionId, deliveryId, {
+        refreshDisplayMetadata: false,
+      })
+    ).response;
+  }
+
+  async function getFailedDelivery(
+    connectionId: unknown,
+    deliveryId: unknown,
+  ): Promise<VerifiedGithubFailedDelivery> {
+    const { connection, delivery } = await readFailedDelivery(
+      connectionId,
+      deliveryId,
+    );
     return makeVerifiedGithubFailedDelivery(
       connection,
       { ...delivery, status: delivery.status ?? "FAILED" },
@@ -211,6 +292,7 @@ export function createGithubDeliveryService(options: {
   return {
     listFailedDeliveries,
     getFailedDelivery,
+    getFullFailedDelivery,
     getVerifiedConnection,
     createIncidentFromVerifiedConnectionDelivery,
   };

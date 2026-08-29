@@ -13,10 +13,10 @@ import {
   GithubRouteBodyError,
   readBoundedBody,
 } from "@/server/github-route-utils";
+import { MAX_MANIFEST_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const MAX_MANIFEST_REQUEST_BODY_BYTES = 16 * 1024;
 
 class ManifestRequestError extends Error {
   constructor(message: string) {

@@ -124,17 +124,23 @@ with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit
 absolute directory when required; its ownership, ancestor, symlink, and
 permission checks remain enforced. Set the required server-side
 `REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
-Set `REDRIVE_TRUEFORGE_GITHUB_MCP_NAME` to the name of the configured read-only
-GitHub MCP server in TrueForge. TrueForge Settings owns that server's URL and
-credentials. Redrive does not select or interpret a provider, and TrueForge
-credentials stay server-side.
+Legacy M2.5 incidents use `REDRIVE_TRUEFORGE_GITHUB_MCP_NAME`, whose configured
+read-only server must expose the hook-based bridge contract. Connection-backed
+M2.6B incidents use the separate
+`REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME`, whose configured server must
+point at Redrive's strict `/api/mcp/github` endpoint. Set
+`REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to its server-side bearer secret. Keep
+the legacy bridge's optional `REDRIVE_GITHUB_MCP_TOKEN` separate. TrueForge
+Settings owns both server URLs and credentials. Redrive does not select or
+interpret a provider, and TrueForge credentials stay server-side.
 
-Provider inspection requires a bridge exposing the proven
+Legacy provider inspection requires a bridge exposing the proven
 `get_webhook_delivery` MCP tool. Set `REDRIVE_GITHUB_MCP_URL`, then configure an
 explicit repository-to-hook mapping with `REDRIVE_GITHUB_HOOK_IDS` (or set the
 single-receiver `REDRIVE_GITHUB_HOOK_ID`). Redrive sends `hook_id` and the
 incident's exact `externalDeliveryId` as `delivery_id`; it never derives a hook
-ID from `repositoryId` and never calls GitHub REST directly.
+ID from `repositoryId` and never calls GitHub REST directly. Connection-backed
+incidents never read these legacy settings.
 
 `externalDeliveryId` and normalized `providerDeliveryId` identify the exact
 GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook
@@ -144,15 +150,17 @@ the configured repository evidence contradict each other.
 
 `GET /api/incidents/:incidentId/provider-evidence` reads only the persisted
 snapshot and returns `{ "evidence": null }` before capture. Its `POST` remains
-the direct diagnostic primitive. The first normalized snapshot is immutable;
+the direct legacy diagnostic primitive; it refuses to use the legacy bridge for
+connection-backed incidents. The first normalized snapshot is immutable;
 later direct capture requests return it without contacting GitHub again. MCP
 reads time out after 12 seconds and reject transport responses larger than 64
 MiB.
 
 `POST /api/incidents/:incidentId/provider-investigation` runs the recovery path
-through the incident's existing TrueForge session. It upgrades an existing
-`m2.5-v1` inline session in place to `m2.5-v2`, then requires a dynamic
-`provider-investigator` thread and correlates its read-only
+through the incident's existing TrueForge session. Legacy incidents upgrade an
+existing `m2.5-v1` inline session in place to `m2.5-v2`; connection-backed
+incidents use `m2.6b-v1` and the strict connection MCP server. The route then
+requires a dynamic `provider-investigator` thread and correlates its read-only
 `get_webhook_delivery` model tool call and `tool.response`. Only that response
 is normalized as provider evidence. The route returns product state, not a
 TrueForge transcript.

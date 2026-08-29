@@ -16,7 +16,6 @@ import { openDatabase, type SqliteDatabase } from "@/server/database";
 import {
   createProviderInvestigationService,
   extractGithubDeliveryFromTrueForgeToolResponse,
-  ConnectionBackedProviderInvestigationUnsupportedError,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
   PROVIDER_INVESTIGATOR_NAME,
@@ -31,11 +30,13 @@ import { GithubMcpConfigurationError } from "@/server/github-mcp";
 const deliveryId = "900719925474099312345678901234567890";
 const repositoryId = "example/receiver";
 const hookId = "hook-42";
-const mcpServerName = "redrive-github";
+const mcpServerName = "legacy-github";
+const connectionMcpServerName = "redrive-github";
 const environment = {
   NODE_ENV: "test",
   REDRIVE_TRUEFORGE_MODEL: "configured-model",
   REDRIVE_TRUEFORGE_GITHUB_MCP_NAME: mcpServerName,
+  REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: connectionMcpServerName,
   REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: hookId }),
 } as const;
 
@@ -86,6 +87,8 @@ interface StreamOptions {
   toolInfoName?: string;
   toolInfoServerName?: string;
   hookArgument?: string;
+  connectionArgument?: string;
+  useConnectionArguments?: boolean;
   deliveryArgument?: string;
   expectedDeliveryId?: string;
   includeResponse?: boolean;
@@ -101,6 +104,17 @@ function makeStream(
 ): AsyncIterable<TrueForgeApi.TurnStreamingEvent> & { events: unknown[] } {
   const providerThreadId = "provider-thread-1";
   const toolCallId = "github-call-1";
+  const providerToolArguments = options.useConnectionArguments
+    ? {
+        connection_id: options.connectionArgument ?? "connection-1",
+        delivery_id:
+          options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+      }
+    : {
+        hook_id: options.hookArgument ?? hookId,
+        delivery_id:
+          options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+      };
   const events: unknown[] = [
     {
       type: "turn.created",
@@ -158,11 +172,7 @@ function makeStream(
           type: "function",
           function: {
             name: options.toolName ?? "get_webhook_delivery",
-            arguments: JSON.stringify({
-              hook_id: options.hookArgument ?? hookId,
-              delivery_id:
-                options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
-            }),
+            arguments: JSON.stringify(providerToolArguments),
           },
           toolInfo: {
             type: "mcp",
@@ -394,33 +404,49 @@ describe("TrueForge provider investigation", () => {
 
     const environmentWithLegacyHook = {
       ...environment,
+      REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
       REDRIVE_GITHUB_HOOK_IDS: JSON.stringify({ [repositoryId]: "hook-B" }),
     };
-    const client = createClient(makeStream());
+    const client = createClient(
+      makeStream({
+        useConnectionArguments: true,
+        connectionArgument: "connection-incident",
+        deliveryArgument: "connection-delivery",
+        toolInfoServerName: connectionMcpServerName,
+        responseContent: JSON.stringify(makeGithubResult({ id: "connection-delivery" })),
+      }),
+    );
     const service = createProviderInvestigationService(
       database,
       client,
       environmentWithLegacyHook,
     );
 
-    await expect(service.investigateProviderForIncident(incident.id)).rejects.toBeInstanceOf(
-      ConnectionBackedProviderInvestigationUnsupportedError,
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      incidentId: incident.id,
+      providerStatusCode: 500,
+      trueForgeSessionId: "replacement-session",
+    });
+    expect(client.createSession).toHaveBeenCalledOnce();
+    expect(client.createTurnStream).toHaveBeenCalledOnce();
+    expect(client.createSession.mock.calls[0][0].mcpServers).toEqual([
+      expect.objectContaining({ name: connectionMcpServerName }),
+    ]);
+    expect(client.listTurnEvents).toHaveBeenCalledWith(
+      "replacement-session",
+      "turn-1",
     );
-    expect(client.getSession).not.toHaveBeenCalled();
-    expect(client.updateSession).not.toHaveBeenCalled();
-    expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.createTurnStream).not.toHaveBeenCalled();
-    expect(client.listTurnEvents).not.toHaveBeenCalled();
+    const turnInput = client.createTurnStream.mock.calls[0][1]?.input;
+    expect(JSON.stringify(turnInput)).toContain("connection-incident");
+    expect(JSON.stringify(turnInput)).toContain("connection_id");
+    expect(JSON.stringify(turnInput)).not.toContain("hook-B");
     expect(
       database.get<{ count: number }>(
         "SELECT COUNT(*) AS count FROM provider_evidence",
       )?.count,
-    ).toBe(0);
-    expect(
-      database.get<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM incident_workflow_events",
-      )?.count,
-    ).toBe(0);
+    ).toBe(1);
   });
 
   it("collects only the exact completed turn, not unrelated session history", async () => {

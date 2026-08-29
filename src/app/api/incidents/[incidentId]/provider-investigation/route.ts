@@ -9,7 +9,6 @@ import {
 import {
   investigateProviderForIncident,
   ProviderInvestigationConfigurationError,
-  ConnectionBackedProviderInvestigationUnsupportedError,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
 } from "@/server/provider-investigation-service";
@@ -56,10 +55,6 @@ function providerInvestigationErrorResponse(error: unknown): Response {
       { error: "Provider investigation is not supported for this incident." },
       { status: 422 },
     );
-  }
-
-  if (error instanceof ConnectionBackedProviderInvestigationUnsupportedError) {
-    return NextResponse.json({ error: error.message }, { status: 422 });
   }
 
   if (

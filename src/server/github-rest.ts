@@ -97,6 +97,82 @@ function repositoryPath(repositoryFullName: string): string {
   return `/repos/${encodePathSegment(owner, "repository owner")}/${encodePathSegment(repository, "repository name")}`;
 }
 
+function splitLinkHeader(value: string): string[] {
+  const links: string[] = [];
+  let start = 0;
+  let inAngleBrackets = false;
+  let inQuotes = false;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (inQuotes) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inQuotes = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inQuotes = true;
+    } else if (character === "<") {
+      inAngleBrackets = true;
+    } else if (character === ">") {
+      inAngleBrackets = false;
+    } else if (character === "," && !inAngleBrackets) {
+      links.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  links.push(value.slice(start));
+  return links;
+}
+
+function nextCursorFromLink(
+  linkHeader: string | null,
+  expectedPath: string,
+): string | null {
+  if (linkHeader === null || linkHeader.length === 0) return null;
+
+  for (const link of splitLinkHeader(linkHeader)) {
+    const match = link.match(/^\s*<([^>]*)>\s*;(.*)$/);
+    if (match === null) continue;
+    const [, target, parameters] = match;
+    const relParameter = parameters
+      .split(";")
+      .map((parameter) => parameter.trim())
+      .find((parameter) => /^rel\s*=/i.test(parameter));
+    if (relParameter === undefined) continue;
+    const relValue = relParameter.match(/^rel\s*=\s*(?:"([^"]*)"|([^\s]+))\s*$/i);
+    if (relValue === null) continue;
+    const relations = (relValue[1] ?? relValue[2]).split(/\s+/);
+    if (!relations.includes("next")) continue;
+
+    let nextUrl: URL;
+    try {
+      nextUrl = new URL(target, GITHUB_API_BASE_URL);
+    } catch {
+      continue;
+    }
+    if (
+      nextUrl.origin !== new URL(GITHUB_API_BASE_URL).origin ||
+      nextUrl.pathname !== expectedPath ||
+      nextUrl.username !== "" ||
+      nextUrl.password !== "" ||
+      nextUrl.hash !== ""
+    ) {
+      continue;
+    }
+    const cursors = nextUrl.searchParams.getAll("cursor");
+    if (cursors.length !== 1 || cursors[0].length === 0) continue;
+    return cursors[0];
+  }
+  return null;
+}
+
 function isJsonMediaType(response: Response): boolean {
   const mediaType = response.headers
     .get("content-type")
@@ -124,6 +200,14 @@ export class GithubApi {
     path: string,
     options: GithubRestRequestOptions = {},
   ): Promise<unknown> {
+    const response = await this.requestJsonWithMetadata(path, options);
+    return response.value;
+  }
+
+  private async requestJsonWithMetadata(
+    path: string,
+    options: GithubRestRequestOptions = {},
+  ): Promise<{ value: unknown; link: string | null }> {
     if (!path.startsWith("/") || path.includes("://") || path.includes("\\")) {
       throw new GithubRestError(
         "CONFIGURATION",
@@ -201,7 +285,10 @@ export class GithubApi {
       }
 
       try {
-        return await readGithubRestJson(response, controller.signal);
+        return {
+          value: await readGithubRestJson(response, controller.signal),
+          link: response.headers.get("link"),
+        };
       } catch (error) {
         if (isAbortError(error)) {
           throw new GithubRestError(
@@ -352,15 +439,35 @@ export class GithubApi {
     );
   }
 
-  listWebhookDeliveries(
+  async listWebhookDeliveries(
     repositoryFullName: string,
     webhookId: string,
     installationToken: string,
   ): Promise<unknown[]> {
-    return this.listPaginated(
-      `${repositoryPath(repositoryFullName)}/hooks/${encodePathSegment(webhookId, "webhook ID")}/deliveries`,
-      "webhook deliveries",
-      installationToken,
+    const path = `${repositoryPath(repositoryFullName)}/hooks/${encodePathSegment(webhookId, "webhook ID")}/deliveries`;
+    const values: unknown[] = [];
+    let cursor: string | null = null;
+
+    for (let request = 0; request < GITHUB_REST_MAX_PAGES; request += 1) {
+      const query = new URLSearchParams({ per_page: "100" });
+      if (cursor !== null) query.set("cursor", cursor);
+      const response = await this.requestJsonWithMetadata(
+        `${path}?${query.toString()}`,
+        { token: installationToken },
+      );
+      if (!Array.isArray(response.value)) {
+        throw new GithubRestError(
+          "INVALID_RESPONSE",
+          "GitHub webhook deliveries response is invalid.",
+        );
+      }
+      values.push(...response.value);
+      cursor = nextCursorFromLink(response.link, path);
+      if (cursor === null) return values;
+    }
+    throw new GithubRestError(
+      "INVALID_RESPONSE",
+      "GitHub webhook deliveries pagination exceeded the safety bound.",
     );
   }
 

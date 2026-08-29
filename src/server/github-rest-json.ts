@@ -225,7 +225,10 @@ export function parseGithubRestJson(text: string): unknown {
   }
 }
 
-export const MAX_GITHUB_REST_RESPONSE_BYTES = 4 * 1024 * 1024;
+// GitHub permits webhook payloads up to 25 MiB. Keep REST reads bounded with
+// headroom for delivery metadata; the MCP boundary separately bounds the final
+// JSON-RPC envelope after its text content has been escaped.
+export const MAX_GITHUB_REST_RESPONSE_BYTES = 32 * 1024 * 1024;
 
 async function readChunkWithAbort(
   reader: ReadableStreamDefaultReader<Uint8Array>,

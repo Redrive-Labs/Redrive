@@ -4,7 +4,20 @@ import {
   GithubRestJsonError,
   parseGithubRestJson,
 } from "@/server/github-rest-json";
-import { GithubApi } from "@/server/github-rest";
+import {
+  GITHUB_REST_MAX_PAGES,
+  GithubApi,
+} from "@/server/github-rest";
+
+function deliveryResponse(value: unknown, link?: string): Response {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: {
+      "content-type": "application/vnd.github+json",
+      ...(link === undefined ? {} : { Link: link }),
+    },
+  });
+}
 
 describe("lossless GitHub REST JSON decoding", () => {
   it("preserves unsafe integer IDs as exact strings without touching quoted values", () => {
@@ -90,6 +103,148 @@ describe("lossless GitHub REST JSON decoding", () => {
     expect((fetchImplementation.mock.calls[0]?.[1] as RequestInit).headers).toMatchObject({
       Authorization: "Bearer installation-token",
     });
+  });
+
+  it("starts delivery pagination with per_page and no page parameter", async () => {
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request) => deliveryResponse([]));
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .resolves.toEqual([]);
+
+    const requestUrl = new URL(String(fetchImplementation.mock.calls[0]?.[0]));
+    expect(requestUrl.pathname).toBe("/repos/octocat/receiver/hooks/42/deliveries");
+    expect(requestUrl.searchParams.get("per_page")).toBe("100");
+    expect(requestUrl.searchParams.has("page")).toBe(false);
+    expect(requestUrl.search).toBe("?per_page=100");
+  });
+
+  it("stops delivery pagination after one request when Link has no next relation", async () => {
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request) => deliveryResponse([{ id: "only" }]));
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .resolves.toEqual([{ id: "only" }]);
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+  });
+
+  it("follows a delivery Link next cursor on the known endpoint", async () => {
+    const path = "/repos/octocat/receiver/hooks/42/deliveries";
+    const responses = [
+      deliveryResponse([{ id: "first" }], `<${path}?per_page=100&cursor=next-token>; rel="next"`),
+      deliveryResponse([{ id: "second" }]),
+    ];
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request) => {
+      const response = responses.shift();
+      if (response === undefined) throw new Error("unexpected request");
+      return response;
+    });
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .resolves.toEqual([{ id: "first" }, { id: "second" }]);
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
+    expect(String(fetchImplementation.mock.calls[1]?.[0])).toBe(
+      "https://api.github.com/repos/octocat/receiver/hooks/42/deliveries?per_page=100&cursor=next-token",
+    );
+  });
+
+  it("collects delivery pages in order across multiple cursors", async () => {
+    const path = "/repos/octocat/receiver/hooks/42/deliveries";
+    const nextLink = (cursor: string) =>
+      `<${path}?per_page=100&cursor=${encodeURIComponent(cursor)}>; rel="next"`;
+    const responses = [
+      deliveryResponse([{ id: "first" }], nextLink("cursor-1")),
+      deliveryResponse([{ id: "second" }], nextLink("cursor-2")),
+      deliveryResponse([{ id: "third" }]),
+    ];
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request) => {
+      const response = responses.shift();
+      if (response === undefined) throw new Error("unexpected request");
+      return response;
+    });
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .resolves.toEqual([{ id: "first" }, { id: "second" }, { id: "third" }]);
+    expect(fetchImplementation).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops delivery pagination at the configured request bound", async () => {
+    const path = "/repos/octocat/receiver/hooks/42/deliveries";
+    let requestCount = 0;
+    const fetchImplementation = vi.fn(async () => {
+      const cursor = String(requestCount++);
+      return deliveryResponse(
+        [{ id: cursor }],
+        `<${path}?cursor=${cursor}>; rel="next"`,
+      );
+    });
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .rejects.toMatchObject({
+        code: "INVALID_RESPONSE",
+        message: "GitHub webhook deliveries pagination exceeded the safety bound.",
+      });
+    expect(fetchImplementation).toHaveBeenCalledTimes(GITHUB_REST_MAX_PAGES);
+  });
+
+  it("ignores malformed or untrusted delivery Link targets", async () => {
+    const path = "/repos/octocat/receiver/hooks/42/deliveries";
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request) =>
+      deliveryResponse(
+        Array.from({ length: 100 }, (_, index) => ({ id: index })),
+        `<https://api.github.com/repos/attacker/other/hooks/999/deliveries?cursor=bad>; rel="next", <https://evil.example/${path}?cursor=evil>; rel="next"`,
+      ),
+    );
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(api.listWebhookDeliveries("octocat/receiver", "42", "installation-token"))
+      .resolves.toHaveLength(100);
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    expect(String(fetchImplementation.mock.calls[0]?.[0])).toBe(
+      "https://api.github.com/repos/octocat/receiver/hooks/42/deliveries?per_page=100",
+    );
+  });
+
+  it("encodes cursor contents without changing the delivery endpoint", async () => {
+    const path = "/repos/octocat/receiver/hooks/42/deliveries";
+    const cursor = "cursor&with=unsafe /?";
+    const fetchImplementation = vi.fn()
+      .mockResolvedValueOnce(
+        deliveryResponse(
+          [{ id: "first" }],
+          `<${path}?cursor=${encodeURIComponent(cursor)}>; rel="next"`,
+        ),
+      )
+      .mockResolvedValueOnce(deliveryResponse([{ id: "second" }]));
+    const api = new GithubApi({ fetchImplementation });
+
+    await api.listWebhookDeliveries("octocat/receiver", "42", "installation-token");
+
+    const nextRequest = new URL(String(fetchImplementation.mock.calls[1]?.[0]));
+    expect(nextRequest.origin).toBe("https://api.github.com");
+    expect(nextRequest.pathname).toBe(path);
+    expect(nextRequest.searchParams.get("cursor")).toBe(cursor);
+    expect(nextRequest.searchParams.has("page")).toBe(false);
+    expect(nextRequest.search).not.toContain(cursor);
+  });
+
+  it("keeps large delivery IDs as exact lexical strings", async () => {
+    const id = "900719925474099312345678901234567899";
+    const fetchImplementation = vi.fn(async () =>
+      deliveryResponse([{ id, status_code: 500 }]),
+    );
+    const api = new GithubApi({ fetchImplementation });
+
+    const deliveries = await api.listWebhookDeliveries(
+      "octocat/receiver",
+      "42",
+      "installation-token",
+    );
+
+    expect(deliveries).toEqual([{ id, status_code: 500 }]);
   });
 
 });

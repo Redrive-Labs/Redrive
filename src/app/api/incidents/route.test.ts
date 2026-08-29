@@ -6,10 +6,8 @@ import {
   closeConfiguredDatabase,
   openDatabase,
 } from "@/server/database";
-import {
-  MAX_INCIDENT_REQUEST_BODY_BYTES,
-  POST,
-} from "./route";
+import { POST } from "./route";
+import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
 import {
   GET as GETProviderEvidence,
   POST as POSTProviderEvidence,

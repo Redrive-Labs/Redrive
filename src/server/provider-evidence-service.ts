@@ -34,6 +34,15 @@ export class ProviderEvidenceReadError extends Error {
   }
 }
 
+export class ConnectionBackedProviderEvidenceUnsupportedError extends Error {
+  constructor() {
+    super(
+      "Connection-backed provider evidence must be collected through the TrueForge provider investigation.",
+    );
+    this.name = "ConnectionBackedProviderEvidenceUnsupportedError";
+  }
+}
+
 export type ProviderEvidenceDisposition = "CAPTURED" | "REOBSERVED";
 
 export interface ProviderEvidenceCaptureResult {
@@ -249,6 +258,13 @@ export function createProviderEvidenceService(
     const incident = getIncidentOrThrow(incidentId);
     if (incident.provider !== GITHUB_PROVIDER) {
       throw new UnsupportedProviderEvidenceError(incident.provider);
+    }
+
+    if (
+      incident.applicationConnectionId !== undefined &&
+      incident.applicationConnectionId !== null
+    ) {
+      throw new ConnectionBackedProviderEvidenceUnsupportedError();
     }
 
     if (githubDeliveryReader === null) {

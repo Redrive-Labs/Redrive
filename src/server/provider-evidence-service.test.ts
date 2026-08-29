@@ -116,6 +116,59 @@ describe("provider evidence persistence", () => {
   });
 
 
+  function makeConnectionBackedIncident() {
+    const incident = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: "connection-delivery",
+      repositoryId: "example/receiver",
+    }).incident;
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["app-connection", "app-id", "redrive", "owner-id", "octocat", "User", "key", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO github_installations
+        (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["installation-connection", "app-connection", "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["connection-incident", "github", "installation-connection", "repository-id", "example/receiver", "hook-id", "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      "UPDATE incidents SET application_connection_id = ? WHERE id = ?",
+      ["connection-incident", incident.id],
+    );
+    return incident;
+  }
+
+  it("does not use the legacy reader for a connection-backed incident", async () => {
+    const incident = makeConnectionBackedIncident();
+    let readerCalls = 0;
+    const service = createProviderEvidenceService(database, {
+      async getWebhookDelivery() {
+        readerCalls += 1;
+        throw new Error("legacy reader must not run");
+      },
+    });
+
+    await expect(service.inspectForIncident(incident.id)).rejects.toMatchObject({
+      name: "ConnectionBackedProviderEvidenceUnsupportedError",
+    });
+    expect(readerCalls).toBe(0);
+    expect(service.getByIncidentId(incident.id)).toBeNull();
+  });
+
   it("returns captured incident IDs without loading evidence snapshots", () => {
     const incidents = createIncidentService(database);
     const first = incidents.create({

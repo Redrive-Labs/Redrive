@@ -4,8 +4,7 @@ import {
   createIncident,
   listIncidents,
 } from "@/server/incident-service";
-
-export const MAX_INCIDENT_REQUEST_BODY_BYTES = 8 * 1024;
+import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

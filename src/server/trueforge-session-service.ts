@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 import {
+  getConnectionRecoveryCoordinatorAgentSpec,
+  CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   getRecoveryCoordinatorAgentSpec,
   LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
   RECOVERY_COORDINATOR_SPEC_VERSION,
@@ -322,10 +324,16 @@ export function createTrueForgeSessionService(
 
   async function ensure(incidentId: string): Promise<TrueForgeSessionEnsureResult> {
     // This check intentionally precedes reservation and every client call.
-    // A typo cannot create an unowned remote session.
-    if (incidentService.getById(incidentId) === null) {
+    // A typo cannot create an unowned remote session. The incident's durable
+    // applicationConnectionId is the sole selector for the Coordinator
+    // semantic path; no repository, hook, or environment fallback is used.
+    const incident = incidentService.getById(incidentId);
+    if (incident === null) {
       throw new TrueForgeIncidentNotFoundError(incidentId);
     }
+    const connectionBacked =
+      incident.applicationConnectionId !== undefined &&
+      incident.applicationConnectionId !== null;
 
     const existing = bindingRepository.getByIncidentId(incidentId);
     if (existing !== null) {
@@ -333,14 +341,21 @@ export function createTrueForgeSessionService(
     }
 
     // Validate the server-side model/resource name before reserving or
-    // creating a remote session. Missing configuration must fail closed.
-    const coordinatorAgentSpec = getRecoveryCoordinatorAgentSpec(environment);
+    // creating a remote session. Missing configuration must fail closed. A
+    // connection-backed incident starts with the connection semantic spec;
+    // legacy incidents retain their exact m2.5-v2 creation behavior.
+    const coordinatorAgentSpec = connectionBacked
+      ? getConnectionRecoveryCoordinatorAgentSpec(environment)
+      : getRecoveryCoordinatorAgentSpec(environment);
+    const coordinatorSpecVersion = connectionBacked
+      ? CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION
+      : RECOVERY_COORDINATOR_SPEC_VERSION;
 
     const creationToken = randomUUID();
     const reservation = bindingRepository.reserveCreation(
       incidentId,
       creationToken,
-      RECOVERY_COORDINATOR_SPEC_VERSION,
+      coordinatorSpecVersion,
       now(),
     );
 
@@ -406,10 +421,34 @@ export function createTrueForgeSessionService(
     });
   }
 
-  async function ensureCoordinatorV2(
+  async function ensureCoordinatorForIncident(
     incidentId: string,
     ensured?: TrueForgeSessionEnsureResult,
   ): Promise<TrueForgeSessionEnsureResult> {
+    // Resolve the path from durable incident state on every call. In
+    // particular, an environment hook mapping can never select the
+    // connection path (or vice versa).
+    const incident = incidentService.getById(incidentId);
+    if (incident === null) {
+      throw new TrueForgeIncidentNotFoundError(incidentId);
+    }
+    const connectionBacked =
+      incident.applicationConnectionId !== undefined &&
+      incident.applicationConnectionId !== null;
+    const desiredVersion = connectionBacked
+      ? CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION
+      : RECOVERY_COORDINATOR_SPEC_VERSION;
+    const acceptedVersions: string[] = connectionBacked
+      ? [
+          LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+          RECOVERY_COORDINATOR_SPEC_VERSION,
+          CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+        ]
+      : [
+          LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
+          RECOVERY_COORDINATOR_SPEC_VERSION,
+        ];
+
     const session = ensured ?? (await ensure(incidentId));
 
     if (
@@ -421,11 +460,7 @@ export function createTrueForgeSessionService(
     }
 
     const binding = session.binding;
-    if (
-      binding.coordinatorSpecVersion !==
-        LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION &&
-      binding.coordinatorSpecVersion !== RECOVERY_COORDINATOR_SPEC_VERSION
-    ) {
+    if (!acceptedVersions.includes(binding.coordinatorSpecVersion)) {
       throw new TrueForgeUnsupportedCoordinatorSpecError(
         incidentId,
         binding.coordinatorSpecVersion,
@@ -434,8 +469,11 @@ export function createTrueForgeSessionService(
 
     // coordinatorSpecVersion tracks Redrive's semantic spec only. Reapply the
     // desired spec so runtime-selected model and MCP resources stay current on
-    // this same inline session before a turn can begin.
-    const coordinatorAgentSpec = getRecoveryCoordinatorAgentSpec(environment);
+    // this same inline session before a turn can begin. Connection incidents
+    // receive the connection-only prompt and never read legacy hook settings.
+    const coordinatorAgentSpec = connectionBacked
+      ? getConnectionRecoveryCoordinatorAgentSpec(environment)
+      : getRecoveryCoordinatorAgentSpec(environment);
     if (typeof trueForgeClient.updateSession !== "function") {
       throw new TrueForgeSessionSpecUpgradeError(
         incidentId,
@@ -453,30 +491,43 @@ export function createTrueForgeSessionService(
       });
     }
 
-    if (binding.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION) {
+    if (binding.coordinatorSpecVersion === desiredVersion) {
       return session;
     }
 
-    const upgraded = bindingRepository.updateCoordinatorSpecVersion(
-      incidentId,
-      session.sessionId,
-      LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
-      RECOVERY_COORDINATOR_SPEC_VERSION,
-      now(),
-    );
+    // Upgrade one of the explicitly known prior versions. This CAS follows
+    // the remote update, so an active session is never relabeled unless the
+    // corresponding current AgentSpec was accepted first.
+    for (const expectedVersion of acceptedVersions) {
+      if (
+        expectedVersion === desiredVersion ||
+        binding.coordinatorSpecVersion !== expectedVersion
+      ) {
+        continue;
+      }
 
-    if (upgraded !== null) {
-      return resultFor(upgraded, session.outcome, {
-        retryable: session.retryable,
-        reused: session.reused,
-      });
+      const upgraded = bindingRepository.updateCoordinatorSpecVersion(
+        incidentId,
+        session.sessionId,
+        expectedVersion,
+        desiredVersion,
+        now(),
+      );
+
+      if (upgraded !== null) {
+        return resultFor(upgraded, session.outcome, {
+          retryable: session.retryable,
+          reused: session.reused,
+        });
+      }
+      break;
     }
 
     const current = bindingRepository.getByIncidentId(incidentId);
     if (
       current?.state === "ACTIVE" &&
       current.trueForgeSessionId === session.sessionId &&
-      current.coordinatorSpecVersion === RECOVERY_COORDINATOR_SPEC_VERSION
+      current.coordinatorSpecVersion === desiredVersion
     ) {
       return resultFor(current, session.outcome, {
         retryable: session.retryable,
@@ -484,28 +535,48 @@ export function createTrueForgeSessionService(
       });
     }
 
-    if (
-      current !== null &&
-      current !== undefined &&
-      current.coordinatorSpecVersion !==
-        LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION
-    ) {
-      throw new TrueForgeUnsupportedCoordinatorSpecError(
-        incidentId,
-        current.coordinatorSpecVersion,
-      );
+    if (current !== null && current !== undefined) {
+      if (!acceptedVersions.includes(current.coordinatorSpecVersion)) {
+        throw new TrueForgeUnsupportedCoordinatorSpecError(
+          incidentId,
+          current.coordinatorSpecVersion,
+        );
+      }
     }
 
     throw new TrueForgeSessionSpecUpgradeError(
       incidentId,
-      "the durable binding changed before its v2 version could be recorded",
+      connectionBacked
+        ? "the durable binding changed before its connection spec version could be recorded"
+        : "the durable binding changed before its v2 version could be recorded",
     );
+  }
+
+  // Keep the M2.5 API name for existing callers. It now selects the semantic
+  // path exclusively from incident.applicationConnectionId, while legacy
+  // incidents retain the exact m2.5 upgrade rules above.
+  async function ensureCoordinatorV2(
+    incidentId: string,
+    ensured?: TrueForgeSessionEnsureResult,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    return ensureCoordinatorForIncident(incidentId, ensured);
+  }
+
+  // Explicit alias for connection-aware callers and integration tests. It is
+  // intentionally the same selector rather than a caller-provided mode flag.
+  async function ensureCoordinatorConnection(
+    incidentId: string,
+    ensured?: TrueForgeSessionEnsureResult,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    return ensureCoordinatorForIncident(incidentId, ensured);
   }
 
   return {
     getBindingByIncidentId,
     ensureTrueForgeSession: ensure,
     ensureCoordinatorV2,
+    ensureCoordinatorConnection,
+    ensureCoordinatorForIncident,
   };
 }
 

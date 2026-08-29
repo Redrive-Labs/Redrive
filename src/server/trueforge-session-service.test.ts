@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getConnectionRecoveryCoordinatorAgentSpec,
   getRecoveryCoordinatorAgentSpec,
+  CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION,
   RECOVERY_COORDINATOR_SPEC_VERSION,
   RecoveryCoordinatorConfigurationError,
@@ -38,15 +40,25 @@ describe("TrueForge incident session spine", () => {
   let databasePath: string;
   let database: SqliteDatabase;
   const configuredModel = "openrouter/free-model";
-  const configuredMcpName = "redrive-github";
+  const configuredMcpName = "legacy-github";
+  const configuredConnectionMcpName = "redrive-github";
+  const makeConnectionEnvironment = () => ({
+    ...process.env,
+    REDRIVE_TRUEFORGE_MODEL: configuredModel,
+    REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: configuredConnectionMcpName,
+    REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
+  });
   let originalModel: string | undefined;
   let originalMcpName: string | undefined;
+  let originalConnectionMcpName: string | undefined;
 
   beforeEach(() => {
     originalModel = process.env.REDRIVE_TRUEFORGE_MODEL;
     originalMcpName = process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME;
+    originalConnectionMcpName = process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME;
     process.env.REDRIVE_TRUEFORGE_MODEL = configuredModel;
     process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME = configuredMcpName;
+    process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME = configuredConnectionMcpName;
     testDirectory = mkdtempSync(
       path.join(os.tmpdir(), "redrive-trueforge-session-"),
     );
@@ -67,6 +79,11 @@ describe("TrueForge incident session spine", () => {
     } else {
       process.env.REDRIVE_TRUEFORGE_GITHUB_MCP_NAME = originalMcpName;
     }
+    if (originalConnectionMcpName === undefined) {
+      delete process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME;
+    } else {
+      process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME = originalConnectionMcpName;
+    }
 
     const resolvedDirectory = path.resolve(testDirectory);
     if (
@@ -84,6 +101,38 @@ describe("TrueForge incident session spine", () => {
       externalDeliveryId: `delivery-${crypto.randomUUID()}`,
       repositoryId: "example/receiver",
     }).incident;
+  }
+
+  function makeConnectionBacked(incidentId: string): string {
+    const connectionId = `connection-${incidentId}`;
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`app-${incidentId}`, "app-id", "redrive", "owner-id", "octocat", "User", "key", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO github_installations
+        (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`installation-${incidentId}`, `app-${incidentId}`, "owner-id", "octocat", "User", "selected", "2026-01-01", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      `INSERT INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [connectionId, "github", `installation-${incidentId}`, "repository-id", "octocat/receiver", "hook-id", "https://receiver.example/webhook", "READY", "2026-01-01", "2026-01-01"],
+    );
+    database.run(
+      "UPDATE incidents SET application_connection_id = ? WHERE id = ?",
+      [connectionId, incidentId],
+    );
+    return connectionId;
   }
 
   function insertActiveBinding(incidentId: string, version: string): void {
@@ -862,6 +911,62 @@ describe("TrueForge incident session spine", () => {
     expect(client.updateSession).toHaveBeenCalledWith(
       "existing-session",
       getRecoveryCoordinatorAgentSpec(environment),
+    );
+  });
+
+  it("creates a connection-backed session with the m2.6b spec", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    const client = createFakeClient();
+    client.createSession.mockResolvedValue("connection-session");
+    const connectionEnvironment = makeConnectionEnvironment();
+
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      connectionEnvironment,
+    );
+
+    const result = await service.ensureTrueForgeSession(incident.id);
+
+    expect(result).toMatchObject({
+      state: "ACTIVE",
+      sessionId: "connection-session",
+      outcome: "CREATED",
+      binding: { coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION },
+    });
+    expect(client.createSession).toHaveBeenCalledWith(
+      getConnectionRecoveryCoordinatorAgentSpec(connectionEnvironment)
+    );
+  });
+
+  it("upgrades a legacy connection session in place without a replacement", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(incident.id, LEGACY_RECOVERY_COORDINATOR_SPEC_VERSION);
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    const connectionEnvironment = makeConnectionEnvironment();
+
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      connectionEnvironment,
+    );
+
+    const result = await service.ensureCoordinatorForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      state: "ACTIVE",
+      sessionId: "existing-session",
+      binding: { coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION },
+    });
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(connectionEnvironment),
     );
   });
 

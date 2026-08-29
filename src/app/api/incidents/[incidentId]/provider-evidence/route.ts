@@ -3,6 +3,7 @@ import { GithubMcpConfigurationError } from "@/server/github-mcp";
 import { getIncidentById } from "@/server/incident-service";
 import { GithubDeliveryNormalizationError } from "@/server/github-provider-evidence";
 import {
+  ConnectionBackedProviderEvidenceUnsupportedError,
   IncidentNotFoundError,
   ProviderEvidenceReadError,
   UnsupportedProviderEvidenceError,
@@ -68,6 +69,13 @@ function providerEvidenceErrorResponse(
     return NextResponse.json(
       { error: "Incident not found." },
       { status: 404 },
+    );
+  }
+
+  if (error instanceof ConnectionBackedProviderEvidenceUnsupportedError) {
+    return NextResponse.json(
+      { error: error.message },
+      { status: 422 },
     );
   }
 
