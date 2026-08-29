@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/operator-auth";
 
 const mocks = vi.hoisted(() => ({
   deliveryService: {
@@ -25,12 +26,17 @@ import { GET, POST } from "@/app/api/mcp/github/route";
 
 const token = "route-test-token";
 
-function rpcRequest(body: unknown, authorization = `Bearer ${token}`): Request {
+function rpcRequest(
+  body: unknown,
+  authorization = `Bearer ${token}`,
+  cookie?: string,
+): Request {
   return new Request("http://redrive.test/api/mcp/github", {
     method: "POST",
     headers: {
       authorization,
       "content-type": "application/json",
+      ...(cookie ? { cookie } : {}),
     },
     body: JSON.stringify(body),
   });
@@ -77,6 +83,21 @@ describe("production GitHub MCP route", () => {
       "connection-1",
       "delivery-1",
     );
+  });
+
+  it("does not accept an operator cookie as MCP authentication", async () => {
+    const operatorSession = createOperatorSession({
+      REDRIVE_OPERATOR_TOKEN: "operator-token-that-is-at-least-32-characters",
+    } as unknown as NodeJS.ProcessEnv);
+    const response = await POST(
+      rpcRequest(
+        { jsonrpc: "2.0", id: "operator-cookie", method: "tools/list" },
+        "Bearer wrong-token",
+        `${OPERATOR_SESSION_COOKIE}=${operatorSession}`,
+      ),
+    );
+    expect(response.status).toBe(401);
+    expect(mocks.getServerConfig).not.toHaveBeenCalled();
   });
 
   it("rejects authentication before configuration and database construction", async () => {

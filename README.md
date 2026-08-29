@@ -100,6 +100,14 @@ See:
 
 Active hackathon development.
 
+## Operator access
+
+Redrive is currently a single-operator, self-hosted control plane. Configure a
+high-entropy `REDRIVE_OPERATOR_TOKEN` of at least 32 characters. The operator
+UI and control APIs require login at `/login`. GitHub callbacks retain their
+state-token authentication, and `/api/mcp/github` retains separate bearer
+authentication.
+
 ## Run the control plane locally
 
 Requirements: Node.js 22 or newer and npm.
