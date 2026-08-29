@@ -506,6 +506,75 @@ describe("TrueForge provider investigation", () => {
     );
   });
 
+  it("rejects persisted events for a different turn and does not persist their evidence", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+
+    const persisted = makeStream();
+    const liveEvents = persisted.events
+      .filter(
+        (event) =>
+          event !== null &&
+          typeof event === "object" &&
+          "type" in event &&
+          (event.type === "turn.created" || event.type === "turn.done"),
+      )
+      .map((event) =>
+        event !== null &&
+        typeof event === "object" &&
+        "type" in event &&
+        event.type === "turn.created"
+          ? { ...event, turnId: "turn-A" }
+          : event,
+      );
+    const persistedEvents = persisted.events.map((event) =>
+      event !== null &&
+      typeof event === "object" &&
+      "type" in event &&
+      event.type === "turn.created"
+        ? { ...event, turnId: "turn-B" }
+        : event,
+    );
+    const liveStream = {
+      events: liveEvents,
+      async *[Symbol.asyncIterator]() {
+        for (const event of liveEvents) {
+          yield event as TrueForgeApi.TurnStreamingEvent;
+        }
+      },
+    };
+    const client = createClient(liveStream);
+    client.listTurnEvents.mockResolvedValue(
+      persistedTurnEvents(persistedEvents),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+
+    expect(
+      createProviderEvidenceService(database, null).getByIncidentId(incident.id),
+    ).toBeNull();
+    expect(
+      service
+        .getWorkflowEvents(incident.id)
+        .find((event) => event.eventType === "PROVIDER_INVESTIGATION_FAILED"),
+    ).toMatchObject({
+      eventType: "PROVIDER_INVESTIGATION_FAILED",
+      trueForgeSessionId: "existing-session",
+      turnId: "turn-A",
+      details: {
+        reason: "ProviderInvestigationTurnError",
+        sourceTrueForgeEventId: "turn-created-event",
+      },
+    });
+  });
+
   it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);

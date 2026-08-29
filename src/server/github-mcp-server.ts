@@ -101,13 +101,28 @@ function readConfiguredToken(
   // Keep the M2.6B credential separate from the legacy bridge credential.
   // There is deliberately no fallback: a legacy credential must not authorize
   // reads through this connection-bound production endpoint.
-  const token =
-    suppliedToken ?? environment.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
+  const configuredConnectionToken =
+    environment.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
+  const token = suppliedToken ?? configuredConnectionToken;
   if (typeof token !== "string" || token.length === 0) {
     throw new GithubMcpServerConfigurationError(
       "REDRIVE_GITHUB_CONNECTION_MCP_TOKEN must be configured for the production GitHub MCP.",
     );
   }
+
+  const legacyToken = environment.REDRIVE_GITHUB_MCP_TOKEN;
+  if (
+    typeof legacyToken === "string" &&
+    legacyToken.length > 0 &&
+    ((typeof configuredConnectionToken === "string" &&
+      timingSafeStringEqual(configuredConnectionToken, legacyToken)) ||
+      timingSafeStringEqual(token, legacyToken))
+  ) {
+    throw new GithubMcpServerConfigurationError(
+      "The legacy and connection GitHub MCP credentials must be different.",
+    );
+  }
+
   return token;
 }
 

@@ -61,6 +61,24 @@ describe("Recovery Coordinator v2 spec", () => {
     expect(JSON.stringify(spec)).not.toContain("REDRIVE_GITHUB_HOOK");
   });
 
+  it("accepts distinct legacy and connection MCP credentials", () => {
+    expect(() =>
+      getConnectionRecoveryCoordinatorAgentSpec({
+        ...environment,
+        REDRIVE_GITHUB_MCP_TOKEN: "legacy-token",
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects equal legacy and connection MCP credentials", () => {
+    expect(() =>
+      getConnectionRecoveryCoordinatorAgentSpec({
+        ...environment,
+        REDRIVE_GITHUB_MCP_TOKEN: "connection-token",
+      }),
+    ).toThrow(RecoveryCoordinatorConfigurationError);
+  });
+
   it("rejects a shared legacy and connection MCP resource", () => {
     expect(() =>
       getConnectionRecoveryCoordinatorAgentSpec({

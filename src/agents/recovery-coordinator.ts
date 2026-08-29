@@ -1,4 +1,5 @@
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
+import { timingSafeStringEqual } from "@/domain/github-integration";
 import { GITHUB_WEBHOOK_DELIVERY_TOOL } from "@/server/github-mcp";
 
 export { GITHUB_WEBHOOK_DELIVERY_TOOL };
@@ -120,9 +121,19 @@ export function getConnectionRecoveryCoordinatorAgentSpec(
       `${CONNECTION_TRUEFORGE_GITHUB_MCP_ENV} must name a configured connection-backed TrueForge GitHub MCP server before creating a Coordinator session.`,
     );
   }
-  if (!environment.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN) {
+  const connectionMcpToken = environment.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
+  if (!connectionMcpToken) {
     throw new RecoveryCoordinatorConfigurationError(
       "REDRIVE_GITHUB_CONNECTION_MCP_TOKEN must be configured for the connection-backed GitHub MCP before creating a Coordinator session.",
+    );
+  }
+  const legacyMcpToken = environment.REDRIVE_GITHUB_MCP_TOKEN;
+  if (
+    legacyMcpToken &&
+    timingSafeStringEqual(connectionMcpToken, legacyMcpToken)
+  ) {
+    throw new RecoveryCoordinatorConfigurationError(
+      "The legacy and connection GitHub MCP credentials must be different before creating a Coordinator session.",
     );
   }
   const legacyMcpName = environment[LEGACY_TRUEFORGE_GITHUB_MCP_ENV]?.trim();

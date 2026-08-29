@@ -501,6 +501,7 @@ async function collectTurnLifecycle(
 
 async function collectProviderTurn(
   stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
+  expectedTurnId: string,
   expectedLookup: ProviderLookup,
   expectedMcpServerName: string,
   onAttribution?: (attribution: ProviderTurnAttribution) => void,
@@ -541,7 +542,13 @@ async function collectProviderTurn(
           "TrueForge emitted more than one turn.created event for the turn.",
         );
       }
-      turnId = requiredString(event, "turnId", "turn.created event");
+      const persistedTurnId = requiredString(event, "turnId", "turn.created event");
+      if (persistedTurnId !== expectedTurnId) {
+        throw new ProviderInvestigationTurnError(
+          "TrueForge persisted provider investigation events do not match the completed live turn.",
+        );
+      }
+      turnId = persistedTurnId;
       const eventState = event.state;
       if (!isRecord(eventState) || eventState.status !== "running") {
         throw new ProviderInvestigationTurnError(
@@ -958,6 +965,7 @@ export function createProviderInvestigationService(
         );
         collected = await collectProviderTurn(
           persistedEvents,
+          completedTurnId,
           lookup,
           configuredMcpName,
           (attribution) => {

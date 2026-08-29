@@ -107,6 +107,18 @@ describe("production GitHub MCP route", () => {
     expect(mocks.deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
   });
 
+  it("fails closed when the legacy credential equals the connection credential", async () => {
+    process.env.REDRIVE_GITHUB_MCP_TOKEN = token;
+
+    const response = await POST(
+      rpcRequest({ jsonrpc: "2.0", id: "equal-credentials", method: "tools/list" }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(mocks.getServerConfig).not.toHaveBeenCalled();
+    expect(mocks.deliveryService.getFullFailedDelivery).not.toHaveBeenCalled();
+  });
+
   it("does not expose a GET or a legacy route", async () => {
     const response = await GET();
     expect(response.status).toBe(405);
