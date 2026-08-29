@@ -232,20 +232,24 @@ function runIndependentDatabaseOpener(
   databasePath: string,
 ): Promise<DatabaseOpenerResult> {
   const source = `
+    const { writeSync } = require("node:fs");
     const { openDatabase } = require(process.argv[1]);
     const database = openDatabase(process.argv[2]);
 
     try {
-      process.stdout.write(JSON.stringify({
+      const output = JSON.stringify({
         migrationVersions: database
           .all("SELECT version FROM schema_migrations ORDER BY version")
           .map((row) => row.version),
         incidentCount: database
           .get("SELECT COUNT(*) AS count FROM incidents")
           .count,
-      }));
-    } finally {
+      });
+      writeSync(1, output);
       database.close();
+    } catch (error) {
+      database.close();
+      throw error;
     }
   `;
 
@@ -276,6 +280,31 @@ function runIndependentDatabaseOpener(
       resolve({ code, signal, stderr, stdout });
     });
   });
+}
+
+function parseIndependentDatabaseOpenerResult(
+  result: DatabaseOpenerResult,
+  index: number,
+): { migrationVersions: number[]; incidentCount: number } {
+  try {
+    expect(result.code, `database opener ${index} exit code`).toBe(0);
+    expect(result.signal, `database opener ${index} signal`).toBeNull();
+    return JSON.parse(result.stdout) as {
+      migrationVersions: number[];
+      incidentCount: number;
+    };
+  } catch (error) {
+    throw new Error(
+      [
+        `Independent database opener ${index} produced invalid output.`,
+        `exit code: ${String(result.code)}`,
+        `signal: ${String(result.signal)}`,
+        `stdout: ${JSON.stringify(result.stdout)}`,
+        `stderr: ${JSON.stringify(result.stderr)}`,
+        `cause: ${error instanceof Error ? error.message : String(error)}`,
+      ].join("\n"),
+    );
+  }
 }
 
 
@@ -529,7 +558,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 },
+      { version: 7 }, { version: 8 }, { version: 9 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -620,7 +649,7 @@ describe("native SQLite persistence", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
-      { version: 7 }, { version: 8 },
+      { version: 7 }, { version: 8 }, { version: 9 },
     ]);
     expect(
       database.all<{
@@ -725,7 +754,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 },
+      { version: 7 }, { version: 8 }, { version: 9 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -859,7 +888,7 @@ describe("native SQLite persistence", () => {
         "SELECT version FROM schema_migrations ORDER BY version",
       )).toEqual([
         { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
-        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
+        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 },
       ]);
       expect(upgraded.get("SELECT * FROM incidents")).toEqual({
         ...before.incident,
@@ -895,22 +924,9 @@ describe("native SQLite persistence", () => {
       ),
     );
 
-    expect(
-      results.map((result) => ({
-        code: result.code,
-        signal: result.signal,
-      })),
-    ).toEqual(
+    expect(results.map(parseIndependentDatabaseOpenerResult)).toEqual(
       Array.from({ length: openerCount }, () => ({
-        code: 0,
-        signal: null,
-      })),
-    );
-    expect(
-      results.map((result) => JSON.parse(result.stdout)),
-    ).toEqual(
-      Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8],
+        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9],
         incidentCount: 0,
       })),
     );
@@ -928,7 +944,7 @@ describe("native SQLite persistence", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
-        { version: 7 }, { version: 8 },
+        { version: 7 }, { version: 8 }, { version: 9 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(

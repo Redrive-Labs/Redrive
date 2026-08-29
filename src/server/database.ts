@@ -67,6 +67,75 @@ const incidentWorkflowEventsTableSql = `
     ON incident_workflow_events (incident_id, occurred_at, id);
 `;
 
+const receiverConnectorTablesSql = `
+  CREATE TABLE receiver_connections (
+    id TEXT PRIMARY KEY NOT NULL,
+    application_connection_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'WAITING_FOR_RECEIVER',
+        'VERIFYING',
+        'READY',
+        'UNHEALTHY'
+      )
+    ),
+    enrollment_token_hash TEXT,
+    enrollment_expires_at TEXT,
+    enrollment_consumed_at TEXT,
+    connector_id TEXT UNIQUE,
+    connector_secret_hash TEXT,
+    protocol_version TEXT,
+    capabilities_json TEXT,
+    enrolled_at TEXT,
+    last_seen_at TEXT,
+    last_health_status TEXT CHECK (
+      last_health_status IS NULL OR last_health_status IN ('HEALTHY', 'UNHEALTHY')
+    ),
+    last_health_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (application_connection_id)
+      REFERENCES application_connections (id)
+      ON DELETE CASCADE
+  );
+
+  CREATE INDEX receiver_connections_state_idx
+    ON receiver_connections (state, updated_at, id);
+
+  CREATE TABLE receiver_read_jobs (
+    id TEXT PRIMARY KEY NOT NULL,
+    receiver_connection_id TEXT NOT NULL,
+    capability TEXT NOT NULL CHECK (
+      capability IN ('business_state:v1', 'health:v1')
+    ),
+    input_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+      state IN ('QUEUED', 'LEASED', 'SUCCEEDED', 'FAILED', 'EXPIRED')
+    ),
+    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+    leased_connector_id TEXT,
+    lease_expires_at TEXT,
+    deadline_at TEXT NOT NULL,
+    result_json TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (receiver_connection_id)
+      REFERENCES receiver_connections (id)
+      ON DELETE CASCADE
+  );
+
+  CREATE INDEX receiver_read_jobs_queue_idx
+    ON receiver_read_jobs (
+      receiver_connection_id,
+      state,
+      deadline_at,
+      created_at,
+      id
+    );
+`;
+
 const migrations: Migration[] = [
   {
     version: 1,
@@ -258,6 +327,10 @@ const migrations: Migration[] = [
       ALTER TABLE github_manifest_attempts
         ADD COLUMN private_key_sha256 TEXT;
     `,
+  },
+  {
+    version: 9,
+    sql: receiverConnectorTablesSql,
   },
 ];
 
