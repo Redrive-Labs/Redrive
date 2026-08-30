@@ -106,7 +106,9 @@ Redrive is currently a single-operator, self-hosted control plane. Configure a
 high-entropy `REDRIVE_OPERATOR_TOKEN` of at least 32 characters. The operator
 UI and control APIs require login at `/login`. GitHub callbacks retain their
 state-token authentication, and `/api/mcp/github` retains separate bearer
-authentication.
+authentication. The read-only `/api/mcp/receiver` surface uses its own
+`REDRIVE_RECEIVER_MCP_TOKEN` bearer secret; it is independent from operator,
+GitHub MCP, and connector authentication.
 
 ## Run the control plane locally
 
