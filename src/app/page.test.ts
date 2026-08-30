@@ -5,7 +5,7 @@ import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 const mocks = vi.hoisted(() => ({
   listIncidents: vi.fn(),
   getProviderEvidenceCaptureStatus: vi.fn(),
-  getProviderEvidenceByIncidentId: vi.fn(),
+  buildRecoveryCockpitViewModel: vi.fn(),
 }));
 
 vi.mock("@/server/incident-service", () => ({
@@ -13,7 +13,9 @@ vi.mock("@/server/incident-service", () => ({
 }));
 vi.mock("@/server/provider-evidence-service", () => ({
   getProviderEvidenceCaptureStatus: mocks.getProviderEvidenceCaptureStatus,
-  getProviderEvidenceByIncidentId: mocks.getProviderEvidenceByIncidentId,
+}));
+vi.mock("@/server/recovery-cockpit-view-model", () => ({
+  buildRecoveryCockpitViewModel: mocks.buildRecoveryCockpitViewModel,
 }));
 
 import Home from "./page";
@@ -62,9 +64,18 @@ describe("homepage evidence loading", () => {
     mocks.getProviderEvidenceCaptureStatus.mockResolvedValue(
       new Set(["incident-1"]),
     );
+    mocks.buildRecoveryCockpitViewModel.mockResolvedValue({
+      incident: {
+        id: "incident-1",
+        repository: "example/receiver",
+        deliveryId: "delivery-1",
+        status: "OPEN",
+      },
+      sandbox: { state: "NOT_STARTED" },
+    });
   });
 
-  it("loads only capture status and does not load full evidence for each incident", async () => {
+  it("loads the selected durable cockpit plus compact capture status for the incident list", async () => {
     const page = await Home();
 
     expect(mocks.getProviderEvidenceCaptureStatus).toHaveBeenCalledTimes(1);
@@ -72,7 +83,8 @@ describe("homepage evidence loading", () => {
       "incident-1",
       "incident-2",
     ]);
-    expect(mocks.getProviderEvidenceByIncidentId).not.toHaveBeenCalled();
+    expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledTimes(1);
+    expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledWith(incidents[0]);
     expect(findPanels(page).map((props) => props.initialCaptured)).toEqual([
       true,
       false,
