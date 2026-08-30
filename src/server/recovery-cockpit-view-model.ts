@@ -55,7 +55,10 @@ export async function buildRecoveryCockpitViewModel(incident: Incident): Promise
   const binding = createTrueForgeSessionBindingRepository(database).getByIncidentId(incident.id);
   const workflowEvents = createIncidentWorkflowEventService(database).listByIncidentId(incident.id);
   const providerEvent = workflowEvents.findLast((event) => event.eventType === "PROVIDER_EVIDENCE_CAPTURED" || event.eventType === "PROVIDER_EVIDENCE_REOBSERVED");
-  const assessment = provider && receiver ? deriveRecoveryAssessment(provider, receiver) : null;
+  const providerOutcome = provider?.outcome ?? null;
+  const assessment = provider && providerOutcome !== null && receiver
+    ? deriveRecoveryAssessment(provider, receiver)
+    : null;
 
   let changedFiles: string[] | undefined;
   if (attempt?.resultJson && attempt.state === "REPAIR_VERIFIED") {
@@ -96,10 +99,10 @@ export async function buildRecoveryCockpitViewModel(incident: Incident): Promise
       createdAt: incident.createdAt,
       status: incident.status,
     },
-    ...(provider?.outcome.statusCode !== null ? {
+    ...(providerOutcome !== null && providerOutcome.statusCode !== null && providerOutcome.statusCode !== undefined ? {
       provider: {
-        statusCode: provider!.outcome.statusCode,
-        status: provider!.outcome.status,
+        statusCode: providerOutcome.statusCode,
+        status: providerOutcome.status,
         observed: true,
         observedAt: provider!.capturedAt,
         provenance: {
