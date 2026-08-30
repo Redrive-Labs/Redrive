@@ -434,6 +434,59 @@ const migrations: Migration[] = [
         ON recovery_attempts (state, updated_at, id);
     `,
   },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE deploy_permits (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL,
+        recovery_attempt_id TEXT NOT NULL,
+        fingerprint_sha256 TEXT NOT NULL UNIQUE,
+        patch_sha256 TEXT NOT NULL,
+        deployment_target TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN ('APPROVED', 'CONSUMED', 'REVOKED')
+        ),
+        approved_at TEXT NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE recovery_deployments (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL,
+        recovery_attempt_id TEXT NOT NULL UNIQUE,
+        deploy_permit_id TEXT NOT NULL UNIQUE,
+        patch_sha256 TEXT NOT NULL,
+        deployment_target TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'PREPARED',
+            'APPLYING',
+            'VERIFYING',
+            'VERIFIED',
+            'FAILED',
+            'OUTCOME_UNKNOWN'
+          )
+        ),
+        pre_deploy_mutation_count INTEGER,
+        post_deploy_mutation_count INTEGER,
+        health_status_code INTEGER,
+        started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents (id),
+        FOREIGN KEY (deploy_permit_id) REFERENCES deploy_permits (id)
+      );
+
+      CREATE INDEX deploy_permits_incident_idx
+        ON deploy_permits (incident_id, created_at, id);
+      CREATE INDEX recovery_deployments_incident_idx
+        ON recovery_deployments (incident_id, created_at, id);
+    `,
+  },
 ];
 
 export class SqliteDatabase {

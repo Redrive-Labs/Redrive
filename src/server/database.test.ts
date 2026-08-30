@@ -402,6 +402,67 @@ describe("native SQLite persistence", () => {
     expect(database.pragma("busy_timeout", { simple: true })).toBe(5000);
   });
 
+  it("applies recovery migration 12 before deployment migration 13", () => {
+    expect(
+      database.all<{ version: number }>(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ).map(({ version }) => version),
+    ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(
+      database.all<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('deploy_permits', 'recovery_deployments', 'recovery_attempts') ORDER BY name",
+      ),
+    ).toEqual([
+      { name: "deploy_permits" },
+      { name: "recovery_attempts" },
+      { name: "recovery_deployments" },
+    ]);
+    expect(
+      database.all<{ name: string; notnull: number }>(
+        "PRAGMA table_info('deploy_permits')",
+      ).map(({ name, notnull }) => ({ name, notnull })),
+    ).toEqual([
+      { name: "id", notnull: 1 },
+      { name: "incident_id", notnull: 1 },
+      { name: "recovery_attempt_id", notnull: 1 },
+      { name: "fingerprint_sha256", notnull: 1 },
+      { name: "patch_sha256", notnull: 1 },
+      { name: "deployment_target", notnull: 1 },
+      { name: "state", notnull: 1 },
+      { name: "approved_at", notnull: 1 },
+      { name: "consumed_at", notnull: 0 },
+      { name: "created_at", notnull: 1 },
+    ]);
+    expect(
+      database.all<{ name: string; notnull: number }>(
+        "PRAGMA table_info('recovery_deployments')",
+      ).map(({ name, notnull }) => ({ name, notnull })),
+    ).toEqual([
+      { name: "id", notnull: 1 },
+      { name: "incident_id", notnull: 1 },
+      { name: "recovery_attempt_id", notnull: 1 },
+      { name: "deploy_permit_id", notnull: 1 },
+      { name: "patch_sha256", notnull: 1 },
+      { name: "deployment_target", notnull: 1 },
+      { name: "state", notnull: 1 },
+      { name: "pre_deploy_mutation_count", notnull: 0 },
+      { name: "post_deploy_mutation_count", notnull: 0 },
+      { name: "health_status_code", notnull: 0 },
+      { name: "started_at", notnull: 0 },
+      { name: "completed_at", notnull: 0 },
+      { name: "created_at", notnull: 1 },
+      { name: "updated_at", notnull: 1 },
+    ]);
+    expect(
+      database.all<{ table: string; from: string; to: string; on_delete: string }>(
+        "PRAGMA foreign_key_list('recovery_deployments')",
+      ).map(({ table, from, to, on_delete }) => ({ table, from, to, on_delete })),
+    ).toEqual([
+      { table: "deploy_permits", from: "deploy_permit_id", to: "id", on_delete: "NO ACTION" },
+      { table: "incidents", from: "incident_id", to: "id", on_delete: "NO ACTION" },
+    ]);
+  });
+
   it("creates the approved TrueForge binding schema and constraints on a fresh database", () => {
     const columns = database.all<{
       name: string;
@@ -558,7 +619,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -649,7 +710,7 @@ describe("native SQLite persistence", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
     ]);
     expect(
       database.all<{
@@ -754,7 +815,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -888,7 +949,7 @@ describe("native SQLite persistence", () => {
         "SELECT version FROM schema_migrations ORDER BY version",
       )).toEqual([
         { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
-        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
       ]);
       expect(upgraded.get("SELECT * FROM incidents")).toEqual({
         ...before.incident,
@@ -990,7 +1051,7 @@ describe("native SQLite persistence", () => {
 
     expect(results.map(parseIndependentDatabaseOpenerResult)).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         incidentCount: 0,
       })),
     );
@@ -1008,7 +1069,7 @@ describe("native SQLite persistence", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
-        { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+        { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(
