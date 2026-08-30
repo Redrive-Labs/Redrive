@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createGithubDeliveryService } from "@/server/github-delivery-service";
-import { createGithubApi } from "@/server/github-rest";
-import { createGithubMcpServer } from "@/server/github-mcp-server";
-import { FilesystemSecretStore } from "@/server/secret-store";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createGithubDeliveryService } from "@/server/github/github-delivery-service";
+import { createGithubApi } from "@/server/github/github-rest";
+import { createGithubMcpServer } from "@/server/github/github-mcp-server";
+import { FilesystemSecretStore } from "@/server/infrastructure/secret-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

@@ -2,8 +2,8 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeConfiguredDatabase, getConfiguredDatabase, openDatabase } from "@/server/database";
-import { FilesystemSecretStore, manifestPrivateKeyReference, SecretStoreError } from "@/server/secret-store";
+import { closeConfiguredDatabase, getConfiguredDatabase, openDatabase } from "@/server/infrastructure/database";
+import { FilesystemSecretStore, manifestPrivateKeyReference, SecretStoreError } from "@/server/infrastructure/secret-store";
 import { POST as startManifest } from "./route";
 import { GET as manifestCallback } from "./callback/route";
 

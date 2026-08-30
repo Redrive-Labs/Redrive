@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeConfiguredDatabase, openDatabase } from "@/server/database";
-import { createInstallationAttempt } from "@/server/github-app-service";
-import { FilesystemSecretStore } from "@/server/secret-store";
+import { closeConfiguredDatabase, openDatabase } from "@/server/infrastructure/database";
+import { createInstallationAttempt } from "@/server/github/github-app-service";
+import { FilesystemSecretStore } from "@/server/infrastructure/secret-store";
 import { GET } from "./callback/route";
 
 const { privateKey } = generateKeyPairSync("rsa", {

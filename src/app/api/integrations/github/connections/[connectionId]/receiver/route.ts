@@ -1,15 +1,15 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { getApplicationConnection } from "@/server/github-connection-service";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { getApplicationConnection } from "@/server/github/github-connection-service";
 import {
   getReceiverConnectionForApplication,
-} from "@/server/receiver-connection-service";
+} from "@/server/receiver/receiver-connection-service";
 import {
   receiverErrorResponse,
   requireOperatorSession,
   toSafeReceiverConnection,
-} from "@/server/receiver-route-utils";
+} from "@/server/receiver/receiver-route-utils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

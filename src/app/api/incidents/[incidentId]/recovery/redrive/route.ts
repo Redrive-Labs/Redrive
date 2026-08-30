@@ -3,13 +3,13 @@ import {
   readReceiverJson,
   ReceiverRouteBodyError,
   requireOperatorSession,
-} from "@/server/receiver-route-utils";
+} from "@/server/receiver/receiver-route-utils";
 import {
   createConfiguredRedriveService,
   parseRedriveExecuteRequest,
   RedriveError,
   RedriveRequestError,
-} from "@/server/redrive-service";
+} from "@/server/recovery/redrive-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

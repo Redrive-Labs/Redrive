@@ -1,6 +1,6 @@
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
-import { GITHUB_WEBHOOK_DELIVERY_TOOL } from "@/server/github-mcp";
-import { RECEIVER_MCP_BUSINESS_STATE_TOOL } from "@/server/receiver-mcp-server";
+import { GITHUB_WEBHOOK_DELIVERY_TOOL } from "@/server/github/github-mcp";
+import { RECEIVER_MCP_BUSINESS_STATE_TOOL } from "@/server/receiver/receiver-mcp-server";
 
 export { GITHUB_WEBHOOK_DELIVERY_TOOL };
 

@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createReceiverConnectionService } from "@/server/receiver-connection-service";
-import { createReceiverReadJobTransportService } from "@/server/receiver-read-job-service";
-import { createReceiverMcpServer } from "@/server/receiver-mcp-server";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createReceiverConnectionService } from "@/server/receiver/receiver-connection-service";
+import { createReceiverReadJobTransportService } from "@/server/receiver/receiver-read-job-service";
+import { createReceiverMcpServer } from "@/server/receiver/receiver-mcp-server";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

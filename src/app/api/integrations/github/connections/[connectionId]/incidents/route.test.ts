@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeConfiguredDatabase, openDatabase } from "@/server/database";
-import { FilesystemSecretStore } from "@/server/secret-store";
+import { closeConfiguredDatabase, openDatabase } from "@/server/infrastructure/database";
+import { FilesystemSecretStore } from "@/server/infrastructure/secret-store";
 import { POST } from "./route";
 import { GET as listDeliveries } from "../deliveries/route";
 

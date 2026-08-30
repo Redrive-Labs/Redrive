@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getIncidentById } from "@/server/incident-service";
-import { getProviderEvidenceByIncidentId } from "@/server/provider-evidence-service";
+import { getIncidentById } from "@/server/incidents/incident-service";
+import { getProviderEvidenceByIncidentId } from "@/server/incidents/provider-evidence-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

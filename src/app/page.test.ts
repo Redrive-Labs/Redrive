@@ -8,13 +8,13 @@ const mocks = vi.hoisted(() => ({
   buildRecoveryCockpitViewModel: vi.fn(),
 }));
 
-vi.mock("@/server/incident-service", () => ({
+vi.mock("@/server/incidents/incident-service", () => ({
   listIncidents: mocks.listIncidents,
 }));
-vi.mock("@/server/provider-evidence-service", () => ({
+vi.mock("@/server/incidents/provider-evidence-service", () => ({
   getProviderEvidenceCaptureStatus: mocks.getProviderEvidenceCaptureStatus,
 }));
-vi.mock("@/server/recovery-cockpit-view-model", () => ({
+vi.mock("@/server/recovery/recovery-cockpit-view-model", () => ({
   buildRecoveryCockpitViewModel: mocks.buildRecoveryCockpitViewModel,
 }));
 

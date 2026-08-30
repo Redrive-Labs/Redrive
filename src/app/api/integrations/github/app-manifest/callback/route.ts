@@ -11,19 +11,19 @@ import {
   markManifestAttemptRecovery,
   parseManifestConversion,
   recordManifestConversionCheckpoint,
-} from "@/server/github-app-service";
+} from "@/server/github/github-app-service";
 import {
   deriveRedriveUrl,
   getRequiredRedrivePublicUrl,
   getServerConfig,
   ServerConfigurationError,
-} from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createGithubApi, GithubRestError } from "@/server/github-rest";
+} from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createGithubApi, GithubRestError } from "@/server/github/github-rest";
 import {
   FilesystemSecretStore,
   SecretStoreError,
-} from "@/server/secret-store";
+} from "@/server/infrastructure/secret-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

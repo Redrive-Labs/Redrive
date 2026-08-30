@@ -6,12 +6,12 @@ import {
   DeploymentNotEligibleError,
   DeploymentNotFoundError,
   DeploymentPermitError,
-} from "@/server/recovery-deployment-service";
+} from "@/server/recovery/recovery-deployment-service";
 import {
   readReceiverJson,
   ReceiverRouteBodyError,
   requireOperatorSession,
-} from "@/server/receiver-route-utils";
+} from "@/server/receiver/receiver-route-utils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createReceiverEnrollmentService } from "@/server/receiver-connection-service";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createReceiverEnrollmentService } from "@/server/receiver/receiver-connection-service";
 import {
   parseReceiverEnrollmentAction,
   readReceiverJson,
   receiverErrorResponse,
   requireOperatorSession,
   toSafeReceiverConnection,
-} from "@/server/receiver-route-utils";
+} from "@/server/receiver/receiver-route-utils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

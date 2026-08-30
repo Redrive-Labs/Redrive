@@ -8,7 +8,7 @@ import {
   parseOperatorToken,
   readBoundedRequestText,
   shouldUseSecureOperatorCookie,
-} from "@/server/operator-auth";
+} from "@/server/auth/operator-auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
