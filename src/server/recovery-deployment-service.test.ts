@@ -119,25 +119,6 @@ function insertApplicationConnection(database: SqliteDatabase): void {
   );
 }
 
-function createRecoveryAttemptsPrerequisite(database: SqliteDatabase): void {
-  database.exec(`
-    CREATE TABLE recovery_attempts (
-      id TEXT PRIMARY KEY NOT NULL,
-      incident_id TEXT NOT NULL,
-      state TEXT NOT NULL,
-      source_repository_full_name TEXT NOT NULL,
-      original_revision TEXT NOT NULL,
-      delivery_guid TEXT NOT NULL,
-      patch_text TEXT NOT NULL,
-      patch_sha256 TEXT NOT NULL,
-      verification_pre_count INTEGER,
-      verification_http_status INTEGER,
-      verification_post_count INTEGER,
-      verified_at TEXT
-    );
-  `);
-}
-
 function insertAttempt(
   database: SqliteDatabase,
   overrides: Partial<{
@@ -156,16 +137,21 @@ function insertAttempt(
   const patchText = overrides.patchText ?? PATCH_TEXT;
   database.run(
     `INSERT INTO recovery_attempts (
-      id, incident_id, state, source_repository_full_name, original_revision,
-      delivery_guid, patch_text, patch_sha256, verification_pre_count,
-      verification_http_status, verification_post_count, verified_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, incident_id, state, recovery_spec_version,
+      source_repository_full_name, original_revision, provider_status_code,
+      receiver_pre_count, delivery_guid, patch_text, patch_sha256,
+      verification_pre_count, verification_http_status,
+      verification_post_count, created_at, updated_at, verified_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       overrides.id ?? ATTEMPT_ID,
       INCIDENT_ID,
       overrides.state ?? "REPAIR_VERIFIED",
+      "redrive.recovery.v1",
       overrides.sourceRepositoryFullName ?? REPOSITORY_FULL_NAME,
       overrides.originalRevision ?? ORIGINAL_REVISION,
+      500,
+      1,
       overrides.deliveryGuid ?? DELIVERY_GUID,
       patchText,
       overrides.patchSha256 ?? patchDigest(patchText),
@@ -178,6 +164,8 @@ function insertAttempt(
       overrides.verificationPostCount === undefined
         ? 1
         : overrides.verificationPostCount,
+      START,
+      START,
       START,
     ],
   );
@@ -243,7 +231,6 @@ describe("recovery deployment slice", () => {
     database = openDatabase(path.join(testDirectory, "redrive.sqlite"));
     databaseForRunner = database;
     insertApplicationConnection(database);
-    createRecoveryAttemptsPrerequisite(database);
     environment = {
       REDRIVE_DEMO_RECEIVER_REPO_PATH: targetDirectory,
     } as unknown as NodeJS.ProcessEnv;
@@ -373,8 +360,13 @@ describe("recovery deployment slice", () => {
       INCIDENT_ID,
       computeDeploymentFingerprint(candidate),
     );
-    database.run("UPDATE recovery_attempts SET state = 'REPAIR_GENERATED' WHERE id = ?", [ATTEMPT_ID]);
-    insertAttempt(database, { id: "attempt-deploy-2", patchText: "new patch\n" });
+    const replacementPatch = "new patch\n";
+    database.run(
+      `UPDATE recovery_attempts
+       SET id = ?, patch_text = ?, patch_sha256 = ?, updated_at = ?
+       WHERE id = ?`,
+      ["attempt-deploy-2", replacementPatch, patchDigest(replacementPatch), START, ATTEMPT_ID],
+    );
 
     await expectDeployRejection(
       deployment.deploy(INCIDENT_ID, permit.id),

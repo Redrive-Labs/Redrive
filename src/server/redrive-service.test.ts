@@ -15,6 +15,7 @@ import type { RedriveGithubService } from "@/server/redrive-service";
 const INCIDENT_ID = "incident-1";
 const CONNECTION_ID = "connection-1";
 const ATTEMPT_ID = "attempt-1";
+const DEPLOY_PERMIT_ID = "deploy-permit-1";
 const DEPLOYMENT_ID = "deployment-1";
 const DELIVERY_ID = "original-delivery-1";
 const DELIVERY_GUID = "delivery-guid-1";
@@ -42,33 +43,6 @@ describe("redrive service", () => {
   beforeEach(() => {
     directory = mkdtempSync(path.join(os.tmpdir(), "redrive-c-test-"));
     database = openDatabase(path.join(directory, "records.sqlite"));
-    database.exec(`
-      CREATE TABLE recovery_attempts (
-        id TEXT PRIMARY KEY,
-        incident_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        delivery_guid TEXT NOT NULL,
-        patch_sha256 TEXT NOT NULL,
-        provider_status_code INTEGER NOT NULL,
-        receiver_pre_count INTEGER NOT NULL,
-        verification_pre_count INTEGER NOT NULL,
-        verification_http_status INTEGER NOT NULL,
-        verification_post_count INTEGER NOT NULL,
-        verified_at TEXT NOT NULL
-      );
-      CREATE TABLE recovery_deployments (
-        id TEXT PRIMARY KEY,
-        incident_id TEXT NOT NULL,
-        recovery_attempt_id TEXT NOT NULL,
-        patch_sha256 TEXT NOT NULL,
-        deployment_target TEXT NOT NULL,
-        state TEXT NOT NULL,
-        pre_deploy_mutation_count INTEGER NOT NULL,
-        post_deploy_mutation_count INTEGER NOT NULL,
-        health_status_code INTEGER NOT NULL,
-        completed_at TEXT NOT NULL
-      );
-    `);
     database.run(
       `INSERT INTO github_app_registrations
        (id, github_app_id, slug, owner_id, owner_login, owner_type, private_key_ref, created_at, updated_at)
@@ -95,18 +69,35 @@ describe("redrive service", () => {
     );
     database.run(
       `INSERT INTO recovery_attempts
-       (id, incident_id, state, delivery_guid, patch_sha256, provider_status_code,
-        receiver_pre_count, verification_pre_count, verification_http_status,
-        verification_post_count, verified_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [ATTEMPT_ID, INCIDENT_ID, "REPAIR_VERIFIED", DELIVERY_GUID, PATCH_SHA256, 500, 1, 1, 201, 1, STARTED_AT],
+       (id, incident_id, state, recovery_spec_version,
+        source_repository_full_name, original_revision, provider_status_code,
+        receiver_pre_count, delivery_guid, patch_text, patch_sha256,
+        verification_pre_count, verification_http_status,
+        verification_post_count, created_at, updated_at, verified_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [ATTEMPT_ID, INCIDENT_ID, "REPAIR_VERIFIED", "redrive.recovery.v1",
+        "octocat/receiver", "5bfadf93d5233e4e6cfe0fdb19ad1b78328a5d79", 500,
+        1, DELIVERY_GUID, "verified patch", PATCH_SHA256, 1, 201, 1,
+        STARTED_AT, STARTED_AT, STARTED_AT],
+    );
+    database.run(
+      `INSERT INTO deploy_permits
+       (id, incident_id, recovery_attempt_id, fingerprint_sha256, patch_sha256,
+        deployment_target, state, approved_at, consumed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'CONSUMED', ?, ?, ?)`,
+      [DEPLOY_PERMIT_ID, INCIDENT_ID, ATTEMPT_ID, "d".repeat(64), PATCH_SHA256,
+        REDRIVE_DEPLOYMENT_TARGET, STARTED_AT, STARTED_AT, STARTED_AT],
     );
     database.run(
       `INSERT INTO recovery_deployments
-       (id, incident_id, recovery_attempt_id, patch_sha256, deployment_target, state,
-        pre_deploy_mutation_count, post_deploy_mutation_count, health_status_code, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [DEPLOYMENT_ID, INCIDENT_ID, ATTEMPT_ID, PATCH_SHA256, REDRIVE_DEPLOYMENT_TARGET, "VERIFIED", 1, 1, 200, STARTED_AT],
+       (id, incident_id, recovery_attempt_id, deploy_permit_id, patch_sha256,
+        deployment_target, state, pre_deploy_mutation_count,
+        post_deploy_mutation_count, health_status_code, started_at,
+        completed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [DEPLOYMENT_ID, INCIDENT_ID, ATTEMPT_ID, DEPLOY_PERMIT_ID, PATCH_SHA256,
+        REDRIVE_DEPLOYMENT_TARGET, "VERIFIED", 1, 1, 200, STARTED_AT,
+        STARTED_AT, STARTED_AT, STARTED_AT],
     );
   });
 
