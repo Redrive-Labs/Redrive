@@ -80,6 +80,14 @@ describe("GitHub App manifest routes", () => {
     expect(html).toContain('method="post"');
     expect(html).toContain('name="manifest"');
     expect(html).toContain("https://github.com/organizations/acme/settings/apps/new?state=");
+    expect(html).toContain('<meta name="viewport" content="width=device-width, initial-scale=1">');
+    expect(html).toContain("<h1 id=\"page-title\">Connect GitHub</h1>");
+    expect(html).toContain("Redrive creates a narrowly scoped GitHub App for delivery investigation.");
+    expect(html).toContain("Read webhook delivery evidence");
+    expect(html).toContain("Install only on repositories you choose");
+    expect(html).toContain("Recovery actions remain separately human-gated");
+    expect(html).toContain(">Continue to GitHub</button>");
+    expect(html).toContain("You’ll review the requested permissions on GitHub before creating the app.");
   });
 
   it("converts once, stores the PEM outside SQLite, and safely handles a duplicate callback", async () => {
