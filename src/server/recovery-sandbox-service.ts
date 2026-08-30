@@ -330,16 +330,31 @@ function parseArtifactToolResponse(
         "the required sandbox artifact read failed.",
       );
     }
-    const exitCode = parsed.exitCode ?? parsed.exit_code;
-    if (typeof exitCode !== "undefined") {
-      if (exitCode !== 0 || typeof parsed.stdout !== "string") {
+    if (Object.prototype.hasOwnProperty.call(parsed, "response")) {
+      const response = parsed.response;
+      if (
+        parsed.success !== true ||
+        !isRecord(response) ||
+        response.exitCode !== 0 ||
+        typeof response.result !== "string"
+      ) {
         throw new RecoverySandboxTurnError(
           "the required sandbox artifact exec did not succeed.",
         );
       }
-      artifactText = parsed.stdout;
-    } else if (typeof parsed.output === "string") {
-      artifactText = parsed.output;
+      artifactText = response.result;
+    } else {
+      const exitCode = parsed.exitCode ?? parsed.exit_code;
+      if (typeof exitCode !== "undefined") {
+        if (exitCode !== 0 || typeof parsed.stdout !== "string") {
+          throw new RecoverySandboxTurnError(
+            "the required sandbox artifact exec did not succeed.",
+          );
+        }
+        artifactText = parsed.stdout;
+      } else if (typeof parsed.output === "string") {
+        artifactText = parsed.output;
+      }
     }
   }
 

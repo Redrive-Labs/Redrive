@@ -391,6 +391,34 @@ describe("sandbox recovery orchestration", () => {
 
     await expect(
       collectRecoveryTurn(
+        persistedEvents(valid, "trueforge-exec-envelope", {
+          toolResponse: JSON.stringify({
+            success: true,
+            response: { exitCode: 0, result: JSON.stringify(valid) },
+          }),
+        }),
+        "session-1",
+        "trueforge-exec-envelope",
+        expectedIdentity,
+      ),
+    ).resolves.toMatchObject({ artifact: valid });
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents(valid, "failed-trueforge-exec-envelope", {
+          toolResponse: JSON.stringify({
+            success: true,
+            response: { exitCode: 1, result: JSON.stringify(valid) },
+          }),
+        }),
+        "session-1",
+        "failed-trueforge-exec-envelope",
+        expectedIdentity,
+      ),
+    ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+
+    await expect(
+      collectRecoveryTurn(
         persistedEvents(valid, "wrong-path", {
           toolArguments: JSON.stringify({ path: "/tmp/artifact.json" }),
         }),
