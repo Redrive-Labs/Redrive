@@ -39,7 +39,9 @@ export const PROVIDER_INVESTIGATOR_NAME = "provider-investigator" as const;
 const CREATE_SUB_AGENT_TOOL = "create_sub_agent" as const;
 const EXEC_TOOL = "exec" as const;
 const READ_FILE_TOOL = "read_file" as const;
+const GET_TOOL_OUTPUT_SCHEMA_TOOL = "get_tool_output_schema" as const;
 const MAX_SKILL_BOOTSTRAP_CALLS = 8;
+const MAX_SCHEMA_INTROSPECTION_CALLS = 1;
 const ALLOWED_REDRIVE_SKILL_PATHS = [
   "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md",
   "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md",
@@ -140,6 +142,7 @@ interface CollectedProviderTurn {
 type ProviderToolCategory =
   | "create_sub_agent"
   | "skill_bootstrap"
+  | "schema_introspection"
   | "evidence"
   | "forbidden";
 
@@ -369,6 +372,13 @@ function classifyProviderToolCall(
     return "create_sub_agent";
   }
   if (parseSkillBootstrapPath(toolCall) !== null) return "skill_bootstrap";
+  if (
+    toolCall.toolInfoType === "truefoundry-system" &&
+    toolCall.toolInfoName === GET_TOOL_OUTPUT_SCHEMA_TOOL &&
+    toolCall.functionName === GET_TOOL_OUTPUT_SCHEMA_TOOL
+  ) {
+    return "schema_introspection";
+  }
   if (
     (toolCall.toolInfoType === "mcp" &&
       toolCall.toolInfoServerName === expectedMcpServerName &&
@@ -917,7 +927,7 @@ async function collectProviderTurn(
   if (
     parentToolCalls.some(
       ({ category }) =>
-        category === "forbidden" || category === "evidence",
+        category !== "create_sub_agent" && category !== "skill_bootstrap",
     )
   ) {
     throw new ProviderInvestigationTurnError(
@@ -944,6 +954,14 @@ async function collectProviderTurn(
   if (bootstrapToolCalls.length > MAX_SKILL_BOOTSTRAP_CALLS) {
     throw new ProviderInvestigationTurnError(
       "TrueForge emitted more than the allowed number of skill-bootstrap reads.",
+    );
+  }
+  const schemaIntrospectionToolCalls = childToolCalls.filter(
+    ({ category }) => category === "schema_introspection",
+  );
+  if (schemaIntrospectionToolCalls.length > MAX_SCHEMA_INTROSPECTION_CALLS) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator emitted more than the allowed number of read-only schema-introspection calls.",
     );
   }
 
@@ -1012,6 +1030,13 @@ async function collectProviderTurn(
     if (responsesFor(bootstrap.toolCall).length !== 1) {
       throw new ProviderInvestigationTurnError(
         "TrueForge did not emit exactly one response for a skill-bootstrap read.",
+      );
+    }
+  }
+  for (const introspection of schemaIntrospectionToolCalls) {
+    if (responsesFor(introspection.toolCall).length !== 1) {
+      throw new ProviderInvestigationTurnError(
+        "TrueForge did not emit exactly one response for a schema-introspection call.",
       );
     }
   }

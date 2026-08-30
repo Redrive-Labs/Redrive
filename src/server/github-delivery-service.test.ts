@@ -83,6 +83,39 @@ describe("connection-based GitHub delivery discovery", () => {
     expect(JSON.stringify(database.all("SELECT * FROM application_connections"))).not.toContain("temporary-token");
   });
 
+  it("redelivers through the verified connection and installation-token boundary", async () => {
+    const { database } = fixture();
+    const api = {
+      createInstallationToken: vi.fn(async () => ({ token: "installation-token" })),
+      listInstallationRepositories: vi.fn(async () => [
+        { id: REPOSITORY_ID, full_name: "octocat/receiver", private: true },
+      ]),
+      getRepositoryHook: vi.fn(async () => ({
+        id: WEBHOOK_ID,
+        name: "web",
+        active: true,
+        events: [],
+        config: { url: "https://receiver.example/webhook" },
+      })),
+      redeliverWebhookDelivery: vi.fn(async () => 202),
+    } as unknown as GithubApi;
+    const service = createGithubDeliveryService({
+      database,
+      api,
+      secretStore: new MemorySecretStore(),
+    });
+
+    await expect(
+      service.redeliverWebhookDelivery("connection-1", "delivery-1"),
+    ).resolves.toBe(202);
+    expect(api.redeliverWebhookDelivery).toHaveBeenCalledWith(
+      "octocat/receiver",
+      WEBHOOK_ID,
+      "delivery-1",
+      "installation-token",
+    );
+  });
+
   it("uses installation, repository ID, and hook ID as authority while refreshing display data", async () => {
     const { database } = fixture();
     const api = {

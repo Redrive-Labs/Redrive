@@ -174,6 +174,83 @@ const receiverObservationsTableSql = `
     ON receiver_observations (delivery_guid);
 `;
 
+const redriveTablesSql = `
+  CREATE TABLE redrive_permits (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL,
+    recovery_attempt_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    fingerprint_sha256 TEXT NOT NULL UNIQUE,
+    patch_sha256 TEXT NOT NULL,
+    provider_delivery_id TEXT NOT NULL,
+    delivery_guid TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('APPROVED', 'CONSUMED', 'REVOKED')),
+    approved_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX redrive_permits_incident_idx
+    ON redrive_permits (incident_id, created_at, id);
+
+  CREATE TABLE redrive_dispatches (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL,
+    redrive_permit_id TEXT NOT NULL UNIQUE,
+    application_connection_id TEXT NOT NULL,
+    original_delivery_id TEXT NOT NULL,
+    delivery_guid TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+      'PREPARED',
+      'DISPATCHING',
+      'DISPATCHED',
+      'PROVIDER_VERIFIED',
+      'COMPLETE',
+      'FAILED',
+      'OUTCOME_UNKNOWN'
+    )),
+    provider_redelivery_id TEXT,
+    provider_status_code INTEGER,
+    provider_delivered_at TEXT,
+    pre_redrive_mutation_count INTEGER NOT NULL,
+    final_mutation_count INTEGER,
+    started_at TEXT,
+    dispatched_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE,
+    FOREIGN KEY (redrive_permit_id) REFERENCES redrive_permits (id)
+      ON DELETE RESTRICT
+  );
+
+  CREATE INDEX redrive_dispatches_incident_idx
+    ON redrive_dispatches (incident_id, created_at, id);
+
+  CREATE TABLE recovery_receipts (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL UNIQUE,
+    recovery_attempt_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    dispatch_id TEXT NOT NULL UNIQUE,
+    original_provider_status_code INTEGER NOT NULL,
+    original_receiver_mutation_count INTEGER NOT NULL,
+    patch_sha256 TEXT NOT NULL,
+    sandbox_retry_status_code INTEGER NOT NULL,
+    sandbox_retry_mutation_count INTEGER NOT NULL,
+    deployment_health_status_code INTEGER NOT NULL,
+    pre_redrive_mutation_count INTEGER NOT NULL,
+    redelivery_provider_status_code INTEGER NOT NULL,
+    final_receiver_mutation_count INTEGER NOT NULL,
+    final_receiver_business_state TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome = 'RECOVERY_COMPLETE'),
+    receipt_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+  );
+`;
+
 const migrations: Migration[] = [
   {
     version: 1,
@@ -377,6 +454,119 @@ const migrations: Migration[] = [
   {
     version: 11,
     apply: migrateM27BProvenanceConstraints,
+  },
+  {
+    version: 12,
+    sql: `
+      CREATE TABLE recovery_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'SESSION_CREATING',
+            'SESSION_UNCERTAIN',
+            'READY',
+            'RUNNING',
+            'REPAIR_VERIFIED',
+            'FAILED',
+            'SESSION_LOST'
+          )
+        ),
+        creation_token TEXT,
+        trueforge_session_id TEXT UNIQUE,
+        recovery_spec_version TEXT NOT NULL,
+        source_repository_full_name TEXT NOT NULL,
+        original_revision TEXT NOT NULL,
+        provider_status_code INTEGER NOT NULL,
+        receiver_pre_count INTEGER NOT NULL CHECK (receiver_pre_count >= 0),
+        delivery_guid TEXT NOT NULL,
+        trueforge_turn_id TEXT,
+        result_json TEXT,
+        patch_text TEXT,
+        patch_sha256 TEXT,
+        reproduction_pre_count INTEGER CHECK (reproduction_pre_count IS NULL OR reproduction_pre_count >= 0),
+        reproduction_http_status INTEGER,
+        reproduction_post_count INTEGER CHECK (reproduction_post_count IS NULL OR reproduction_post_count >= 0),
+        verification_pre_count INTEGER CHECK (verification_pre_count IS NULL OR verification_pre_count >= 0),
+        verification_http_status INTEGER,
+        verification_post_count INTEGER CHECK (verification_post_count IS NULL OR verification_post_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        verified_at TEXT,
+        CHECK (
+          (state = 'SESSION_CREATING'
+            AND trueforge_session_id IS NULL
+            AND creation_token IS NOT NULL)
+          OR (state = 'SESSION_UNCERTAIN'
+            AND trueforge_session_id IS NULL)
+          OR (state = 'SESSION_LOST'
+            AND trueforge_session_id IS NOT NULL)
+          OR (state IN ('READY', 'RUNNING', 'REPAIR_VERIFIED', 'FAILED'))
+        ),
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX recovery_attempts_state_idx
+        ON recovery_attempts (state, updated_at, id);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE deploy_permits (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL,
+        recovery_attempt_id TEXT NOT NULL,
+        fingerprint_sha256 TEXT NOT NULL UNIQUE,
+        patch_sha256 TEXT NOT NULL,
+        deployment_target TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN ('APPROVED', 'CONSUMED', 'REVOKED')
+        ),
+        approved_at TEXT NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE recovery_deployments (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL,
+        recovery_attempt_id TEXT NOT NULL UNIQUE,
+        deploy_permit_id TEXT NOT NULL UNIQUE,
+        patch_sha256 TEXT NOT NULL,
+        deployment_target TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'PREPARED',
+            'APPLYING',
+            'VERIFYING',
+            'VERIFIED',
+            'FAILED',
+            'OUTCOME_UNKNOWN'
+          )
+        ),
+        pre_deploy_mutation_count INTEGER,
+        post_deploy_mutation_count INTEGER,
+        health_status_code INTEGER,
+        started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents (id),
+        FOREIGN KEY (deploy_permit_id) REFERENCES deploy_permits (id)
+      );
+
+      CREATE INDEX deploy_permits_incident_idx
+        ON deploy_permits (incident_id, created_at, id);
+      CREATE INDEX recovery_deployments_incident_idx
+        ON recovery_deployments (incident_id, created_at, id);
+    `,
+  },
+  {
+    version: 14,
+    sql: redriveTablesSql,
   },
 ];
 

@@ -22,6 +22,56 @@ function deliveryResponse(value: unknown, link?: string): Response {
 }
 
 describe("lossless GitHub REST JSON decoding", () => {
+  it("redelivers one delivery through the exact empty-success POST path", async () => {
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, {
+        status: 202,
+        headers: { "content-type": "application/vnd.github+json" },
+      }),
+    );
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(
+      api.redeliverWebhookDelivery(
+        "octocat/receiver",
+        "hook-42",
+        "delivery-99",
+        "installation-token",
+      ),
+    ).resolves.toBe(202);
+
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    expect(fetchImplementation).toHaveBeenCalledWith(
+      "https://api.github.com/repos/octocat/receiver/hooks/hook-42/deliveries/delivery-99/attempts",
+      expect.objectContaining({
+        method: "POST",
+        redirect: "error",
+        headers: {
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2026-03-10",
+          "User-Agent": "Redrive-GitHub-App-Connection",
+          Authorization: "Bearer installation-token",
+        },
+      }),
+    );
+    expect(fetchImplementation.mock.calls[0]?.[1]).not.toHaveProperty("body");
+  });
+
+  it.each([
+    [new Error("network"), "NETWORK"],
+    [new DOMException("aborted", "AbortError"), "TIMEOUT"],
+  ])("classifies redelivery transport failure %s without retry", async (failure, code) => {
+    const fetchImplementation = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => {
+      throw failure;
+    });
+    const api = new GithubApi({ fetchImplementation });
+
+    await expect(
+      api.redeliverWebhookDelivery("octocat/receiver", "42", "delivery-1", "token"),
+    ).rejects.toMatchObject({ code });
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves bounded rate-limit metadata without retaining error bodies or credentials", async () => {
     const credential = "app-jwt-secret";
     const responseBody = `{"message":"rate limited; credential=${credential}"}`;
