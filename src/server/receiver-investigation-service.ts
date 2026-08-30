@@ -30,6 +30,13 @@ import { IncidentNotFoundError } from "@/server/provider-evidence-service";
 
 export const RECEIVER_INVESTIGATOR_NAME = "receiver-investigator" as const;
 const CREATE_SUB_AGENT_TOOL = "create_sub_agent" as const;
+const EXEC_TOOL = "exec" as const;
+const READ_FILE_TOOL = "read_file" as const;
+const MAX_SKILL_BOOTSTRAP_CALLS = 8;
+const ALLOWED_REDRIVE_SKILL_PATHS = [
+  "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md",
+  "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md",
+] as const;
 
 export class ReceiverInvestigationConfigurationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -112,6 +119,12 @@ interface CollectedReceiverTurn {
   toolResponse: ReceiverToolResponse;
 }
 
+type ReceiverToolCategory =
+  | "create_sub_agent"
+  | "skill_bootstrap"
+  | "evidence"
+  | "forbidden";
+
 function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -177,6 +190,86 @@ function parseExactJsonObject(
     );
   }
   return parseExactObject(parsed, description, expectedKeys);
+}
+
+function allowedSkillPath(value: unknown): string | null {
+  return typeof value === "string" &&
+    (ALLOWED_REDRIVE_SKILL_PATHS as readonly string[]).includes(value)
+    ? value
+    : null;
+}
+
+function parseSkillBootstrapPath(toolCall: ObservedToolCall): string | null {
+  if (
+    toolCall.toolInfoType === "truefoundry-system" &&
+    toolCall.toolInfoName === EXEC_TOOL &&
+    toolCall.functionName === EXEC_TOOL
+  ) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(toolCall.argumentsText) as unknown;
+    } catch {
+      return null;
+    }
+    if (!isRecord(parsed)) return null;
+    const keys = Object.keys(parsed);
+    if (
+      !Object.prototype.hasOwnProperty.call(parsed, "command") ||
+      keys.some((key) => key !== "command" && key !== "intent") ||
+      (Object.prototype.hasOwnProperty.call(parsed, "intent") &&
+        typeof parsed.intent !== "string") ||
+      typeof parsed.command !== "string"
+    ) {
+      return null;
+    }
+    for (const path of ALLOWED_REDRIVE_SKILL_PATHS) {
+      if (parsed.command === `cat ${path}`) return path;
+    }
+    return null;
+  }
+
+  if (
+    toolCall.functionName !== READ_FILE_TOOL ||
+    toolCall.toolInfoName !== READ_FILE_TOOL
+  ) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(toolCall.argumentsText) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof parsed === "string") return allowedSkillPath(parsed);
+  if (!isRecord(parsed) || Object.keys(parsed).length !== 1) return null;
+  return allowedSkillPath(parsed.path);
+}
+
+function classifyReceiverToolCall(
+  toolCall: ObservedToolCall,
+  expectedMcpServerName: string,
+): ReceiverToolCategory {
+  if (
+    toolCall.toolInfoType === "truefoundry-system" &&
+    toolCall.toolInfoName === CREATE_SUB_AGENT_TOOL &&
+    toolCall.functionName === CREATE_SUB_AGENT_TOOL
+  ) {
+    return "create_sub_agent";
+  }
+  if (parseSkillBootstrapPath(toolCall) !== null) return "skill_bootstrap";
+  if (
+    (toolCall.toolInfoType === "mcp" &&
+      toolCall.toolInfoServerName === expectedMcpServerName &&
+      toolCall.toolInfoName === RECEIVER_MCP_BUSINESS_STATE_TOOL &&
+      toolCall.functionName === RECEIVER_MCP_BUSINESS_STATE_TOOL) ||
+    (toolCall.toolInfoType === "truefoundry-system" &&
+      toolCall.toolInfoName === "call_tool" &&
+      toolCall.functionName === "call_tool")
+  ) {
+    return "evidence";
+  }
+  return "forbidden";
 }
 
 function parseReceiverToolArguments(
@@ -640,25 +733,34 @@ export async function collectReceiverTurn(
   }
   const thread = threads[0];
 
-  const parentToolCalls = observedToolCalls.filter(
-    (toolCall) => toolCall.threadId !== thread.threadId,
+  const classifiedToolCalls = observedToolCalls.map((toolCall) => ({
+    toolCall,
+    category: classifyReceiverToolCall(toolCall, expectedMcpServerName),
+  }));
+  const parentToolCalls = classifiedToolCalls.filter(
+    ({ toolCall }) => toolCall.threadId !== thread.threadId,
+  );
+  if (parentToolCalls.some(({ toolCall }) => toolCall.threadId !== thread.parentThreadId)) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge emitted a receiver tool call outside the root or expected child thread.",
+    );
+  }
+  const rootCreateToolCalls = parentToolCalls.filter(
+    ({ category }) => category === "create_sub_agent",
   );
   if (
-    parentToolCalls.length !== 1 ||
-    parentToolCalls[0].threadId !== "main" ||
+    rootCreateToolCalls.length !== 1 ||
+    rootCreateToolCalls[0].toolCall.threadId !== "main" ||
     thread.parentThreadId !== "main" ||
-    parentToolCalls[0].threadId !== thread.parentThreadId ||
-    parentToolCalls[0].toolCallId !== thread.parentToolCallId ||
-    parentToolCalls[0].toolInfoType !== "truefoundry-system" ||
-    parentToolCalls[0].toolInfoName !== CREATE_SUB_AGENT_TOOL ||
-    parentToolCalls[0].functionName !== CREATE_SUB_AGENT_TOOL
+    rootCreateToolCalls[0].toolCall.threadId !== thread.parentThreadId ||
+    rootCreateToolCalls[0].toolCall.toolCallId !== thread.parentToolCallId
   ) {
     throw new ReceiverInvestigationTurnError(
       "TrueForge did not correlate exactly one root create_sub_agent call to receiver-investigator.",
     );
   }
   const parentArguments = parseCreateSubAgentArguments(
-    parentToolCalls[0].argumentsText,
+    rootCreateToolCalls[0].toolCall.argumentsText,
   );
   if (parentArguments.input !== thread.input) {
     throw new ReceiverInvestigationTurnError(
@@ -666,15 +768,48 @@ export async function collectReceiverTurn(
     );
   }
 
-  const receiverToolCalls = observedToolCalls.filter(
-    (toolCall) => toolCall.threadId === thread.threadId,
+  if (
+    parentToolCalls.some(
+      ({ category }) =>
+        category === "forbidden" || category === "evidence",
+    )
+  ) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge root receiver calls may only create the investigator or read an attached Redrive skill.",
+    );
+  }
+
+  const childToolCalls = classifiedToolCalls.filter(
+    ({ toolCall }) => toolCall.threadId === thread.threadId,
+  );
+  if (
+    childToolCalls.some(
+      ({ category }) =>
+        category === "forbidden" || category === "create_sub_agent",
+    )
+  ) {
+    throw new ReceiverInvestigationTurnError(
+      "Receiver Investigator emitted a forbidden tool call.",
+    );
+  }
+  const bootstrapToolCalls = classifiedToolCalls.filter(
+    ({ category }) => category === "skill_bootstrap",
+  );
+  if (bootstrapToolCalls.length > MAX_SKILL_BOOTSTRAP_CALLS) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge emitted more than the allowed number of skill-bootstrap reads.",
+    );
+  }
+
+  const receiverToolCalls = childToolCalls.filter(
+    ({ category }) => category === "evidence",
   );
   if (receiverToolCalls.length !== 1) {
     throw new ReceiverInvestigationTurnError(
       "Receiver Investigator did not make exactly one MCP call.",
     );
   }
-  const observedToolCall = receiverToolCalls[0];
+  const observedToolCall = receiverToolCalls[0].toolCall;
   const receiverArguments = parseReceiverToolArguments(
     observedToolCall,
     expectedConnectionId,
@@ -682,36 +817,55 @@ export async function collectReceiverTurn(
     expectedMcpServerName,
   );
 
-  const matchingResponses = toolResponses.filter(
-    (response) =>
-      response.threadId === thread.threadId &&
-      response.toolCallId === observedToolCall.toolCallId,
+  const responsesFor = (toolCall: ObservedToolCall) =>
+    toolResponses.filter(
+      (response) =>
+        response.threadId === toolCall.threadId &&
+        response.toolCallId === toolCall.toolCallId,
+    );
+  const observedToolCallSet = new Set(
+    observedToolCalls.map(
+      (toolCall) => `${toolCall.threadId}\u0000${toolCall.toolCallId}`,
+    ),
   );
+  if (
+    toolResponses.some(
+      (response) =>
+        !observedToolCallSet.has(
+          `${response.threadId}\u0000${response.toolCallId}`,
+        ),
+    )
+  ) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge emitted a tool.response without a correlated receiver tool call.",
+    );
+  }
+
+  for (const bootstrap of bootstrapToolCalls) {
+    if (responsesFor(bootstrap.toolCall).length !== 1) {
+      throw new ReceiverInvestigationTurnError(
+        "TrueForge did not emit exactly one response for a skill-bootstrap read.",
+      );
+    }
+  }
+
+  const createResponses = responsesFor(rootCreateToolCalls[0].toolCall);
+  if (
+    createResponses.length > 1 ||
+    (createResponses.length === 1 && createResponses[0].content !== "")
+  ) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge emitted an invalid create_sub_agent tool.response.",
+    );
+  }
+
+  const matchingResponses = responsesFor(observedToolCall);
   if (
     matchingResponses.length !== 1 ||
     matchingResponses[0].content.trim().length === 0
   ) {
     throw new ReceiverInvestigationTurnError(
       "TrueForge did not emit exactly one matching Receiver Investigator tool.response.",
-    );
-  }
-
-  const unrelatedResponses = toolResponses.filter(
-    (response) =>
-      response.threadId !== thread.threadId ||
-      response.toolCallId !== observedToolCall.toolCallId,
-  );
-  if (
-    unrelatedResponses.length > 1 ||
-    unrelatedResponses.some(
-      (response) =>
-        response.threadId !== thread.parentThreadId ||
-        response.toolCallId !== thread.parentToolCallId ||
-        response.content !== "",
-    )
-  ) {
-    throw new ReceiverInvestigationTurnError(
-      "TrueForge emitted an unrelated or duplicate receiver tool.response.",
     );
   }
 

@@ -63,7 +63,26 @@ interface ReceiverEventOptions {
   includeRootReceiverCall?: boolean;
   extraRootCreateCall?: boolean;
   extraThread?: boolean;
+  skillBootstraps?: SkillBootstrapOptions[];
 }
+
+interface SkillBootstrapOptions {
+  shape?: "exec" | "read-file";
+  path?: string;
+  command?: string;
+  intent?: string;
+  thread?: "root" | "child";
+  toolCallId?: string;
+  responseContent?: string;
+  includeResponse?: boolean;
+  responseThreadId?: string;
+  responseToolCallId?: string;
+}
+
+const providerSkillPath =
+  "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md";
+const receiverSkillPath =
+  "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md";
 
 function iterable<T>(items: unknown[]): AsyncIterable<T> {
   return {
@@ -282,6 +301,53 @@ function receiverEvents(options: ReceiverEventOptions = {}): unknown[] {
         input: task,
       },
     });
+  }
+
+  for (const [index, bootstrap] of (options.skillBootstraps ?? []).entries()) {
+    const toolCallId = bootstrap.toolCallId ?? `skill-bootstrap-${index + 1}`;
+    const path = bootstrap.path ?? receiverSkillPath;
+    const shape = bootstrap.shape ?? "exec";
+    const threadId = bootstrap.thread === "root" ? "main" : childThreadId;
+    const functionName = shape === "exec" ? "exec" : "read_file";
+    const argumentsValue =
+      shape === "exec"
+        ? {
+            command: bootstrap.command ?? `cat ${path}`,
+            ...(bootstrap.intent === undefined
+              ? {}
+              : { intent: bootstrap.intent }),
+          }
+        : { path };
+    events.push({
+      type: "model.message",
+      id: `skill-bootstrap-model-event-${index + 1}`,
+      threadId,
+      content: null,
+      toolCalls: [
+        {
+          id: toolCallId,
+          type: "function",
+          function: {
+            name: functionName,
+            arguments: JSON.stringify(argumentsValue),
+          },
+          toolInfo: {
+            type: "truefoundry-system",
+            name: functionName,
+          },
+        },
+      ],
+    });
+    if (bootstrap.includeResponse !== false) {
+      events.push({
+        type: "tool.response",
+        id: `skill-bootstrap-response-event-${index + 1}`,
+        createdAt: "2026-08-30T00:00:02.500Z",
+        threadId: bootstrap.responseThreadId ?? threadId,
+        toolCallId: bootstrap.responseToolCallId ?? toolCallId,
+        content: bootstrap.responseContent ?? "skill bootstrap complete",
+      });
+    }
   }
 
   events.push({
@@ -517,6 +583,113 @@ describe("TrueForge receiver investigation", () => {
 
     expect(result.observation.businessState).toBe("EXACTLY_ONE");
   });
+
+  const acceptedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    [
+      "one child exec read with intent",
+      [{ path: receiverSkillPath, intent: "load receiver investigation skill" }],
+    ],
+    [
+      "both exact Redrive exec reads",
+      [
+        { path: providerSkillPath },
+        { path: receiverSkillPath },
+      ],
+    ],
+    [
+      "read_file bootstrap",
+      [{ shape: "read-file", path: providerSkillPath }],
+    ],
+    [
+      "root and child bootstrap reads in varying order",
+      [
+        { path: providerSkillPath, thread: "root" },
+        { path: receiverSkillPath, thread: "child" },
+      ],
+    ],
+    [
+      "eight duplicate bounded bootstrap reads",
+      Array.from({ length: 8 }, () => ({ path: receiverSkillPath })),
+    ],
+  ];
+
+  it.each(acceptedSkillBootstrapCases)(
+    "accepts %s alongside exactly one receiver evidence call",
+    async (_description, skillBootstraps) => {
+      const incidentId = createIncident();
+      const client = createClient(receiverEvents({ skillBootstraps }));
+      const service = createReceiverInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      const result = await service.investigateReceiverForIncident(incidentId, {
+        connectionId: applicationConnectionId,
+        deliveryGuid,
+        expectedSessionId: sessionId,
+      });
+
+      expect(result.observation.businessState).toBe("EXACTLY_ONE");
+      expect(result.observation.mutationCount).toBe(1);
+    },
+  );
+
+  const rejectedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    ["arbitrary exec", [{ command: "pwd" }]],
+    ["cat of another path", [{ command: "cat /tmp/other-skill.md" }]],
+    [
+      "shell syntax in exec",
+      [{ command: `cat ${receiverSkillPath}; echo unsafe | tee /tmp/x && true > /tmp/y < /tmp/z $() \`x\`` }],
+    ],
+    [
+      "arbitrary read_file path",
+      [{ shape: "read-file", path: "/tmp/supporting-file.txt" }],
+    ],
+    [
+      "more than the bootstrap ceiling",
+      Array.from({ length: 9 }, () => ({ path: receiverSkillPath })),
+    ],
+    [
+      "missing bootstrap response",
+      [{ path: receiverSkillPath, includeResponse: false }],
+    ],
+    [
+      "mismatched bootstrap response",
+      [{ path: receiverSkillPath, responseToolCallId: "other-call" }],
+    ],
+  ];
+
+  it.each(rejectedSkillBootstrapCases)(
+    "rejects %s without persisting receiver evidence",
+    async (_description, skillBootstraps) => {
+      const incidentId = createIncident();
+      const client = createClient(receiverEvents({ skillBootstraps }));
+      const service = createReceiverInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      await expect(
+        service.investigateReceiverForIncident(incidentId, {
+          connectionId: applicationConnectionId,
+          deliveryGuid,
+          expectedSessionId: sessionId,
+        }),
+      ).rejects.toBeInstanceOf(ReceiverInvestigationTurnError);
+      expect(
+        database.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM receiver_observations WHERE incident_id = ?",
+          [incidentId],
+        ),
+      ).toEqual({ count: 0 });
+    },
+  );
 
   it("does not create a replacement session and does not create a turn on reconciliation failure", async () => {
     const incidentId = createIncident();

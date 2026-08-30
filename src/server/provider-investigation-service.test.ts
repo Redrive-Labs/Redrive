@@ -110,7 +110,26 @@ interface StreamOptions {
   responseToolCallId?: string;
   responseContent?: string;
   eventSuffix?: string;
+  skillBootstraps?: SkillBootstrapOptions[];
 }
+
+interface SkillBootstrapOptions {
+  shape?: "exec" | "read-file";
+  path?: string;
+  command?: string;
+  intent?: string;
+  thread?: "root" | "child";
+  toolCallId?: string;
+  responseContent?: string;
+  includeResponse?: boolean;
+  responseThreadId?: string;
+  responseToolCallId?: string;
+}
+
+const providerSkillPath =
+  "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md";
+const receiverSkillPath =
+  "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md";
 
 function makeStream(
   options: StreamOptions = {},
@@ -298,6 +317,52 @@ function makeStream(
         content: "",
       },
     );
+  }
+  for (const [index, bootstrap] of (options.skillBootstraps ?? []).entries()) {
+    const toolCallId = bootstrap.toolCallId ?? `skill-bootstrap-${index + 1}`;
+    const path = bootstrap.path ?? providerSkillPath;
+    const shape = bootstrap.shape ?? "exec";
+    const threadId = bootstrap.thread === "root" ? "main" : providerThreadId;
+    const functionName = shape === "exec" ? "exec" : "read_file";
+    const argumentsValue =
+      shape === "exec"
+        ? {
+            command: bootstrap.command ?? `cat ${path}`,
+            ...(bootstrap.intent === undefined
+              ? {}
+              : { intent: bootstrap.intent }),
+          }
+        : { path };
+    events.push({
+      type: "model.message",
+      id: `skill-bootstrap-model-event-${index + 1}`,
+      threadId,
+      content: null,
+      toolCalls: [
+        {
+          id: toolCallId,
+          type: "function",
+          function: {
+            name: functionName,
+            arguments: JSON.stringify(argumentsValue),
+          },
+          toolInfo: {
+            type: "truefoundry-system",
+            name: functionName,
+          },
+        },
+      ],
+    });
+    if (bootstrap.includeResponse !== false) {
+      events.push({
+        type: "tool.response",
+        id: `skill-bootstrap-response-event-${index + 1}`,
+        createdAt: "2026-08-25T10:00:02.750Z",
+        threadId: bootstrap.responseThreadId ?? threadId,
+        toolCallId: bootstrap.responseToolCallId ?? toolCallId,
+        content: bootstrap.responseContent ?? "skill bootstrap complete",
+      });
+    }
   }
   events.push({
     type: "turn.done",
@@ -734,6 +799,107 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
     expect(client.listTurnEvents).toHaveBeenCalledOnce();
   });
+
+  const acceptedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    [
+      "one child exec read with intent",
+      [{ path: providerSkillPath, intent: "load provider investigation skill" }],
+    ],
+    [
+      "both exact Redrive exec reads",
+      [
+        { path: providerSkillPath },
+        { path: receiverSkillPath },
+      ],
+    ],
+    [
+      "read_file bootstrap",
+      [{ shape: "read-file", path: receiverSkillPath }],
+    ],
+    [
+      "root and child bootstrap reads in varying order",
+      [
+        { path: receiverSkillPath, thread: "root" },
+        { path: providerSkillPath, thread: "child" },
+      ],
+    ],
+    [
+      "eight duplicate bounded bootstrap reads",
+      Array.from({ length: 8 }, () => ({ path: providerSkillPath })),
+    ],
+  ];
+
+  it.each(acceptedSkillBootstrapCases)(
+    "accepts %s alongside exactly one provider evidence call",
+    async (_description, skillBootstraps) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const client = createClient(makeStream({ skillBootstraps }));
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      const result = await service.investigateProviderForIncident(incident.id);
+
+      expect(result.evidenceDisposition).toBe("CAPTURED");
+      expect(result.providerStatusCode).toBe(500);
+      expect(
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
+      ).toMatchObject({ providerDeliveryId: deliveryId });
+    },
+  );
+
+  const rejectedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    ["arbitrary exec", [{ command: "pwd" }]],
+    ["cat of another path", [{ command: "cat /tmp/other-skill.md" }]],
+    [
+      "shell syntax in exec",
+      [{ command: `cat ${providerSkillPath}; echo unsafe | tee /tmp/x && true > /tmp/y < /tmp/z $() \`x\`` }],
+    ],
+    [
+      "arbitrary read_file path",
+      [{ shape: "read-file", path: "/tmp/supporting-file.txt" }],
+    ],
+    [
+      "more than the bootstrap ceiling",
+      Array.from({ length: 9 }, () => ({ path: providerSkillPath })),
+    ],
+    [
+      "missing bootstrap response",
+      [{ path: providerSkillPath, includeResponse: false }],
+    ],
+    [
+      "mismatched bootstrap response",
+      [{ path: providerSkillPath, responseToolCallId: "other-call" }],
+    ],
+  ];
+
+  it.each(rejectedSkillBootstrapCases)(
+    "rejects %s",
+    async (_description, skillBootstraps) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const client = createClient(makeStream({ skillBootstraps }));
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      await expect(
+        service.investigateProviderForIncident(incident.id),
+      ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+      expect(
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
+      ).toBeNull();
+    },
+  );
 
   it.each([
     { mcp_server: connectionMcpServerName },
