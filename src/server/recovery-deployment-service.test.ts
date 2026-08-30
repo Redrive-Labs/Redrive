@@ -458,6 +458,8 @@ describe("recovery deployment slice", () => {
       ["git", ["-C", targetDirectory, "rev-parse", "HEAD"]],
       ["git", ["-C", targetDirectory, "status", "--porcelain"]],
       ["git", ["-C", targetDirectory, "apply", "--check", expect.any(String)]],
+      ["git", ["-C", targetDirectory, "rev-parse", "HEAD"]],
+      ["git", ["-C", targetDirectory, "status", "--porcelain"]],
       ["git", ["-C", targetDirectory, "apply", expect.any(String)]],
       ["docker", ["compose", "-f", path.join(targetDirectory, "compose.yaml"), "up", "--build", "-d"]],
     ]);
@@ -465,6 +467,54 @@ describe("recovery deployment slice", () => {
     expect(checkedPatchMode).toBe(0o600);
     expect(() => statSync(fake.calls[3].args[4])).toThrow();
     expect((reader.readBusinessState as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ["HEAD", "checkout mutation", { head: "changed-head" }],
+    ["status", "worktree mutation", { status: " M src/handler.ts" }],
+  ])("does not apply when the %s changes after preflight", async (_kind, _description, mutation) => {
+    const { fake, reader, service: deployment } = eligibleService();
+    const candidate = deployment.getStatus(INCIDENT_ID).candidate;
+    if (candidate === null) throw new Error("test candidate was not eligible");
+    const permit = deployment.approvePermit(INCIDENT_ID, computeDeploymentFingerprint(candidate));
+    let preflightComplete = false;
+    let headReads = 0;
+    let statusReads = 0;
+    fake.runner.run = vi.fn(async (executable, args, options) => {
+      const call = { executable, args: [...args], cwd: options.cwd };
+      fake.calls.push(call);
+      if (executable === "git" && args.includes("--check")) preflightComplete = true;
+      if (executable === "git" && args.includes("HEAD")) headReads += 1;
+      if (executable === "git" && args.includes("--porcelain")) statusReads += 1;
+      if (args.join(" ") === `-C ${targetDirectory} rev-parse --show-toplevel`) {
+        return { exitCode: 0, stdout: `${targetDirectory}\n`, stderr: "" };
+      }
+      if (args.join(" ") === `-C ${targetDirectory} rev-parse HEAD`) {
+        return {
+          exitCode: 0,
+          stdout: `${preflightComplete && "head" in mutation ? mutation.head : ORIGINAL_REVISION}\n`,
+          stderr: "",
+        };
+      }
+      if (args.join(" ") === `-C ${targetDirectory} status --porcelain`) {
+        return {
+          exitCode: 0,
+          stdout: preflightComplete && "status" in mutation ? mutation.status : "",
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expectDeployRejection(
+      deployment.deploy(INCIDENT_ID, permit.id),
+      DeploymentReconciliationRequiredError,
+    );
+    expect(fake.calls.filter((call) => call.executable === "git" && call.args.includes("apply") && !call.args.includes("--check"))).toHaveLength(0);
+    expect(database.get("SELECT state FROM recovery_deployments")).toMatchObject({ state: "APPLYING" });
+    expect(headReads).toBe(2);
+    expect(statusReads).toBe("status" in mutation ? 2 : 1);
+    expect(reader.readBusinessState).toHaveBeenCalledTimes(1);
   });
 
   it("marks an ambiguous crash after APPLYING unknown and never automatically applies again", async () => {

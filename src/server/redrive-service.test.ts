@@ -254,6 +254,30 @@ describe("redrive service", () => {
     expect(github.listWebhookDeliveryAttempts).toHaveBeenCalledTimes(2);
   });
 
+  it("rejects continuation when the candidate changes after dispatch creation", async () => {
+    const github = {
+      redeliverWebhookDelivery: vi.fn(async () => {
+        throw new GithubRestError("TIMEOUT", "timeout");
+      }),
+      listWebhookDeliveryAttempts: vi.fn(async () => []),
+    };
+    const service = makeService({ github });
+    const permit = await service.approve(INCIDENT_ID, fingerprint());
+    const first = await service.execute(INCIDENT_ID, permit.id);
+    expect(first.outcome).toBe("OUTCOME_UNKNOWN");
+
+    database.run(
+      "UPDATE recovery_attempts SET delivery_guid = ? WHERE id = ?",
+      ["changed-delivery-guid", ATTEMPT_ID],
+    );
+
+    await expect(service.execute(INCIDENT_ID, permit.id)).rejects.toMatchObject({
+      code: "FINGERPRINT_MISMATCH",
+    });
+    expect(github.listWebhookDeliveryAttempts).not.toHaveBeenCalled();
+    expect(service.getReceiptByIncidentId(INCIDENT_ID)).toBeNull();
+  });
+
   it("does not issue a second POST when durable state is already DISPATCHING", async () => {
     const github = {
       redeliverWebhookDelivery: vi.fn(async () => 202),

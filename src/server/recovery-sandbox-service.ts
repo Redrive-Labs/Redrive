@@ -228,11 +228,13 @@ const ALLOWED_RECOVERY_TOOL_NAMES = new Set([
   ...SANDBOX_IO_TOOL_NAMES,
   "get_current_datetime",
 ]);
+const RECOVERY_ARTIFACT_PATH = "/home/trueforge/evidence/artifact.json";
 
 interface RecoveryToolCall {
   threadId: string;
   toolCallId: string;
   toolName: string;
+  argumentsText: string;
 }
 
 function validateSandboxToolCall(
@@ -269,7 +271,86 @@ function validateSandboxToolCall(
     );
   }
   seenToolCallIds.add(rawToolCall.id);
-  return { threadId, toolCallId: rawToolCall.id, toolName: toolInfo.name };
+  return {
+    threadId,
+    toolCallId: rawToolCall.id,
+    toolName: toolInfo.name,
+    argumentsText: functionValue.arguments,
+  };
+}
+
+function identifiesRecoveryArtifact(toolCall: RecoveryToolCall): boolean {
+  if (toolCall.toolName !== "exec" && toolCall.toolName !== "read_file") {
+    return false;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(toolCall.argumentsText) as unknown;
+  } catch {
+    return false;
+  }
+
+  if (toolCall.toolName === "exec") {
+    if (!isRecord(parsed) || typeof parsed.command !== "string") return false;
+    const keys = Object.keys(parsed);
+    return (
+      parsed.command === `cat ${RECOVERY_ARTIFACT_PATH}` &&
+      keys.every((key) => key === "command" || key === "intent") &&
+      (typeof parsed.intent === "undefined" || typeof parsed.intent === "string")
+    );
+  }
+
+  if (typeof parsed === "string") return parsed === RECOVERY_ARTIFACT_PATH;
+  return (
+    isRecord(parsed) &&
+    Object.keys(parsed).length === 1 &&
+    parsed.path === RECOVERY_ARTIFACT_PATH
+  );
+}
+
+function parseArtifactToolResponse(
+  content: string,
+  expectedIdentity: RecoveryResultExpectedIdentity,
+): RecoveryResultArtifact {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content) as unknown;
+  } catch (error) {
+    throw new RecoverySandboxTurnError(
+      "the required sandbox artifact response was not valid JSON.",
+      { cause: error },
+    );
+  }
+
+  let artifactText = content;
+  if (isRecord(parsed)) {
+    if (parsed.isError === true || parsed.success === false) {
+      throw new RecoverySandboxTurnError(
+        "the required sandbox artifact read failed.",
+      );
+    }
+    const exitCode = parsed.exitCode ?? parsed.exit_code;
+    if (typeof exitCode !== "undefined") {
+      if (exitCode !== 0 || typeof parsed.stdout !== "string") {
+        throw new RecoverySandboxTurnError(
+          "the required sandbox artifact exec did not succeed.",
+        );
+      }
+      artifactText = parsed.stdout;
+    } else if (typeof parsed.output === "string") {
+      artifactText = parsed.output;
+    }
+  }
+
+  try {
+    return parseRecoveryResultJson(artifactText, expectedIdentity);
+  } catch (error) {
+    throw new RecoverySandboxTurnError(
+      "the required sandbox artifact response was not a valid recovery artifact.",
+      { cause: error },
+    );
+  }
 }
 
 export async function collectRecoveryTurn(
@@ -287,6 +368,8 @@ export async function collectRecoveryTurn(
   const toolResponses: Array<{
     threadId: string;
     toolCallId: string;
+    content: string;
+    isError: boolean;
   }> = [];
   let finalResultText: string | null = null;
 
@@ -376,15 +459,17 @@ export async function collectRecoveryTurn(
 
     if (type === "tool.response") {
       assertEventTurn(rawEvent, expectedTurnId, true);
-      toolResponses.push({
-        threadId: requiredString(rawEvent.threadId, "tool response threadId"),
-        toolCallId: requiredString(rawEvent.toolCallId, "tool response toolCallId"),
-      });
       if (typeof rawEvent.content !== "string") {
         throw new RecoverySandboxTurnError(
           "TrueForge recovery tool.response content is not text.",
         );
       }
+      toolResponses.push({
+        threadId: requiredString(rawEvent.threadId, "tool response threadId"),
+        toolCallId: requiredString(rawEvent.toolCallId, "tool response toolCallId"),
+        content: rawEvent.content,
+        isError: rawEvent.isError === true,
+      });
       continue;
     }
 
@@ -403,9 +488,10 @@ export async function collectRecoveryTurn(
       "TrueForge recovery turn did not contain a final JSON result message.",
     );
   }
-  if (!toolCalls.some((toolCall) => SANDBOX_IO_TOOL_NAMES.has(toolCall.toolName))) {
+  const artifactReads = toolCalls.filter(identifiesRecoveryArtifact);
+  if (artifactReads.length !== 1) {
     throw new RecoverySandboxTurnError(
-      "TrueForge recovery turn did not contain a sandbox execution tool call.",
+      "TrueForge recovery turn did not contain exactly one required artifact read.",
     );
   }
 
@@ -436,16 +522,51 @@ export async function collectRecoveryTurn(
     );
   }
 
-  let artifact: RecoveryResultArtifact;
+  const artifactRead = artifactReads[0];
+  const artifactResponse = toolResponses.find(
+    (response) =>
+      response.threadId === artifactRead.threadId &&
+      response.toolCallId === artifactRead.toolCallId,
+  );
+  if (artifactResponse === undefined || artifactResponse.isError) {
+    throw new RecoverySandboxTurnError(
+      "the required sandbox artifact read did not have a successful response.",
+    );
+  }
+
+  let authoritativeArtifact: RecoveryResultArtifact;
   try {
-    artifact = parseRecoveryResultJson(finalResultText, expectedIdentity);
+    authoritativeArtifact = parseArtifactToolResponse(
+      artifactResponse.content,
+      expectedIdentity,
+    );
+  } catch (error) {
+    throw new RecoverySandboxTurnError(
+      "the authoritative sandbox artifact was not valid.",
+      { cause: error },
+    );
+  }
+
+  let finalArtifact: RecoveryResultArtifact;
+  try {
+    finalArtifact = parseRecoveryResultJson(finalResultText, expectedIdentity);
   } catch (error) {
     throw new RecoverySandboxTurnError(
       "the final model message was not a strictly valid recovery artifact.",
       { cause: error },
     );
   }
-  return { turnId: expectedTurnId, resultText: finalResultText, artifact };
+  if (JSON.stringify(finalArtifact) !== JSON.stringify(authoritativeArtifact)) {
+    throw new RecoverySandboxTurnError(
+      "the final model artifact differs from the authoritative sandbox artifact.",
+    );
+  }
+
+  return {
+    turnId: expectedTurnId,
+    resultText: JSON.stringify(authoritativeArtifact),
+    artifact: authoritativeArtifact,
+  };
 }
 
 function requiredRevision(providerEvidence: ProviderEvidence): string {

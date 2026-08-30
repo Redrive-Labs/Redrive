@@ -80,7 +80,19 @@ function artifact(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function persistedEvents(result: unknown, turnId = "recovery-turn-1") {
+const expectedIdentity = {
+  sourceRepositoryFullName: repositoryFullName,
+  originalRevision: revision,
+  deliveryGuid,
+  providerStatusCode: 500,
+  receiverMutationCount: 1,
+};
+
+function persistedEvents(
+  result: unknown,
+  turnId = "recovery-turn-1",
+  options: { toolArguments?: string; toolResponse?: string; toolResponseIsError?: boolean } = {},
+) {
   return iterable<TrueForgeApi.SessionEvent>([
     {
       type: "turn.created",
@@ -98,7 +110,12 @@ function persistedEvents(result: unknown, turnId = "recovery-turn-1") {
         {
           id: `${turnId}-exec-call`,
           type: "function",
-          function: { name: "exec", arguments: "{}" },
+          function: {
+            name: "exec",
+            arguments:
+              options.toolArguments ??
+              JSON.stringify({ command: "cat /home/trueforge/evidence/artifact.json" }),
+          },
           toolInfo: { type: "truefoundry-system", name: "exec" },
         },
         {
@@ -120,7 +137,8 @@ function persistedEvents(result: unknown, turnId = "recovery-turn-1") {
       turnId,
       threadId: "main",
       toolCallId: `${turnId}-exec-call`,
-      content: "ok",
+      content: options.toolResponse ?? JSON.stringify(result),
+      ...(options.toolResponseIsError === true ? { isError: true } : {}),
     },
     {
       type: "tool.response",
@@ -344,6 +362,63 @@ describe("sandbox recovery orchestration", () => {
         },
       ),
     ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+  });
+
+  it("requires the exact successful sandbox artifact read and binds the final JSON to it", async () => {
+    const valid = artifact();
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents(valid, "unrelated-exec", {
+          toolArguments: JSON.stringify({ command: "cat /tmp/unrelated.json" }),
+        }),
+        "session-1",
+        "unrelated-exec",
+        expectedIdentity,
+      ),
+    ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents(valid, "failed-read", {
+          toolResponse: JSON.stringify({ exitCode: 1, stdout: "", stderr: "missing" }),
+        }),
+        "session-1",
+        "failed-read",
+        expectedIdentity,
+      ),
+    ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents(valid, "wrong-path", {
+          toolArguments: JSON.stringify({ path: "/tmp/artifact.json" }),
+        }),
+        "session-1",
+        "wrong-path",
+        expectedIdentity,
+      ),
+    ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents({ ...valid, patch: "fabricated patch\n" }, "different-final", {
+          toolResponse: JSON.stringify(valid),
+        }),
+        "session-1",
+        "different-final",
+        expectedIdentity,
+      ),
+    ).rejects.toBeInstanceOf(RecoverySandboxTurnError);
+
+    await expect(
+      collectRecoveryTurn(
+        persistedEvents(valid, "exact-binding"),
+        "session-1",
+        "exact-binding",
+        expectedIdentity,
+      ),
+    ).resolves.toMatchObject({ artifact: valid });
   });
 
   it("creates one durable recovery attempt and persists the host-computed SHA-256", async () => {

@@ -109,6 +109,7 @@ export interface RecoveryAttempt {
   id: string;
   incidentId: string;
   state: string;
+  originalRevision: string;
   deliveryGuid: string;
   patchSha256: string;
   providerStatusCode: number;
@@ -192,6 +193,7 @@ interface RecoveryAttemptRow extends Record<string, unknown> {
   id: unknown;
   incidentId: unknown;
   state: unknown;
+  originalRevision: unknown;
   deliveryGuid: unknown;
   patchSha256: unknown;
   providerStatusCode: unknown;
@@ -275,6 +277,7 @@ const recoveryAttemptColumns = `
   id,
   incident_id AS incidentId,
   state,
+  original_revision AS originalRevision,
   delivery_guid AS deliveryGuid,
   patch_sha256 AS patchSha256,
   provider_status_code AS providerStatusCode,
@@ -421,6 +424,7 @@ function mapRecoveryAttempt(row: RecoveryAttemptRow): RecoveryAttempt {
     id: readText(row, "id"),
     incidentId: readText(row, "incidentId"),
     state: readText(row, "state"),
+    originalRevision: readText(row, "originalRevision"),
     deliveryGuid: readText(row, "deliveryGuid"),
     patchSha256: readText(row, "patchSha256"),
     providerStatusCode: readInteger(row, "providerStatusCode"),
@@ -585,11 +589,42 @@ function sameCandidate(left: RecoveryCandidate, right: RecoveryCandidate): boole
     left.incident.id === right.incident.id &&
     left.applicationConnectionId === right.applicationConnectionId &&
     left.recoveryAttempt.id === right.recoveryAttempt.id &&
+    left.recoveryAttempt.originalRevision === right.recoveryAttempt.originalRevision &&
     left.deployment.id === right.deployment.id &&
+    left.deployment.deploymentTarget === right.deployment.deploymentTarget &&
     left.recoveryAttempt.deliveryGuid === right.recoveryAttempt.deliveryGuid &&
     left.recoveryAttempt.patchSha256 === right.recoveryAttempt.patchSha256 &&
     left.fingerprintBase.providerDeliveryId === right.fingerprintBase.providerDeliveryId
   );
+}
+
+function assertDispatchContinuity(
+  candidate: RecoveryCandidate,
+  permit: RedrivePermit,
+  dispatch: RedriveDispatch,
+): void {
+  if (
+    candidate.incident.id !== dispatch.incidentId ||
+    candidate.incident.id !== permit.incidentId ||
+    dispatch.redrivePermitId !== permit.id ||
+    candidate.applicationConnectionId !== dispatch.applicationConnectionId ||
+    candidate.recoveryAttempt.id !== permit.recoveryAttemptId ||
+    candidate.deployment.id !== permit.deploymentId ||
+    candidate.fingerprintBase.providerDeliveryId !== dispatch.originalDeliveryId ||
+    candidate.fingerprintBase.providerDeliveryId !== permit.providerDeliveryId ||
+    candidate.recoveryAttempt.deliveryGuid !== dispatch.deliveryGuid ||
+    candidate.recoveryAttempt.deliveryGuid !== permit.deliveryGuid ||
+    candidate.recoveryAttempt.patchSha256 !== permit.patchSha256 ||
+    candidate.deployment.patchSha256 !== candidate.recoveryAttempt.patchSha256 ||
+    candidate.deployment.deploymentTarget !== REDRIVE_DEPLOYMENT_TARGET ||
+    dispatch.preRedriveMutationCount !== 1 ||
+    fingerprintFor(candidate, 1).hash !== permit.fingerprintSha256
+  ) {
+    throw new RedriveError(
+      "FINGERPRINT_MISMATCH",
+      "The current recovery candidate does not match the dispatch-bound identities.",
+    );
+  }
 }
 
 export function parseRedrivePermitRequest(value: unknown): { fingerprint: string } {
@@ -1257,7 +1292,9 @@ export function createRedriveService(options: RedriveServiceOptions) {
   async function continueDispatch(
     candidate: RecoveryCandidate,
     dispatch: RedriveDispatch,
+    permit: RedrivePermit,
   ) {
+    assertDispatchContinuity(candidate, permit, dispatch);
     if (dispatch.state === "COMPLETE") {
       return executionResult("COMPLETE", dispatch, undefined, getReceiptByIncidentId(candidate.incident.id));
     }
@@ -1319,19 +1356,24 @@ export function createRedriveService(options: RedriveServiceOptions) {
     incidentId: string,
     permitId: string,
   ) {
-    const existingReceipt = getReceiptByIncidentId(incidentId);
-    if (existingReceipt !== null) {
-      const dispatch = getDispatchById(existingReceipt.dispatchId);
-      if (dispatch === null) throw new Error("Recovery receipt has no dispatch.");
-      return executionResult("COMPLETE", dispatch, undefined, existingReceipt);
-    }
-
     const permit = getPermitById(permitId);
     if (permit === null || permit.incidentId !== incidentId) {
       throw new RedriveError("PERMIT_NOT_FOUND", "The redrive permit was not found.");
     }
+
+    const existingReceipt = getReceiptByIncidentId(incidentId);
+    if (existingReceipt !== null) {
+      const dispatch = getDispatchById(existingReceipt.dispatchId);
+      if (dispatch === null) throw new Error("Recovery receipt has no dispatch.");
+      const candidate = loadCandidate(incidentId);
+      assertDispatchContinuity(candidate, permit, dispatch);
+      return executionResult("COMPLETE", dispatch, undefined, existingReceipt);
+    }
+
     const existingDispatch = getDispatchByPermitId(permit.id);
     if (existingDispatch !== null) {
+      const candidate = loadCandidate(incidentId);
+      assertDispatchContinuity(candidate, permit, existingDispatch);
       if (existingDispatch.state === "DISPATCHING") {
         return executionResult(
           "DISPATCHING",
@@ -1342,8 +1384,7 @@ export function createRedriveService(options: RedriveServiceOptions) {
       if (existingDispatch.state === "FAILED") {
         return executionResult("FAILED", existingDispatch, "The dispatch is terminally failed.");
       }
-      const candidate = loadCandidate(incidentId);
-      return continueDispatch(candidate, existingDispatch);
+      return continueDispatch(candidate, existingDispatch, permit);
     }
     if (permit.state !== "APPROVED") {
       throw new RedriveError(
@@ -1413,7 +1454,7 @@ export function createRedriveService(options: RedriveServiceOptions) {
       return persisted;
     }, "immediate");
 
-    if (dispatch.id !== dispatchId) return continueDispatch(candidate, dispatch);
+    if (dispatch.id !== dispatchId) return continueDispatch(candidate, dispatch, permit);
 
     let acceptedStatusCode: number;
     try {
@@ -1440,7 +1481,7 @@ export function createRedriveService(options: RedriveServiceOptions) {
       providerStatusCode: acceptedStatusCode,
       dispatchedAt: now(),
     });
-    return continueDispatch(candidate, dispatched);
+    return continueDispatch(candidate, dispatched, permit);
   }
 
   return {

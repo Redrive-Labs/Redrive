@@ -1376,6 +1376,36 @@ export function createRecoveryDeploymentService(options: DeploymentServiceOption
         throw new DeploymentReconciliationRequiredError(applying);
       }
 
+      // The repository can change independently of the durable control-plane
+      // transition. Re-read both checkout identity and worktree cleanliness at
+      // the last boundary before applying the consequential patch.
+      try {
+        const head = await runFixedCommand(
+          runner,
+          "git",
+          ["-C", target.repositoryPath, "rev-parse", "HEAD"],
+          { cwd: target.repositoryPath },
+        );
+        if (head.stdout.trim() !== current.candidate.originalRevision) {
+          throw new DeploymentPreconditionError(
+            "The receiver repository HEAD changed before apply.",
+          );
+        }
+        const status = await runFixedCommand(
+          runner,
+          "git",
+          ["-C", target.repositoryPath, "status", "--porcelain"],
+          { cwd: target.repositoryPath },
+        );
+        if (status.stdout.length !== 0) {
+          throw new DeploymentPreconditionError(
+            "The receiver repository worktree became dirty before apply.",
+          );
+        }
+      } catch {
+        throw new DeploymentReconciliationRequiredError(applying);
+      }
+
       try {
         await runFixedCommand(
           runner,
