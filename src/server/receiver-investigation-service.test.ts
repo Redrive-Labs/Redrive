@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
-import { CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION } from "@/agents/recovery-coordinator";
+import {
+  getConnectionRecoveryCoordinatorAgentSpec,
+  CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+} from "@/agents/recovery-coordinator";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import { createIncidentService } from "@/server/incident-service";
 import {
@@ -518,7 +521,10 @@ describe("TrueForge receiver investigation", () => {
     });
     expect(client.createSession).not.toHaveBeenCalled();
     expect(client.getSession).toHaveBeenCalledWith(sessionId);
-    expect(client.updateSession).not.toHaveBeenCalled();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      sessionId,
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
+    );
     expect(client.createTurnStream).toHaveBeenCalledWith(sessionId, {
       input: buildReceiverInvestigationInput(
         applicationConnectionId,

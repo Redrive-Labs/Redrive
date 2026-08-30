@@ -487,21 +487,10 @@ export function createTrueForgeSessionService(
       );
     }
 
-    if (
-      binding.coordinatorSpecVersion === CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION
-    ) {
-      // A current durable binding already records that the remote session was
-      // reconciled. The preceding ensure/verify call proved its identity; use
-      // this fresh binding without rewriting the remote AgentSpec every turn.
-      return resultFor(binding, session.outcome, {
-        retryable: session.retryable,
-        reused: session.reused,
-      });
-    }
-
-    // Upgrade only the explicitly supported prior version on this same remote
-    // session. The durable version is CASed after the remote update so a
-    // concurrent winner can be accepted only after its durable state is read.
+    // Reconcile the current spec on the same remote session. For the explicitly
+    // supported prior version this is also the in-place upgrade. The durable
+    // version is CASed after the remote update so a concurrent winner can be
+    // accepted only after its durable state is read.
     const expectedVersion = binding.coordinatorSpecVersion;
     const coordinatorAgentSpec =
       getConnectionRecoveryCoordinatorAgentSpec(environment);

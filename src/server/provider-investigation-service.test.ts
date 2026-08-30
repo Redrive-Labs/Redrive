@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getConnectionRecoveryCoordinatorAgentSpec,
   CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   RecoveryCoordinatorConfigurationError,
 } from "@/agents/recovery-coordinator";
@@ -728,7 +729,10 @@ describe("TrueForge provider investigation", () => {
       providerStatusCode: 500,
     });
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).not.toHaveBeenCalled();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
+    );
     expect(client.createTurnStream).toHaveBeenCalledWith(
       "existing-session",
       expect.objectContaining({
@@ -767,7 +771,7 @@ describe("TrueForge provider investigation", () => {
     expect(JSON.stringify(events)).not.toContain("receiver failed");
   });
 
-  it("uses the current v2 AgentSpec binding without rewriting the existing session", async () => {
+  it("reconciles the current v2 AgentSpec binding on the existing session", async () => {
     const incident = createIncident();
     installActiveBinding(
       incident.id,
@@ -780,7 +784,10 @@ describe("TrueForge provider investigation", () => {
     await service.investigateProviderForIncident(incident.id);
 
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).not.toHaveBeenCalled();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-v2-session",
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
+    );
   });
 
   it("uses one turn for a valid first attempt and does not retry", async () => {

@@ -869,6 +869,100 @@ describe("TrueForge incident session spine", () => {
     ).toEqual({ coordinator_spec_version: "m2.7-v1" });
   });
 
+  it("reconciles a current m2.7 binding on the same ACTIVE session without creating", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(
+      incident.id,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+    );
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    const environment = makeConnectionEnvironment();
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      environment,
+    );
+
+    const result = await service.ensureCoordinatorForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      outcome: "REUSED",
+      state: "ACTIVE",
+      sessionId: "existing-session",
+      binding: {
+        coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+      },
+    });
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.getSession).toHaveBeenCalledWith("existing-session");
+    expect(client.updateSession).toHaveBeenCalledOnce();
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
+    );
+  });
+
+  it("rebuilds the effective AgentSpec when runtime configuration changes under the same current version", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(
+      incident.id,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+    );
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    const changedEnvironment = {
+      ...makeConnectionEnvironment(),
+      REDRIVE_TRUEFORGE_MODEL: "changed-model",
+      REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: "changed-github-mcp",
+    };
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      changedEnvironment,
+    );
+
+    await service.ensureCoordinatorForIncident(incident.id);
+
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(changedEnvironment),
+    );
+  });
+
+  it("fails closed when current-session reconciliation fails without replacing the binding", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(
+      incident.id,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+    );
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+
+    await expect(
+      service.ensureCoordinatorForIncident(incident.id),
+    ).rejects.toBeInstanceOf(TrueForgeSessionSpecUpgradeError);
+
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(service.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "ACTIVE",
+      trueForgeSessionId: "existing-session",
+      coordinatorSpecVersion: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+    });
+  });
+
   it("never silently downgrades an unsupported newer Coordinator version", async () => {
     const incident = createIncident();
     insertActiveBinding(incident.id, "m2.8-v1");
