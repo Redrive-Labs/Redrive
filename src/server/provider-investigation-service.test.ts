@@ -112,6 +112,13 @@ interface StreamOptions {
   responseContent?: string;
   eventSuffix?: string;
   skillBootstraps?: SkillBootstrapOptions[];
+  schemaIntrospections?: SchemaIntrospectionOptions[];
+}
+
+interface SchemaIntrospectionOptions {
+  thread?: "root" | "child";
+  toolCallId?: string;
+  includeResponse?: boolean;
 }
 
 interface SkillBootstrapOptions {
@@ -362,6 +369,44 @@ function makeStream(
         threadId: bootstrap.responseThreadId ?? threadId,
         toolCallId: bootstrap.responseToolCallId ?? toolCallId,
         content: bootstrap.responseContent ?? "skill bootstrap complete",
+      });
+    }
+  }
+  for (const [index, introspection] of (
+    options.schemaIntrospections ?? []
+  ).entries()) {
+    const toolCallId =
+      introspection.toolCallId ?? `schema-introspection-${index + 1}`;
+    const threadId =
+      introspection.thread === "root" ? "main" : providerThreadId;
+    events.push({
+      type: "model.message",
+      id: `schema-introspection-model-event-${index + 1}`,
+      threadId,
+      content: null,
+      toolCalls: [
+        {
+          id: toolCallId,
+          type: "function",
+          function: {
+            name: "get_tool_output_schema",
+            arguments: JSON.stringify({ tool_name: "get_webhook_delivery" }),
+          },
+          toolInfo: {
+            type: "truefoundry-system",
+            name: "get_tool_output_schema",
+          },
+        },
+      ],
+    });
+    if (introspection.includeResponse !== false) {
+      events.push({
+        type: "tool.response",
+        id: `schema-introspection-response-event-${index + 1}`,
+        createdAt: "2026-08-25T10:00:02.875Z",
+        threadId,
+        toolCallId,
+        content: JSON.stringify({ type: "object" }),
       });
     }
   }
@@ -1126,6 +1171,51 @@ describe("TrueForge provider investigation", () => {
       providerDeliveryId: deliveryId,
       deliveryGuid: "logical-guid-1",
     });
+  });
+
+  it("accepts bounded child-only TrueForge schema introspection before the single evidence call", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(
+      makeStream({ schemaIntrospections: [{}] }),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).resolves.toMatchObject({
+      evidenceDisposition: "CAPTURED",
+      providerStatusCode: 500,
+    });
+  });
+
+  it("rejects schema introspection from the root or without a correlated response", async () => {
+    for (const [index, schemaIntrospections] of [
+      [{ thread: "root" as const }],
+      [{ includeResponse: false }],
+    ].entries()) {
+      const incident = createIncident(`${deliveryId}-schema-${index}`);
+      installActiveBinding(incident.id, `schema-session-${index}`);
+      const client = createClient(
+        makeStream({
+          expectedDeliveryId: incident.externalDeliveryId,
+          schemaIntrospections,
+        }),
+      );
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      await expect(
+        service.investigateProviderForIncident(incident.id),
+      ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+    }
   });
 
   it("fails before remote session work when connection MCP configuration is unavailable", async () => {
