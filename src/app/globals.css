@@ -980,6 +980,22 @@ input:focus-visible {
   margin: 0.35rem 0 0;
 }
 
+.incident-row__open {
+  display: inline-block;
+  margin-top: 0.45rem;
+  color: var(--ink);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 0.2em;
+}
+
+.incident-row__open:hover,
+.incident-row__open[aria-current="true"] {
+  color: var(--accent-deep);
+}
+
 .incident-row__time {
   white-space: nowrap;
 }

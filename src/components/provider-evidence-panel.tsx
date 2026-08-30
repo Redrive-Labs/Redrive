@@ -54,7 +54,7 @@ export function ProviderEvidencePanel({
   }
 
   return (
-    <div className="mt-5 border-t border-[var(--line)] pt-4">
+    <div className="mt-5 min-w-0 max-w-full border-t border-[var(--line)] pt-4">
       <button
         className="inline-flex min-h-10 items-center border border-[var(--ink)] px-3 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--ink)] transition-colors hover:bg-[var(--ink)] hover:text-[var(--paper-bright)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-wait disabled:opacity-60"
         disabled={isLoading}
@@ -79,9 +79,9 @@ export function ProviderEvidencePanel({
       {evidence ? (
         <section
           aria-label="Provider delivery evidence"
-          className="mt-4 grid gap-4 bg-[var(--paper)] p-4 sm:grid-cols-2"
+          className="mt-4 grid min-w-0 max-w-full gap-4 bg-[var(--paper)] p-4 sm:grid-cols-2"
         >
-          <div>
+          <div className="min-w-0">
             <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
               Delivery
             </p>
@@ -94,7 +94,7 @@ export function ProviderEvidencePanel({
               {evidence.outcome.statusCode ?? "not returned"}
             </p>
           </div>
-          <div>
+          <div className="min-w-0">
             <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
               Captured
             </p>
@@ -103,19 +103,19 @@ export function ProviderEvidencePanel({
               canonical JSON sha256: {evidence.request.canonicalPayloadSha256}
             </p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="min-w-0 sm:col-span-2">
             <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
               Request payload
             </p>
-            <pre className="mt-2 max-h-56 overflow-auto border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5">
+            <pre className="mt-2 max-h-56 min-w-0 max-w-full overflow-x-auto overflow-y-auto border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5">
               {formatPayload(evidence.request.payload)}
             </pre>
           </div>
-          <div className="sm:col-span-2">
+          <div className="min-w-0 sm:col-span-2">
             <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
               Provider response
             </p>
-            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5">
+            <pre className="mt-2 max-h-32 min-w-0 max-w-full overflow-x-auto overflow-y-auto whitespace-pre-wrap break-words border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5">
               {evidence.response.body ?? "No response body returned."}
             </pre>
           </div>
