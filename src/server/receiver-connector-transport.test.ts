@@ -29,6 +29,7 @@ import {
 
 const START = new Date("2026-01-01T00:00:00.000Z");
 const APP_CONNECTION_ID = "application-connection-1";
+const SECOND_APP_CONNECTION_ID = "application-connection-2";
 const CONNECTOR_ID = "connector-1";
 const CONNECTOR_SECRET = "connector-secret-1";
 
@@ -57,6 +58,19 @@ function addApplicationConnection(database: SqliteDatabase, id = APP_CONNECTION_
        'octocat/receiver', 'webhook-1', 'https://receiver.example/hooks',
        'READY', ?, ?)`,
     [id, START.toISOString(), START.toISOString()],
+  );
+}
+
+function addSecondApplicationConnection(database: SqliteDatabase): void {
+  database.run(
+    `INSERT INTO application_connections
+      (id, provider, github_installation_id, repository_id,
+       repository_full_name, webhook_id, webhook_target_display, state,
+       created_at, updated_at)
+     VALUES (?, 'github', 'installation-1', 'repository-2',
+       'octocat/other-receiver', 'webhook-2', 'https://receiver.example/hooks',
+       'READY', ?, ?)`,
+    [SECOND_APP_CONNECTION_ID, START.toISOString(), START.toISOString()],
   );
 }
 
@@ -428,7 +442,7 @@ describe("central receiver connector transport foundation", () => {
       });
     });
     const httpTransport = new ConcreteRedriveHttpTransport({
-      redriveUrl: "http://redrive.test",
+      redriveUrl: "http://localhost",
       fetchImpl,
     });
     const transport: RedriveTransport = {
@@ -439,7 +453,7 @@ describe("central receiver connector transport foundation", () => {
     };
     const worker = new ReceiverConnectorWorker({
       config: {
-        redriveUrl: "http://redrive.test",
+        redriveUrl: "http://localhost",
         enrollmentToken: "enrollment-token",
         observerDatabaseUrl: "postgresql://observer.invalid/receiver",
         receiverHealthUrl: "http://receiver.invalid/health",
@@ -496,6 +510,53 @@ describe("central receiver connector transport foundation", () => {
     expect(() => jobs.fail(failJob.id, fakePrincipal, failLease.leaseGeneration, "CONNECTOR_ERROR"))
       .toThrowError(expect.objectContaining({ code: "UNAUTHENTICATED" }));
     expect(jobs.getById(failJob.id)?.state).toBe("LEASED");
+  });
+
+  it("scopes completion and failure lookup to the authenticated receiver", () => {
+    addSecondApplicationConnection(database);
+    const ownerEnrollment = enroll(issue().token);
+    const otherEnrollment = connections.enroll({
+      protocolVersion: RECEIVER_CONNECTOR_PROTOCOL_VERSION,
+      enrollmentToken: connections.issue(SECOND_APP_CONNECTION_ID).token,
+      connectorId: "connector-2",
+      connectorSecret: "connector-secret-2",
+      capabilities: [...RECEIVER_CAPABILITIES],
+    });
+    const owner = connections.authenticate(CONNECTOR_ID, CONNECTOR_SECRET);
+    const other = connections.authenticate("connector-2", "connector-secret-2");
+    const job = jobs.createHealthJob(ownerEnrollment.receiverConnection.id);
+    const lease = jobs.lease(job.id, owner);
+    const healthResult = {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: now.toISOString(),
+    } as const;
+
+    const completed = jobs.complete(
+      job.id,
+      owner,
+      lease.leaseGeneration,
+      healthResult,
+    );
+    expect(completed.state).toBe("SUCCEEDED");
+    expect(jobs.complete(job.id, owner, lease.leaseGeneration, healthResult)).toEqual(completed);
+
+    const missingJobId = "job-does-not-exist";
+    expect(() => jobs.complete(job.id, other, lease.leaseGeneration, healthResult))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND" }));
+    expect(() => jobs.complete(missingJobId, other, lease.leaseGeneration, healthResult))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND" }));
+    expect(() => jobs.fail(job.id, other, lease.leaseGeneration, "CONNECTOR_ERROR"))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND" }));
+    expect(() => jobs.fail(missingJobId, other, lease.leaseGeneration, "CONNECTOR_ERROR"))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND" }));
+    expect(() => jobs.complete(missingJobId, {
+      receiverConnectionId: otherEnrollment.receiverConnection.id,
+      connectorId: "connector-2",
+      receiverConnection: otherEnrollment.receiverConnection,
+    } as AuthenticatedReceiverConnector, lease.leaseGeneration, healthResult))
+      .toThrowError(expect.objectContaining({ code: "UNAUTHENTICATED" }));
+    expect(otherEnrollment.receiverConnection.id).not.toBe(ownerEnrollment.receiverConnection.id);
   });
 
   it("validates all business result counts and delivery identity", () => {

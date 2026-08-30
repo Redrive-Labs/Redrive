@@ -302,6 +302,32 @@ function assertAuthenticatedReceiver(
   return normalized;
 }
 
+function getOwnedReceiverReadJobOrThrow(
+  database: SqliteDatabase,
+  jobId: string,
+  authentication: unknown,
+): { row: ReceiverReadJobRow; auth: { receiverConnectionId: string; connectorId: string } } {
+  const auth = readAuthentication(authentication);
+  assertAuthenticatedReceiver(
+    database,
+    authentication,
+    auth.receiverConnectionId,
+  );
+  const row = database.get<ReceiverReadJobRow>(
+    `SELECT ${receiverReadJobColumns}
+       FROM receiver_read_jobs
+      WHERE id = ? AND receiver_connection_id = ?`,
+    [jobId, auth.receiverConnectionId],
+  );
+  if (row === undefined) {
+    throw new ReceiverReadJobError(
+      "JOB_NOT_FOUND",
+      "The receiver read job was not found.",
+    );
+  }
+  return { row, auth };
+}
+
 function readReceiverState(value: unknown): ReceiverConnectionState {
   if (
     value !== RECEIVER_CONNECTION_WAITING_FOR_RECEIVER &&
@@ -972,19 +998,9 @@ function createReceiverReadJobServiceWithCompletion(
     const now = readClockValue(clock, explicitNow);
     const timestamp = now.toISOString();
     const outcome = database.transaction(() => {
-      const row = getReceiverReadJobRow(database, jobId);
-      if (row === undefined) {
-        throw new ReceiverReadJobError(
-          "JOB_NOT_FOUND",
-          "The receiver read job was not found.",
-        );
-      }
-      const receiverConnectionId = readText(row, "receiverConnectionId");
-      const auth = assertAuthenticatedReceiver(
-        database,
-        authentication,
-        receiverConnectionId,
-      );
+      const owned = getOwnedReceiverReadJobOrThrow(database, jobId, authentication);
+      const { row, auth } = owned;
+      const receiverConnectionId = auth.receiverConnectionId;
       const state = readJobState(row);
       if (
         state === RECEIVER_READ_JOB_SUCCEEDED &&
@@ -1123,7 +1139,9 @@ function createReceiverReadJobServiceWithCompletion(
         "The receiver read job deadline has expired.",
       );
     }
-    return getReceiverReadJobOrThrow(database, jobId);
+    return mapReceiverReadJob(
+      getOwnedReceiverReadJobOrThrow(database, jobId, authentication).row,
+    );
   }
 
   function fail(
@@ -1144,19 +1162,9 @@ function createReceiverReadJobServiceWithCompletion(
     const now = readClockValue(clock, explicitNow);
     const timestamp = now.toISOString();
     const outcome = database.transaction(() => {
-      const row = getReceiverReadJobRow(database, jobId);
-      if (row === undefined) {
-        throw new ReceiverReadJobError(
-          "JOB_NOT_FOUND",
-          "The receiver read job was not found.",
-        );
-      }
-      const receiverConnectionId = readText(row, "receiverConnectionId");
-      const auth = assertAuthenticatedReceiver(
-        database,
-        authentication,
-        receiverConnectionId,
-      );
+      const owned = getOwnedReceiverReadJobOrThrow(database, jobId, authentication);
+      const { row, auth } = owned;
+      const receiverConnectionId = auth.receiverConnectionId;
       const state = readJobState(row);
       if (
         state === RECEIVER_READ_JOB_FAILED &&
@@ -1249,7 +1257,9 @@ function createReceiverReadJobServiceWithCompletion(
         "The receiver read job deadline has expired.",
       );
     }
-    return getReceiverReadJobOrThrow(database, jobId);
+    return mapReceiverReadJob(
+      getOwnedReceiverReadJobOrThrow(database, jobId, authentication).row,
+    );
   }
 
   return { ...base, complete, fail };

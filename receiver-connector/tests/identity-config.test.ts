@@ -32,7 +32,7 @@ function temporaryDirectory(): string {
 
 function environment(stateDir: string, token?: string): Record<string, string> {
   return {
-    REDRIVE_URL: "http://redrive.test:4317",
+    REDRIVE_URL: "https://redrive.test:4317",
     ...(token === undefined ? {} : { REDRIVE_ENROLLMENT_TOKEN: token }),
     REDRIVE_OBSERVER_DATABASE_URL: "postgresql://127.0.0.1:5434/receiver",
     REDRIVE_RECEIVER_HEALTH_URL: "http://127.0.0.1:3000/health",
@@ -41,10 +41,31 @@ function environment(stateDir: string, token?: string): Record<string, string> {
 }
 
 describe("receiver connector configuration and identity", () => {
-  it("accepts an arbitrary configured Redrive origin and keeps enrollment optional", () => {
+  it("accepts a remote HTTPS Redrive origin and keeps enrollment optional", () => {
     const config = loadConfig(environment(temporaryDirectory()));
-    expect(config.redriveUrl).toBe("http://redrive.test:4317");
+    expect(config.redriveUrl).toBe("https://redrive.test:4317");
     expect(config.enrollmentToken).toBeUndefined();
+  });
+
+  it.each([
+    "http://localhost:4317",
+    "http://127.0.0.1:4317",
+    "http://[::1]:4317",
+  ])("accepts local HTTP Redrive origin %s", (redriveUrl) => {
+    expect(loadConfig({ ...environment(temporaryDirectory()), REDRIVE_URL: redriveUrl }).redriveUrl)
+      .toBe(redriveUrl);
+  });
+
+  it.each([
+    "http://redrive.test:4317",
+    "https://user@redrive.test:4317",
+    "https://user:password@redrive.test:4317",
+    "https://redrive.test:4317/path",
+    "https://redrive.test:4317?query=value",
+    "https://redrive.test:4317#fragment",
+  ])("rejects unsafe or non-origin Redrive URL %s", (redriveUrl) => {
+    expect(() => loadConfig({ ...environment(temporaryDirectory()), REDRIVE_URL: redriveUrl }))
+      .toThrowError(/REDRIVE_URL/);
   });
 
   it("persists a high-entropy identity before returning it and uses restrictive permissions", () => {

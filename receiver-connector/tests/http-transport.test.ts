@@ -218,6 +218,28 @@ function centralCompletionResponse(
 }
 
 describe("ConcreteRedriveHttpTransport", () => {
+  it.each([
+    ["remote HTTPS", "https://redrive.example:4317"],
+    ["localhost HTTP", "http://localhost:4317"],
+    ["127.0.0.1 HTTP", "http://127.0.0.1:4317"],
+    ["IPv6 loopback HTTP", "http://[::1]:4317"],
+  ])("accepts %s Redrive origins", (_label, redriveUrl) => {
+    expect(() => new ConcreteRedriveHttpTransport({ redriveUrl })).not.toThrow();
+  });
+
+  it.each([
+    "http://redrive.example:4317",
+    "https://user@redrive.example:4317",
+    "https://user:password@redrive.example:4317",
+    "https://redrive.example:4317/path",
+    "https://redrive.example:4317?query=value",
+    "https://redrive.example:4317#fragment",
+  ])("rejects unsafe or non-origin Redrive URL %s", (redriveUrl) => {
+    expect(() => new ConcreteRedriveHttpTransport({ redriveUrl })).toThrowError(
+      expect.objectContaining({ code: "TRANSPORT_REJECTED" }),
+    );
+  });
+
   it("enrolls with the exact body and no connector auth headers", async () => {
     const server = await startServer((_request, response) => {
       sendJson(response, centralEnrollmentResponse("connector-id"));

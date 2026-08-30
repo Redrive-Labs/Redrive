@@ -1,4 +1,5 @@
 import { ConfigurationError } from "./errors.js";
+import { normalizeRedriveOrigin } from "./redrive-url.js";
 
 export interface ConnectorConfig {
   readonly redriveUrl: string;
@@ -37,24 +38,11 @@ function optionalText(environment: Environment, name: string, maximumLength: num
 }
 
 function parseOrigin(value: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
+  const origin = normalizeRedriveOrigin(value);
+  if (origin === null) {
     throw new ConfigurationError("REDRIVE_URL must be a valid HTTP(S) origin.");
   }
-  if (
-    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.pathname !== "/" ||
-    parsed.search !== "" ||
-    parsed.hash !== "" ||
-    parsed.origin === "null"
-  ) {
-    throw new ConfigurationError("REDRIVE_URL must be a valid HTTP(S) origin.");
-  }
-  return parsed.origin;
+  return origin;
 }
 
 function parseHealthUrl(value: string): string {

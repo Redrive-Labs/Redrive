@@ -7,6 +7,7 @@ import {
   type ConnectorIdentity,
 } from "./model.js";
 import { TransportError } from "./errors.js";
+import { normalizeRedriveOrigin } from "./redrive-url.js";
 import type {
   CompleteRequest,
   EnrollmentRequest,
@@ -44,32 +45,15 @@ function hasOwn(value: Record<string, unknown>, key: string): boolean {
 }
 
 function normalizeOrigin(value: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new TransportError(
-      "TRANSPORT_REJECTED",
-      "The configured Redrive URL is invalid.",
-      false,
-    );
-  }
-  if (
-    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.pathname !== "/" ||
-    parsed.search !== "" ||
-    parsed.hash !== "" ||
-    parsed.origin === "null"
-  ) {
+  const origin = normalizeRedriveOrigin(value);
+  if (origin === null) {
     throw new TransportError(
       "TRANSPORT_REJECTED",
       "The configured Redrive URL must be an HTTP(S) origin.",
       false,
     );
   }
-  return parsed.origin;
+  return origin;
 }
 
 function positiveBound(
