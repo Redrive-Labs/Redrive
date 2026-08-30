@@ -10,6 +10,8 @@ const PUBLIC_PATHS = new Set([
   // Logout only expires the cookie and must also clear stale sessions.
   "/api/operator/logout",
   "/api/mcp/github",
+  "/api/mcp/receiver",
+  "/api/receiver/enroll",
   "/api/integrations/github/app-manifest/callback",
   "/api/integrations/github/install/callback",
   "/api/integrations/github/app-webhook-disabled",
@@ -18,7 +20,11 @@ const PUBLIC_PATHS = new Set([
 function isPublicPath(pathname: string): boolean {
   const normalizedPathname =
     pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
-  return PUBLIC_PATHS.has(normalizedPathname);
+  return (
+    PUBLIC_PATHS.has(normalizedPathname) ||
+    normalizedPathname === "/api/receiver/jobs/lease" ||
+    /^\/api\/receiver\/jobs\/[^/]+\/complete$/.test(normalizedPathname)
+  );
 }
 
 function isFrameworkAsset(pathname: string): boolean {

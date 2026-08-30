@@ -83,6 +83,10 @@ describe("operator proxy", () => {
     "/api/operator/login",
     "/api/operator/logout",
     "/api/mcp/github",
+    "/api/mcp/receiver",
+    "/api/receiver/enroll",
+    "/api/receiver/jobs/lease",
+    "/api/receiver/jobs/job-1/complete",
     "/api/integrations/github/app-manifest/callback",
     "/api/integrations/github/install/callback",
     "/api/integrations/github/app-webhook-disabled",
@@ -95,6 +99,21 @@ describe("operator proxy", () => {
     const session = createOperatorSession(process.env) as string;
     const response = proxy(request("/api/mcp/github", session));
     expect(response.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  it("does not use an operator cookie as authentication for connector jobs", () => {
+    const session = createOperatorSession(process.env) as string;
+    const response = proxy(request("/api/receiver/jobs/job-1/complete", session));
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  it.each([
+    "/api/receiver/jobs/job-1/admin",
+    "/api/receiver/jobs/job-1/complete/extra",
+  ])("keeps unsupported receiver job path %s operator protected", (pathname) => {
+    const response = proxy(request(pathname));
+    expect(response.status).toBe(401);
+    expect(response.headers.get("content-type")).toContain("application/json");
   });
 
   it.each(["/_next/static/chunk.js", "/_next/image?url=%2Flogo.png&w=64&q=75"])(
