@@ -378,6 +378,62 @@ const migrations: Migration[] = [
     version: 11,
     apply: migrateM27BProvenanceConstraints,
   },
+  {
+    version: 12,
+    sql: `
+      CREATE TABLE recovery_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        incident_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'SESSION_CREATING',
+            'SESSION_UNCERTAIN',
+            'READY',
+            'RUNNING',
+            'REPAIR_VERIFIED',
+            'FAILED',
+            'SESSION_LOST'
+          )
+        ),
+        creation_token TEXT,
+        trueforge_session_id TEXT UNIQUE,
+        recovery_spec_version TEXT NOT NULL,
+        source_repository_full_name TEXT NOT NULL,
+        original_revision TEXT NOT NULL,
+        provider_status_code INTEGER NOT NULL,
+        receiver_pre_count INTEGER NOT NULL CHECK (receiver_pre_count >= 0),
+        delivery_guid TEXT NOT NULL,
+        trueforge_turn_id TEXT,
+        result_json TEXT,
+        patch_text TEXT,
+        patch_sha256 TEXT,
+        reproduction_pre_count INTEGER CHECK (reproduction_pre_count IS NULL OR reproduction_pre_count >= 0),
+        reproduction_http_status INTEGER,
+        reproduction_post_count INTEGER CHECK (reproduction_post_count IS NULL OR reproduction_post_count >= 0),
+        verification_pre_count INTEGER CHECK (verification_pre_count IS NULL OR verification_pre_count >= 0),
+        verification_http_status INTEGER,
+        verification_post_count INTEGER CHECK (verification_post_count IS NULL OR verification_post_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        verified_at TEXT,
+        CHECK (
+          (state = 'SESSION_CREATING'
+            AND trueforge_session_id IS NULL
+            AND creation_token IS NOT NULL)
+          OR (state = 'SESSION_UNCERTAIN'
+            AND trueforge_session_id IS NULL)
+          OR (state = 'SESSION_LOST'
+            AND trueforge_session_id IS NOT NULL)
+          OR (state IN ('READY', 'RUNNING', 'REPAIR_VERIFIED', 'FAILED'))
+        ),
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX recovery_attempts_state_idx
+        ON recovery_attempts (state, updated_at, id);
+    `,
+  },
 ];
 
 export class SqliteDatabase {
