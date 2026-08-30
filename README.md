@@ -1,116 +1,154 @@
 # Redrive
 
-> Repair the consumer before replaying the event.
+> Failed doesn’t mean safe to retry.
+
+Redrive is a proof-gated webhook recovery control plane that investigates both sides of a failed delivery, repairs the receiver in an isolated sandbox, and only allows replay after machine-verifiable evidence and explicit human approval.
+
+![Redrive recovery cockpit](.visual-review/ship-desktop-polished.png)
 
 ## The problem
 
-Webhook systems can tell you that a delivery failed.
-
-They cannot necessarily tell you whether the business operation failed.
-
-Consider:
+GitHub can report HTTP 500 even after the receiver already changed business state.
 
 ```text
-webhook arrives
-      ↓
-receiver changes business state
-      ↓
-later operation fails
-      ↓
-receiver returns HTTP 500
+GitHub: HTTP 500
+Receiver: mutationCount = 1 / EXACTLY_ONE
 ```
 
-The provider records a failed delivery, but the business mutation has already
-occurred.
+Blind retry can duplicate the business mutation.
 
-Blind replay can perform it again.
+Redrive’s rule:
+
+**No proof, no retry.**
 
 ## What Redrive does
 
-Redrive treats a failed webhook as a recovery incident rather than immediately
-retrying it.
+1. Provider Investigator checks the exact GitHub delivery.
+2. Receiver Investigator independently checks business state.
+3. Redrive deterministically compares both observations.
+4. Contradiction ⇒ `RETRY UNSAFE / BLOCKED`.
+5. Recovery Agent reproduces the failure at the exact revision in an isolated sandbox.
+6. It generates and verifies a repair.
+7. A human approves deployment.
+8. Redrive verifies the deployed receiver.
+9. A second human approval unlocks exactly one GitHub redelivery.
+10. Final independent receiver observation proves the business mutation still occurred exactly once.
+
+## Why TrueForge is load-bearing
+
+TrueForge is the runtime spine for one persistent, incident-bound recovery session. Redrive uses it for:
+
+- persistent incident-bound Coordinator sessions
+- dynamic Provider Investigator and Receiver Investigator subagents
+- MCP tool execution for GitHub and receiver evidence
+- persisted tool and event provenance
+- a separate sandbox-enabled Recovery Session
+- isolated repair and reproduction workflow
+- human-controlled consequential stages
+
+Provider and receiver evidence use separate read-only MCP evidence boundaries with deterministic attribution. Redrive does not claim hard per-child credential isolation.
+
+**AI reasons, integrations observe, deterministic code proves, humans authorize.**
+
+## Architecture
 
 ```text
-failed delivery
-      ↓
-provider + receiver investigation
-      ↓
-sandbox reproduction
-      ↓
-generated receiver repair
-      ↓
-adversarial replay verification
-      ↓
-human approval
-      ↓
-deploy
-      ↓
-human approval
-      ↓
-redrive original event
-      ↓
-independent business verification
+GitHub ----> Provider Investigator --\
+                                      \
+                                       deterministic contradiction
+                                      /
+Receiver --> Receiver Investigator --/
+
+                 |
+              BLOCKED
+                 |
+       TrueForge Recovery Session
+                 |
+              Daytona
+      reproduce -> repair -> verify
+                 |
+          Human DeployPermit
+                 |
+         deploy + verify
+                 |
+         Human RedrivePermit
+                 |
+          GitHub redelivery
+                 |
+         final EXACTLY_ONE proof
 ```
 
-The goal is not merely a successful HTTP response.
+## Real proof from the build
 
-The goal is a successful provider delivery with the intended business effect
-occurring exactly once.
+The build produced these observed recovery facts:
 
-## Core ideas
+**Provider**
 
-### Evidence before action
+- GitHub HTTP 500
 
-Consequential recovery actions become available only after machine-checkable
-evidence has been established.
+**Receiver**
 
-### Repair before replay
+- `EXACTLY_ONE`
+- `mutationCount = 1`
 
-If the consumer is unsafe, retrying transport does not solve the incident.
+**Deterministic contradiction**
 
-### Reproduction fidelity
+- `PROVIDER_FAILED_RECEIVER_MUTATED`
+- recovery `BLOCKED`
 
-Redrive records how each relevant dependency was represented during sandbox
-verification and refuses consequential recovery when a required causal
-dependency remains unresolved.
+**TrueForge / Daytona recovery proof**
 
-### Human control
+- exact failing revision: `5bfadf93d5233e4e6cfe0fdb19ad1b78328a5d79`
+- reproduction: `0 → HTTP 500 → 1`
+- repair verification: `1 → HTTP 201 → 1`
+- patch SHA: `6496e9635406f56d19f08bab431ceda87005ea32d543375aade59d84ee960a39`
+- recovery session: `01m19pb0gxpgpwenhn37tnfkb1`
 
-Deployment and provider redelivery are separate consequential actions and are
-independently approval-gated.
+The same delivery succeeds after repair without increasing the business mutation count.
 
-## Hackathon implementation
+## Safety over pretending success
 
-The initial system uses:
+During final live redelivery validation, the external route produced an HTTP 504 after the single permitted redelivery. Redrive preserved that ambiguous result and refused to issue another blind redelivery.
 
-- GitHub Webhooks;
-- TrueForge;
-- Daytona;
-- Docker Compose;
-- PostgreSQL;
-- a custom GitHub MCP integration;
-- an independent receiver repository.
+That is the safety property working. It is not `RECOVERY_COMPLETE`.
 
-See:
+## Human gates
 
-- `docs/ARCHITECTURE.md`
-- `docs/INVARIANTS.md`
+The two approvals authorize different consequential actions:
 
-## Status
+- **DeployPermit**: authorizes deploying exactly the verified repair artifact
+- **RedrivePermit**: authorizes exactly one provider redelivery only after deployment verification
 
-Active hackathon development.
+## Qodo
 
-## Operator access
+Qodo was used throughout development and caught substantive correctness bugs, including:
 
-Redrive is currently a single-operator, self-hosted control plane. Configure a
-high-entropy `REDRIVE_OPERATOR_TOKEN` of at least 32 characters. The operator
-UI and control APIs require login at `/login`. GitHub callbacks retain their
-state-token authentication, and `/api/mcp/github` retains separate bearer
-authentication. The read-only `/api/mcp/receiver` surface uses its own
-`REDRIVE_RECEIVER_MCP_TOKEN` bearer secret; it is independent from operator,
-GitHub MCP, and connector authentication.
+- migration initialization race
+- unsafe provider-evidence parsing and numeric handling
+- sandbox artifact provenance
+- stale candidate state during redelivery continuation
+- deployment HEAD/worktree time-of-check to time-of-use (TOCTOU)
 
-## Run the control plane locally
+These were safety and correctness findings, not style-only review. See [PR #7](https://github.com/Redrive-Labs/Redrive/pull/7).
+
+## Demo
+
+Demo video: <PLACEHOLDER_FOR_CURRENT_YOUTUBE_URL>
+
+Source: [Redrive on GitHub](https://github.com/Redrive-Labs/Redrive)
+
+## Tech
+
+- Next.js / TypeScript
+- SQLite
+- TrueForge
+- MCP
+- Daytona
+- GitHub App / Webhooks
+- PostgreSQL demo receiver
+- Docker Compose
+
+## Run locally
 
 Requirements: Node.js 22 or newer and npm.
 
@@ -119,64 +157,25 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The development capture
-form records minimal incident metadata in `.local/redrive.sqlite`. Each incident
-can use the control-plane action to investigate one GitHub delivery through the
-connection-backed read-only MCP endpoint. The normalized evidence is stored in the same
-SQLite database. The database directory and schema are created automatically on
-first use.
+Open [http://localhost:3000](http://localhost:3000). The development capture form records minimal incident metadata in `.local/redrive.sqlite`. Each incident can use the control-plane action to investigate one GitHub delivery through the connection-backed read-only MCP endpoint. Normalized evidence is stored in the same SQLite database. Redrive creates the database directory and schema on first use.
 
-To use another local SQLite path, copy `.env.example` to `.env.local` and set
-`REDRIVE_DATABASE_PATH`. GitHub App private keys are stored outside the
-repository at `$HOME/.redrive/secrets` by default. Redrive creates the
-`.redrive` and `secrets` directories with mode `0700` and private-key files
-with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit
-absolute directory when required; its ownership, ancestor, symlink, and
-permission checks remain enforced. Set the required server-side
-`REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
-Connection-backed M2.7B incidents use
-`REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME`, whose configured server must
-point at Redrive's strict `/api/mcp/github` endpoint. Set
-`REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to its server-side bearer secret.
-The receiver investigation uses the distinct
-`REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME` and
-`REDRIVE_RECEIVER_MCP_TOKEN` values for the strict `/api/mcp/receiver` endpoint.
-TrueForge Settings owns the MCP server URL and credentials. Redrive does not
-select or interpret a provider, and TrueForge credentials stay server-side.
-Provider and receiver turns are role-separated, independently authenticated
-evidence boundaries with deterministic fail-closed tool correlation. Per-child
-MCP resource visibility remains LIVE VALIDATION REQUIRED for the current
-TrueForge SDK/API.
+To use another local SQLite path, copy `.env.example` to `.env.local` and set `REDRIVE_DATABASE_PATH`. GitHub App private keys are stored outside the repository at `$HOME/.redrive/secrets` by default. Redrive creates the `.redrive` and `secrets` directories with mode `0700` and private-key files with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit absolute directory when required; ownership, ancestor, symlink, and permission checks remain enforced.
 
-`externalDeliveryId` and normalized `providerDeliveryId` identify the exact
-GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook
-identity (`guid`) carried by `X-GitHub-Delivery`, which receivers should use for
-idempotency. Capture fails closed if those identities, the request header, or
-the configured repository evidence contradict each other.
+Set the required server-side `REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model or resource name. Connection-backed incidents use `REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME`, whose configured server must point at Redrive’s strict `/api/mcp/github` endpoint. Set `REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to its server-side bearer secret.
 
-`GET /api/incidents/:incidentId/provider-evidence` reads only the persisted
-snapshot and returns `{ "evidence": null }` before capture. Provider evidence
-is captured by the connection-backed TrueForge investigation. The first
-normalized snapshot is immutable. MCP reads time out after 12 seconds and
-reject transport responses larger than 64 MiB.
+Receiver investigation uses the distinct `REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME` and `REDRIVE_RECEIVER_MCP_TOKEN` values for the strict `/api/mcp/receiver` endpoint. TrueForge Settings owns the MCP server URL and credentials. Redrive does not select or interpret a provider, and TrueForge credentials stay server-side. Provider and receiver turns are role-separated, independently authenticated evidence boundaries with deterministic fail-closed tool correlation. Per-child MCP resource visibility remains live validation required for the current TrueForge SDK/API.
 
-`POST /api/incidents/:incidentId/provider-investigation` runs the recovery path
-through the incident's existing TrueForge session. Connection-backed incidents
-use `m2.7-v1` and the strict connection MCP server. The route then requires a
-dynamic `provider-investigator` thread and correlates its read-only
-`get_webhook_delivery` model tool call and `tool.response`. Only that response
-is normalized as provider evidence. The route returns product state, not a
-TrueForge transcript.
-GitHub caps webhook payloads at 25 MB; the higher transport limit allows for
-the escaped JSON-RPC text envelope while remaining bounded.
+`externalDeliveryId` and normalized `providerDeliveryId` identify the exact GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook identity (`guid`) carried by `X-GitHub-Delivery`, which receivers should use for idempotency. Capture fails closed if those identities, the request header, or configured repository evidence contradict each other.
 
+`GET /api/incidents/:incidentId/provider-evidence` reads only the persisted snapshot and returns `{ "evidence": null }` before capture. Provider evidence is captured by the connection-backed TrueForge investigation. The first normalized snapshot is immutable. MCP reads time out after 12 seconds and reject transport responses larger than 64 MiB.
 
-The stored `canonicalPayloadSha256` is SHA-256 of Redrive's canonical JSON
-representation of the provider-returned payload. It is not a hash of the
-original webhook request-body bytes, which Redrive does not possess here.
+`POST /api/incidents/:incidentId/provider-investigation` runs the recovery path through the incident’s existing TrueForge session. Connection-backed incidents use `m2.7-v1` and the strict connection MCP server. The route then requires a dynamic `provider-investigator` thread and correlates its read-only `get_webhook_delivery` model tool call and `tool.response`. Only that response is normalized as provider evidence. The route returns product state, not a TrueForge transcript.
 
-For remote or Tailscale development, optionally set the comma-separated
-`NEXT_ALLOWED_DEV_ORIGINS` hostnames in `.env.local`.
+GitHub caps webhook payloads at 25 MB. The higher transport limit allows for the escaped JSON-RPC text envelope while remaining bounded.
+
+The stored `canonicalPayloadSha256` is SHA-256 of Redrive’s canonical JSON representation of the provider-returned payload. It is not a hash of the original webhook request-body bytes, which Redrive does not possess here.
+
+For remote or Tailscale development, optionally set comma-separated `NEXT_ALLOWED_DEV_ORIGINS` hostnames in `.env.local`.
 
 ```bash
 npm run lint
