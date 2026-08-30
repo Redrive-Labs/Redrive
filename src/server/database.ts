@@ -571,6 +571,19 @@ function migrateM27BProvenanceConstraints(database: SqliteDatabase): void {
       ON DELETE RESTRICT;
     CREATE INDEX provider_evidence_application_connection_idx
       ON provider_evidence (application_connection_id);
+    UPDATE provider_evidence
+    SET application_connection_id = (
+      SELECT application_connection_id
+      FROM incidents
+      WHERE incidents.id = provider_evidence.incident_id
+    )
+    WHERE provider_evidence.application_connection_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM incidents
+        WHERE incidents.id = provider_evidence.incident_id
+          AND incidents.application_connection_id IS NOT NULL
+      );
   `);
 
   // Migration 10 briefly made tool_response_event_id globally unique. Rebuild
