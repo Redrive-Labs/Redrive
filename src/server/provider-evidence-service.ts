@@ -45,6 +45,7 @@ export class ProviderEvidenceConflictError extends Error {
 
 interface ProviderEvidenceRow extends Record<string, unknown> {
   incidentId: unknown;
+  applicationConnectionId: unknown;
   schemaVersion: unknown;
   provider: unknown;
   providerDeliveryId: unknown;
@@ -83,6 +84,18 @@ function readIntegerOrNull(
   return value;
 }
 
+function readNullableText(
+  row: Record<string, unknown>,
+  field: string,
+): string | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Provider evidence row has an invalid ${field} value.`);
+  }
+  return value;
+}
+
 function mapProviderEvidenceRow(
   row: ProviderEvidenceRow,
   expectedIncidentId: string,
@@ -97,9 +110,27 @@ function mapProviderEvidenceRow(
   }
 
   const evidence = parseProviderEvidence(parsed);
+  const applicationConnectionId = readNullableText(
+    row,
+    "applicationConnectionId",
+  );
 
   if (row.incidentId !== expectedIncidentId) {
     throw new Error("Provider evidence row has an invalid incident ID.");
+  }
+  if (
+    evidence.incidentId !== undefined &&
+    evidence.incidentId !== expectedIncidentId
+  ) {
+    throw new Error("Provider evidence JSON has an invalid incident ID.");
+  }
+  if (
+    evidence.applicationConnectionId !== undefined &&
+    evidence.applicationConnectionId !== applicationConnectionId
+  ) {
+    throw new Error(
+      "Provider evidence JSON has an invalid application connection ID.",
+    );
   }
 
   if (
@@ -118,11 +149,16 @@ function mapProviderEvidenceRow(
     );
   }
 
-  return evidence;
+  return {
+    ...evidence,
+    incidentId: expectedIncidentId,
+    ...(applicationConnectionId === null ? {} : { applicationConnectionId }),
+  };
 }
 
 const providerEvidenceColumns = `
   incident_id AS incidentId,
+  application_connection_id AS applicationConnectionId,
   schema_version AS schemaVersion,
   provider,
   provider_delivery_id AS providerDeliveryId,
@@ -224,7 +260,7 @@ export function createProviderEvidenceService(
       throw new UnsupportedProviderEvidenceError(incident.provider);
     }
 
-    return normalizeGithubWebhookDelivery(
+    const evidence = normalizeGithubWebhookDelivery(
       result,
       {
         repositoryId: incident.repositoryId,
@@ -232,6 +268,13 @@ export function createProviderEvidenceService(
       },
       capturedAt,
     );
+    return {
+      ...evidence,
+      incidentId,
+      ...(incident.applicationConnectionId === undefined
+        ? {}
+        : { applicationConnectionId: incident.applicationConnectionId }),
+    };
   }
 
 
@@ -253,10 +296,16 @@ export function createProviderEvidenceService(
     evidence: ProviderEvidence,
     evidenceJson: string,
   ): ProviderEvidenceReconciliation {
+    if (evidence.incidentId !== incidentId) {
+      throw new Error(
+        "Provider evidence provenance does not match the incident.",
+      );
+    }
     const insertion = database.run(
       `
         INSERT INTO provider_evidence (
           incident_id,
+          application_connection_id,
           schema_version,
           provider,
           provider_delivery_id,
@@ -269,6 +318,7 @@ export function createProviderEvidenceService(
           captured_at
         ) VALUES (
           @incidentId,
+          @applicationConnectionId,
           @schemaVersion,
           @provider,
           @providerDeliveryId,
@@ -284,6 +334,7 @@ export function createProviderEvidenceService(
       `,
       {
         incidentId,
+        applicationConnectionId: evidence.applicationConnectionId ?? null,
         schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
         provider: GITHUB_PROVIDER,
         providerDeliveryId: evidence.providerDeliveryId,

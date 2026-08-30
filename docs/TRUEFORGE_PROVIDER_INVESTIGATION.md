@@ -2,7 +2,7 @@
 
 Provider investigation uses one persistent TrueForge Coordinator session per
 connection-backed incident. The session is reused for later turns and is
-reconciled before each turn with semantic Coordinator spec `m2.6b-v1`.
+reconciled before each turn with semantic Coordinator spec `m2.7-v1`.
 
 ## 1. Configure the Redrive-owned GitHub MCP endpoint
 
@@ -81,6 +81,13 @@ Set:
 - `REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME` to the strict connection MCP server name;
 - `REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to the server-side bearer token for the strict MCP route.
 
+The receiver investigation uses a distinct Receiver MCP resource and bearer
+token. Provider and receiver turns are role-separated, independently
+authenticated evidence boundaries with deterministic fail-closed tool
+correlation. Per-child MCP resource visibility is LIVE VALIDATION REQUIRED for
+the current static TrueForge SDK/API; the Coordinator instructions still
+prohibit cross-role calls.
+
 Missing deterministic configuration fails closed before remote session or turn
 work. The connection and delivery identifiers come from durable incident state.
 
@@ -104,7 +111,7 @@ curl -X POST \
 ```
 
 For a connection-backed incident, confirm from the response and durable records
-that the same TrueForge session was reused, its binding is `m2.6b-v1`, and the
+that the same TrueForge session was reused, its binding is `m2.7-v1`, and the
 turn produced `thread.created` for `provider-investigator`, exactly one matching
 `get_webhook_delivery` MCP call with `connection_id` and `delivery_id`, and its
 correlated `tool.response`. Confirm that provider status is `500` and that the

@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import { createIncidentService } from "@/server/incident-service";
-import { GithubDeliveryNormalizationError } from "@/server/github-provider-evidence";
+import {
+  GithubDeliveryNormalizationError,
+  normalizeGithubWebhookDelivery,
+} from "@/server/github-provider-evidence";
 import { createProviderEvidenceService } from "@/server/provider-evidence-service";
 
 const deliveryId = "900719925474099312345678901234567890";
@@ -45,6 +48,63 @@ function makeMcpResult(overrides: Record<string, unknown> = {}): Record<string, 
     redelivery: false,
     full: { http_status: 200, body },
   };
+}
+
+function rewindToM26bSchema(database: SqliteDatabase): void {
+  database.exec(`
+    DROP TABLE receiver_observations;
+    DROP INDEX provider_evidence_application_connection_idx;
+    DROP INDEX provider_evidence_delivery_idx;
+    ALTER TABLE provider_evidence RENAME TO provider_evidence_m27b_legacy;
+
+    CREATE TABLE provider_evidence (
+      incident_id TEXT PRIMARY KEY NOT NULL,
+      schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+      provider TEXT NOT NULL CHECK (provider = 'github'),
+      provider_delivery_id TEXT NOT NULL,
+      delivery_guid TEXT NOT NULL,
+      outcome_status TEXT NOT NULL,
+      status_code INTEGER,
+      delivered_at TEXT NOT NULL,
+      canonical_payload_sha256 TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX provider_evidence_delivery_idx
+      ON provider_evidence (provider_delivery_id);
+
+    INSERT INTO provider_evidence (
+      incident_id,
+      schema_version,
+      provider,
+      provider_delivery_id,
+      delivery_guid,
+      outcome_status,
+      status_code,
+      delivered_at,
+      canonical_payload_sha256,
+      evidence_json,
+      captured_at
+    )
+    SELECT
+      incident_id,
+      schema_version,
+      provider,
+      provider_delivery_id,
+      delivery_guid,
+      outcome_status,
+      status_code,
+      delivered_at,
+      canonical_payload_sha256,
+      evidence_json,
+      captured_at
+    FROM provider_evidence_m27b_legacy;
+
+    DROP TABLE provider_evidence_m27b_legacy;
+    DELETE FROM schema_migrations WHERE version IN (10, 11);
+  `);
 }
 
 describe("provider evidence persistence", () => {
@@ -157,5 +217,139 @@ describe("provider evidence persistence", () => {
     service.captureOrReconcileForIncident(incident.id, makeMcpResult());
     database.run("UPDATE provider_evidence SET delivery_guid = ? WHERE incident_id = ?", ["tampered-guid", incident.id]);
     expect(() => service.getByIncidentId(incident.id)).toThrow("does not match its normalized JSON");
+  });
+
+  it("backfills M2.6B provider provenance and converges an identical M2.7 reobservation", () => {
+    const applicationConnectionId = "connection-m27b-provenance";
+    const now = "2026-08-30T00:00:00.000Z";
+    database.run(
+      `INSERT INTO github_app_registrations
+        (id, github_app_id, slug, owner_id, owner_login, owner_type,
+         private_key_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["app-m27b-provenance", "app-id-m27b-provenance", "redrive", "owner-id", "octocat", "User", "key-m27b-provenance", now, now],
+    );
+    database.run(
+      `INSERT INTO github_installations
+       (installation_id, app_registration_id, account_id, account_login,
+         account_type, repository_selection, last_verified_at, created_at,
+         updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["installation-m27b-provenance", "app-m27b-provenance", "owner-id", "octocat", "User", "selected", now, now, now],
+    );
+    database.run(
+      `INSERT INTO application_connections
+        (id, provider, github_installation_id, repository_id,
+         repository_full_name, webhook_id, webhook_target_display, state,
+         created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [applicationConnectionId, "github", "installation-m27b-provenance", "example/receiver", "example/receiver", "webhook-m27b-provenance", "https://receiver.example/webhook", "READY", now, now],
+    );
+
+    const incident = createIncident();
+    database.run(
+      "UPDATE incidents SET application_connection_id = ? WHERE id = ?",
+      [applicationConnectionId, incident.id],
+    );
+    database.run(
+      `INSERT INTO trueforge_session_bindings
+        (incident_id, state, trueforge_session_id, creation_token,
+         coordinator_spec_version, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, NULL, ?, ?, ?)`,
+      [incident.id, "m2.6b-session", "m2.6b-v1", now, now],
+    );
+
+    const preM27Evidence = normalizeGithubWebhookDelivery(
+      makeMcpResult(),
+      { repositoryId: "example/receiver", deliveryId },
+      "2026-08-30T00:01:00.000Z",
+    );
+    const preM27EvidenceJson = JSON.stringify(preM27Evidence);
+    database.run(
+      `INSERT INTO provider_evidence (
+        incident_id,
+        application_connection_id,
+        schema_version,
+        provider,
+        provider_delivery_id,
+        delivery_guid,
+        outcome_status,
+        status_code,
+        delivered_at,
+        canonical_payload_sha256,
+        evidence_json,
+        captured_at
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        incident.id,
+        preM27Evidence.schemaVersion,
+        preM27Evidence.provider,
+        preM27Evidence.providerDeliveryId,
+        preM27Evidence.deliveryGuid,
+        preM27Evidence.outcome.status,
+        preM27Evidence.outcome.statusCode,
+        preM27Evidence.deliveredAt,
+        preM27Evidence.request.canonicalPayloadSha256,
+        preM27EvidenceJson,
+        preM27Evidence.capturedAt,
+      ],
+    );
+
+    const sessionBeforeMigration = database.get(
+      "SELECT * FROM trueforge_session_bindings WHERE incident_id = ?",
+      [incident.id],
+    );
+
+    rewindToM26bSchema(database);
+    expect(
+      database.all<{ name: string }>(
+        "PRAGMA table_info('provider_evidence')",
+      ).map(({ name }) => name),
+    ).not.toContain("application_connection_id");
+    database.close();
+    database = openDatabase(databasePath);
+
+    expect(
+      database.get<{ application_connection_id: string | null }>(
+        "SELECT application_connection_id FROM provider_evidence WHERE incident_id = ?",
+        [incident.id],
+      ),
+    ).toEqual({ application_connection_id: applicationConnectionId });
+    expect(
+      database.get<{ evidence_json: string }>(
+        "SELECT evidence_json FROM provider_evidence WHERE incident_id = ?",
+        [incident.id],
+      ),
+    ).toEqual({ evidence_json: preM27EvidenceJson });
+    expect(
+      database.get(
+        "SELECT * FROM trueforge_session_bindings WHERE incident_id = ?",
+        [incident.id],
+      ),
+    ).toEqual(sessionBeforeMigration);
+
+    const service = createProviderEvidenceService(
+      database,
+      () => "2026-08-30T00:02:00.000Z",
+    );
+    const migratedEvidence = service.getByIncidentId(incident.id);
+    expect(migratedEvidence).toEqual({
+      ...preM27Evidence,
+      incidentId: incident.id,
+      applicationConnectionId,
+    });
+
+    expect(
+      service.captureOrReconcileForIncident(incident.id, makeMcpResult()),
+    ).toEqual({
+      evidence: migratedEvidence,
+      disposition: "REOBSERVED",
+    });
+    expect(
+      database.get<{ evidence_json: string }>(
+        "SELECT evidence_json FROM provider_evidence WHERE incident_id = ?",
+        [incident.id],
+      ),
+    ).toEqual({ evidence_json: preM27EvidenceJson });
   });
 });

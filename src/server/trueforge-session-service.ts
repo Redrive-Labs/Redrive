@@ -65,6 +65,15 @@ export class TrueForgeSessionUnavailableError extends Error {
   }
 }
 
+export class TrueForgeSessionMismatchError extends Error {
+  constructor(incidentId: string) {
+    super(
+      `TrueForge session identity for incident ${incidentId} did not remain stable across investigation turns.`,
+    );
+    this.name = "TrueForgeSessionMismatchError";
+  }
+}
+
 export class TrueForgeSessionSpecUpgradeError extends Error {
   constructor(incidentId: string, message: string, options?: ErrorOptions) {
     super(
@@ -122,6 +131,22 @@ function readCreatedSessionId(result: TrueForgeSessionCreateResult): string {
   }
 
   return sessionId;
+}
+
+function readLookedUpSessionId(response: unknown): string | null {
+  if (response !== null && typeof response === "object") {
+    const record = response as Record<string, unknown>;
+    if (typeof record.id === "string" && record.id.length > 0) {
+      return record.id;
+    }
+    if (record.data !== null && typeof record.data === "object") {
+      const data = record.data as Record<string, unknown>;
+      if (typeof data.id === "string" && data.id.length > 0) {
+        return data.id;
+      }
+    }
+  }
+  return null;
 }
 
 function isDefinitiveCreateFailure(error: unknown): boolean {
@@ -266,12 +291,9 @@ export function createTrueForgeSessionService(
       throw new TrueForgeSessionBindingError(binding.incidentId);
     }
 
+    let lookedUpSession: unknown;
     try {
-      await trueForgeClient.getSession(sessionId);
-      return resultFor(binding, "REUSED", {
-        retryable: false,
-        reused: true,
-      });
+      lookedUpSession = await trueForgeClient.getSession(sessionId);
     } catch (error) {
       // Only the adapter's explicit not-found error is authoritative evidence
       // that a remote session disappeared. Every other lookup failure leaves
@@ -317,6 +339,16 @@ export function createTrueForgeSessionService(
         reused: true,
       });
     }
+
+    const lookedUpSessionId = readLookedUpSessionId(lookedUpSession);
+    if (lookedUpSessionId === null || lookedUpSessionId !== sessionId) {
+      throw new TrueForgeSessionMismatchError(binding.incidentId);
+    }
+
+    return resultFor(binding, "REUSED", {
+      retryable: false,
+      reused: true,
+    });
   }
 
   async function ensure(incidentId: string): Promise<TrueForgeSessionEnsureResult> {
@@ -417,8 +449,10 @@ export function createTrueForgeSessionService(
     if (incident === null) {
       throw new TrueForgeIncidentNotFoundError(incidentId);
     }
-    const desiredVersion = CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION;
-    const acceptedVersions: readonly string[] = [CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION];
+    const acceptedVersions: readonly string[] = [
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+      "m2.6b-v1",
+    ];
 
     const session = ensured ?? (await ensure(incidentId));
 
@@ -430,7 +464,22 @@ export function createTrueForgeSessionService(
       return session;
     }
 
-    const binding = session.binding;
+    // The result passed by a previous ensure call is only a remote lookup
+    // result. Re-read the durable binding before deciding whether the remote
+    // AgentSpec may be updated; the caller must not authorize an update from a
+    // stale binding snapshot.
+    const binding = bindingRepository.getByIncidentId(incidentId);
+    if (binding === null) {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (binding.state !== "ACTIVE" || binding.trueForgeSessionId === null) {
+      return binding.state === "CREATING"
+        ? inProgressResult(binding)
+        : blockedResult(binding);
+    }
+    if (binding.trueForgeSessionId !== session.sessionId) {
+      throw new TrueForgeSessionMismatchError(incidentId);
+    }
     if (!acceptedVersions.includes(binding.coordinatorSpecVersion)) {
       throw new TrueForgeUnsupportedCoordinatorSpecError(
         incidentId,
@@ -438,8 +487,11 @@ export function createTrueForgeSessionService(
       );
     }
 
-    // Reapply the desired spec so runtime-selected model and MCP resources stay
-    // current on this same inline session before a turn can begin.
+    // Reconcile the current spec on the same remote session. For the explicitly
+    // supported prior version this is also the in-place upgrade. The durable
+    // version is CASed after the remote update so a concurrent winner can be
+    // accepted only after its durable state is read.
+    const expectedVersion = binding.coordinatorSpecVersion;
     const coordinatorAgentSpec =
       getConnectionRecoveryCoordinatorAgentSpec(environment);
     if (typeof trueForgeClient.updateSession !== "function") {
@@ -459,43 +511,26 @@ export function createTrueForgeSessionService(
       });
     }
 
-    if (binding.coordinatorSpecVersion === desiredVersion) {
-      return session;
-    }
+    const upgraded = bindingRepository.updateCoordinatorSpecVersion(
+      incidentId,
+      session.sessionId,
+      expectedVersion,
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+      now(),
+    );
 
-    // Upgrade one of the explicitly known prior versions. This CAS follows
-    // the remote update, so an active session is never relabeled unless the
-    // corresponding current AgentSpec was accepted first.
-    for (const expectedVersion of acceptedVersions) {
-      if (
-        expectedVersion === desiredVersion ||
-        binding.coordinatorSpecVersion !== expectedVersion
-      ) {
-        continue;
-      }
-
-      const upgraded = bindingRepository.updateCoordinatorSpecVersion(
-        incidentId,
-        session.sessionId,
-        expectedVersion,
-        desiredVersion,
-        now(),
-      );
-
-      if (upgraded !== null) {
-        return resultFor(upgraded, session.outcome, {
-          retryable: session.retryable,
-          reused: session.reused,
-        });
-      }
-      break;
+    if (upgraded !== null) {
+      return resultFor(upgraded, session.outcome, {
+        retryable: session.retryable,
+        reused: session.reused,
+      });
     }
 
     const current = bindingRepository.getByIncidentId(incidentId);
     if (
       current?.state === "ACTIVE" &&
       current.trueForgeSessionId === session.sessionId &&
-      current.coordinatorSpecVersion === desiredVersion
+      current.coordinatorSpecVersion === CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION
     ) {
       return resultFor(current, session.outcome, {
         retryable: session.retryable,
@@ -503,13 +538,20 @@ export function createTrueForgeSessionService(
       });
     }
 
-    if (current !== null && current !== undefined) {
-      if (!acceptedVersions.includes(current.coordinatorSpecVersion)) {
-        throw new TrueForgeUnsupportedCoordinatorSpecError(
-          incidentId,
-          current.coordinatorSpecVersion,
-        );
-      }
+    if (current === null) {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (!acceptedVersions.includes(current.coordinatorSpecVersion)) {
+      throw new TrueForgeUnsupportedCoordinatorSpecError(
+        incidentId,
+        current.coordinatorSpecVersion,
+      );
+    }
+    if (current.state !== "ACTIVE") {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (current.trueForgeSessionId !== session.sessionId) {
+      throw new TrueForgeSessionMismatchError(incidentId);
     }
 
     throw new TrueForgeSessionSpecUpgradeError(
@@ -518,11 +560,75 @@ export function createTrueForgeSessionService(
     );
   }
 
+  /**
+   * Reconcile an already-bound session without permitting session creation.
+   * Receiver investigation is the second turn of the provider session, so a
+   * missing or changed binding must fail closed rather than create a replacement.
+   */
+  async function reconcileExistingCoordinatorForIncident(
+    incidentId: string,
+    expectedSessionId: string,
+  ): Promise<TrueForgeSessionEnsureResult> {
+    const binding = bindingRepository.getByIncidentId(incidentId);
+    if (
+      binding === null ||
+      binding.state !== "ACTIVE" ||
+      binding.trueForgeSessionId === null
+    ) {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (binding.trueForgeSessionId !== expectedSessionId) {
+      throw new TrueForgeSessionMismatchError(incidentId);
+    }
+
+    const verified = await verifyActiveBinding(binding);
+    if (
+      verified.state !== "ACTIVE" ||
+      verified.sessionId === null ||
+      (verified.outcome !== "CREATED" && verified.outcome !== "REUSED")
+    ) {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (verified.sessionId !== expectedSessionId) {
+      throw new TrueForgeSessionMismatchError(incidentId);
+    }
+
+    const reconciled = await ensureCoordinatorForIncident(incidentId, verified);
+    const current = bindingRepository.getByIncidentId(incidentId);
+    if (current === null || current.state !== "ACTIVE") {
+      throw new TrueForgeSessionUnavailableError(incidentId);
+    }
+    if (current.trueForgeSessionId !== expectedSessionId) {
+      throw new TrueForgeSessionMismatchError(incidentId);
+    }
+    if (
+      current.coordinatorSpecVersion !==
+      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION
+    ) {
+      throw new TrueForgeUnsupportedCoordinatorSpecError(
+        incidentId,
+        current.coordinatorSpecVersion,
+      );
+    }
+    if (
+      reconciled.state !== "ACTIVE" ||
+      reconciled.sessionId !== expectedSessionId ||
+      (reconciled.outcome !== "CREATED" && reconciled.outcome !== "REUSED")
+    ) {
+      throw new TrueForgeSessionMismatchError(incidentId);
+    }
+    return resultFor(current, reconciled.outcome, {
+      retryable: reconciled.retryable,
+      reused: reconciled.reused,
+    });
+  }
+
 
   return {
     getBindingByIncidentId,
     ensureTrueForgeSession: ensure,
     ensureCoordinatorForIncident,
+    reconcileExistingCoordinatorForIncident,
   };
 }
 

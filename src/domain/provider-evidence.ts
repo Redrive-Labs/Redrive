@@ -6,6 +6,10 @@ export const GITHUB_PROVIDER = "github" as const;
 export interface ProviderEvidence {
   schemaVersion: typeof PROVIDER_EVIDENCE_SCHEMA_VERSION;
   provider: typeof GITHUB_PROVIDER;
+  /** Durable provenance added when this snapshot is persisted for an incident. */
+  incidentId?: string;
+  /** Durable application connection provenance, when captured for a bound incident. */
+  applicationConnectionId?: string;
   repositoryId: string;
   /** Exact GitHub delivery attempt ID (`id`); matches Incident.externalDeliveryId. */
   providerDeliveryId: string;
@@ -220,6 +224,8 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
     [
       "schemaVersion",
       "provider",
+      "incidentId",
+      "applicationConnectionId",
       "repositoryId",
       "providerDeliveryId",
       "deliveryGuid",
@@ -244,6 +250,15 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
   }
 
   const repositoryId = readNonEmptyString(input, "repositoryId");
+  const incidentId = Object.prototype.hasOwnProperty.call(input, "incidentId")
+    ? readNonEmptyString(input, "incidentId")
+    : undefined;
+  const applicationConnectionId = Object.prototype.hasOwnProperty.call(
+    input,
+    "applicationConnectionId",
+  )
+    ? readNonEmptyString(input, "applicationConnectionId")
+    : undefined;
   const providerDeliveryId = readNonEmptyString(input, "providerDeliveryId");
   const deliveryGuid = readNonEmptyString(input, "deliveryGuid");
   const event = readNonEmptyString(input, "event");
@@ -323,6 +338,8 @@ export function parseProviderEvidence(input: unknown): ProviderEvidence {
   return {
     schemaVersion: PROVIDER_EVIDENCE_SCHEMA_VERSION,
     provider: GITHUB_PROVIDER,
+    ...(incidentId === undefined ? {} : { incidentId }),
+    ...(applicationConnectionId === undefined ? {} : { applicationConnectionId }),
     repositoryId,
     providerDeliveryId,
     deliveryGuid,

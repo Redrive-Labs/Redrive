@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getConnectionRecoveryCoordinatorAgentSpec,
   CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
   RecoveryCoordinatorConfigurationError,
 } from "@/agents/recovery-coordinator";
@@ -34,6 +35,8 @@ const environment = {
   REDRIVE_TRUEFORGE_MODEL: "configured-model",
   REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: connectionMcpServerName,
   REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
+  REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME: "redrive-receiver",
+  REDRIVE_RECEIVER_MCP_TOKEN: "test-receiver-mcp-token",
 } as const;
 
 function makeGithubResult(
@@ -79,6 +82,7 @@ function makeGithubResult(
 interface StreamOptions {
   agentName?: string;
   modelThreadId?: string;
+  providerToolShape?: "direct-mcp" | "truefoundry-system-wrapper";
   toolName?: string;
   toolInfoName?: string;
   toolInfoServerName?: string;
@@ -86,6 +90,15 @@ interface StreamOptions {
   deliveryArgument?: string;
   providerArgumentsText?: string;
   extraArguments?: Record<string, unknown>;
+  wrapperMcpServer?: string;
+  wrapperToolName?: string;
+  wrapperConnectionArgument?: string;
+  wrapperDeliveryArgument?: string;
+  wrapperExtraOuterField?: boolean;
+  wrapperMissingOuterField?: "mcp_server" | "tool_name" | "input";
+  wrapperExtraInnerField?: boolean;
+  wrapperMissingInnerField?: "connection_id" | "delivery_id";
+  extraProviderToolCall?: boolean;
   expectedDeliveryId?: string;
   turnId?: string;
   providerThreadId?: string;
@@ -98,7 +111,26 @@ interface StreamOptions {
   responseToolCallId?: string;
   responseContent?: string;
   eventSuffix?: string;
+  skillBootstraps?: SkillBootstrapOptions[];
 }
+
+interface SkillBootstrapOptions {
+  shape?: "exec" | "read-file";
+  path?: string;
+  command?: string;
+  intent?: string;
+  thread?: "root" | "child";
+  toolCallId?: string;
+  responseContent?: string;
+  includeResponse?: boolean;
+  responseThreadId?: string;
+  responseToolCallId?: string;
+}
+
+const providerSkillPath =
+  "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md";
+const receiverSkillPath =
+  "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md";
 
 function makeStream(
   options: StreamOptions = {},
@@ -108,14 +140,68 @@ function makeStream(
   const providerSpawnToolCallId =
     options.providerSpawnToolCallId ?? "spawn-provider-1";
   const turnId = options.turnId ?? "turn-1";
-  const providerToolArguments = {
+  const directProviderToolArguments = {
     connection_id: options.connectionArgument ?? "connection-1",
     delivery_id:
       options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
     ...options.extraArguments,
   };
+  const wrapperInput: Record<string, unknown> = {
+    connection_id: options.wrapperConnectionArgument ?? "connection-1",
+    delivery_id:
+      options.wrapperDeliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+  };
+  if (options.wrapperExtraInnerField) {
+    wrapperInput.extra = "not-allowed";
+  }
+  if (options.wrapperMissingInnerField !== undefined) {
+    delete wrapperInput[options.wrapperMissingInnerField];
+  }
+  const wrapperArguments: Record<string, unknown> = {
+    mcp_server: options.wrapperMcpServer ?? connectionMcpServerName,
+    tool_name: options.wrapperToolName ?? "get_webhook_delivery",
+    input: wrapperInput,
+  };
+  if (options.wrapperExtraOuterField) {
+    wrapperArguments.extra = "not-allowed";
+  }
+  if (options.wrapperMissingOuterField !== undefined) {
+    delete wrapperArguments[options.wrapperMissingOuterField];
+  }
+  const isProviderToolWrapper =
+    options.providerToolShape === "truefoundry-system-wrapper";
   const providerToolArgumentsText =
-    options.providerArgumentsText ?? JSON.stringify(providerToolArguments);
+    options.providerArgumentsText ??
+    JSON.stringify(
+      isProviderToolWrapper
+        ? wrapperArguments
+        : directProviderToolArguments,
+    );
+  const providerToolCall = {
+    id: toolCallId,
+    type: "function",
+    function: {
+      name: isProviderToolWrapper
+        ? "call_tool"
+        : options.toolName ?? "get_webhook_delivery",
+      arguments: providerToolArgumentsText,
+    },
+    toolInfo: isProviderToolWrapper
+      ? {
+          type: "truefoundry-system",
+          name: "call_tool",
+        }
+      : {
+          type: "mcp",
+          name: options.toolInfoName ?? "get_webhook_delivery",
+          serverId: "mcp-server-1",
+          serverName: options.toolInfoServerName ?? connectionMcpServerName,
+        },
+  };
+  const providerToolCalls: Record<string, unknown>[] = [providerToolCall];
+  if (options.extraProviderToolCall) {
+    providerToolCalls.push({ ...providerToolCall, id: "github-call-2" });
+  }
   const events: unknown[] = [
     {
       type: "turn.created",
@@ -167,22 +253,7 @@ function makeStream(
       id: "provider-model-event",
       threadId: options.modelThreadId ?? providerThreadId,
       content: null,
-      toolCalls: [
-        {
-          id: toolCallId,
-          type: "function",
-          function: {
-            name: options.toolName ?? "get_webhook_delivery",
-            arguments: providerToolArgumentsText,
-          },
-          toolInfo: {
-            type: "mcp",
-            name: options.toolInfoName ?? "get_webhook_delivery",
-            serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? connectionMcpServerName,
-          },
-        },
-      ],
+      toolCalls: providerToolCalls,
     },
   ];
 
@@ -248,6 +319,52 @@ function makeStream(
       },
     );
   }
+  for (const [index, bootstrap] of (options.skillBootstraps ?? []).entries()) {
+    const toolCallId = bootstrap.toolCallId ?? `skill-bootstrap-${index + 1}`;
+    const path = bootstrap.path ?? providerSkillPath;
+    const shape = bootstrap.shape ?? "exec";
+    const threadId = bootstrap.thread === "root" ? "main" : providerThreadId;
+    const functionName = shape === "exec" ? "exec" : "read_file";
+    const argumentsValue =
+      shape === "exec"
+        ? {
+            command: bootstrap.command ?? `cat ${path}`,
+            ...(bootstrap.intent === undefined
+              ? {}
+              : { intent: bootstrap.intent }),
+          }
+        : { path };
+    events.push({
+      type: "model.message",
+      id: `skill-bootstrap-model-event-${index + 1}`,
+      threadId,
+      content: null,
+      toolCalls: [
+        {
+          id: toolCallId,
+          type: "function",
+          function: {
+            name: functionName,
+            arguments: JSON.stringify(argumentsValue),
+          },
+          toolInfo: {
+            type: "truefoundry-system",
+            name: functionName,
+          },
+        },
+      ],
+    });
+    if (bootstrap.includeResponse !== false) {
+      events.push({
+        type: "tool.response",
+        id: `skill-bootstrap-response-event-${index + 1}`,
+        createdAt: "2026-08-25T10:00:02.750Z",
+        threadId: bootstrap.responseThreadId ?? threadId,
+        toolCallId: bootstrap.responseToolCallId ?? toolCallId,
+        content: bootstrap.responseContent ?? "skill bootstrap complete",
+      });
+    }
+  }
   events.push({
     type: "turn.done",
     id: "turn-done-event",
@@ -306,7 +423,9 @@ function createClient(
 ) {
   return {
     createSession: vi.fn().mockResolvedValue("replacement-session"),
-    getSession: vi.fn().mockResolvedValue({ id: "existing-session" }),
+    getSession: vi
+      .fn()
+      .mockImplementation(async (sessionId: string) => ({ id: sessionId })),
     updateSession: vi.fn().mockResolvedValue(undefined),
     createTurnStream: vi.fn().mockResolvedValue(stream),
     listTurnEvents: vi.fn().mockResolvedValue(
@@ -438,6 +557,7 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
     expect(client.createSession.mock.calls[0][0].mcpServers).toEqual([
       expect.objectContaining({ name: connectionMcpServerName }),
+      expect.objectContaining({ name: "redrive-receiver" }),
     ]);
     expect(client.listTurnEvents).toHaveBeenCalledWith(
       "replacement-session",
@@ -580,7 +700,7 @@ describe("TrueForge provider investigation", () => {
     });
   });
 
-  it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
+  it("reuses the current existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
     const evidenceService = createProviderEvidenceService(database, () =>
@@ -609,7 +729,10 @@ describe("TrueForge provider investigation", () => {
       providerStatusCode: 500,
     });
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledTimes(1);
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
+    );
     expect(client.createTurnStream).toHaveBeenCalledWith(
       "existing-session",
       expect.objectContaining({
@@ -648,7 +771,7 @@ describe("TrueForge provider investigation", () => {
     expect(JSON.stringify(events)).not.toContain("receiver failed");
   });
 
-  it("reconciles the current v2 AgentSpec before using the existing session for a turn", async () => {
+  it("reconciles the current v2 AgentSpec binding on the existing session", async () => {
     const incident = createIncident();
     installActiveBinding(
       incident.id,
@@ -663,17 +786,7 @@ describe("TrueForge provider investigation", () => {
     expect(client.createSession).not.toHaveBeenCalled();
     expect(client.updateSession).toHaveBeenCalledWith(
       "existing-v2-session",
-      expect.objectContaining({
-        model: { name: environment.REDRIVE_TRUEFORGE_MODEL },
-        mcpServers: [
-          expect.objectContaining({
-            name: environment.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME,
-          }),
-        ],
-      }),
-    );
-    expect(client.updateSession.mock.invocationCallOrder[0]).toBeLessThan(
-      client.createTurnStream.mock.invocationCallOrder[0],
+      getConnectionRecoveryCoordinatorAgentSpec(environment),
     );
   });
 
@@ -693,6 +806,107 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
     expect(client.listTurnEvents).toHaveBeenCalledOnce();
   });
+
+  const acceptedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    [
+      "one child exec read with intent",
+      [{ path: providerSkillPath, intent: "load provider investigation skill" }],
+    ],
+    [
+      "both exact Redrive exec reads",
+      [
+        { path: providerSkillPath },
+        { path: receiverSkillPath },
+      ],
+    ],
+    [
+      "read_file bootstrap",
+      [{ shape: "read-file", path: receiverSkillPath }],
+    ],
+    [
+      "root and child bootstrap reads in varying order",
+      [
+        { path: receiverSkillPath, thread: "root" },
+        { path: providerSkillPath, thread: "child" },
+      ],
+    ],
+    [
+      "eight duplicate bounded bootstrap reads",
+      Array.from({ length: 8 }, () => ({ path: providerSkillPath })),
+    ],
+  ];
+
+  it.each(acceptedSkillBootstrapCases)(
+    "accepts %s alongside exactly one provider evidence call",
+    async (_description, skillBootstraps) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const client = createClient(makeStream({ skillBootstraps }));
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      const result = await service.investigateProviderForIncident(incident.id);
+
+      expect(result.evidenceDisposition).toBe("CAPTURED");
+      expect(result.providerStatusCode).toBe(500);
+      expect(
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
+      ).toMatchObject({ providerDeliveryId: deliveryId });
+    },
+  );
+
+  const rejectedSkillBootstrapCases: Array<
+    [string, SkillBootstrapOptions[]]
+  > = [
+    ["arbitrary exec", [{ command: "pwd" }]],
+    ["cat of another path", [{ command: "cat /tmp/other-skill.md" }]],
+    [
+      "shell syntax in exec",
+      [{ command: `cat ${providerSkillPath}; echo unsafe | tee /tmp/x && true > /tmp/y < /tmp/z $() \`x\`` }],
+    ],
+    [
+      "arbitrary read_file path",
+      [{ shape: "read-file", path: "/tmp/supporting-file.txt" }],
+    ],
+    [
+      "more than the bootstrap ceiling",
+      Array.from({ length: 9 }, () => ({ path: providerSkillPath })),
+    ],
+    [
+      "missing bootstrap response",
+      [{ path: providerSkillPath, includeResponse: false }],
+    ],
+    [
+      "mismatched bootstrap response",
+      [{ path: providerSkillPath, responseToolCallId: "other-call" }],
+    ],
+  ];
+
+  it.each(rejectedSkillBootstrapCases)(
+    "rejects %s",
+    async (_description, skillBootstraps) => {
+      const incident = createIncident();
+      installActiveBinding(incident.id);
+      const client = createClient(makeStream({ skillBootstraps }));
+      const service = createProviderInvestigationService(
+        database,
+        client,
+        environment,
+      );
+
+      await expect(
+        service.investigateProviderForIncident(incident.id),
+      ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+      expect(
+        createProviderEvidenceService(database).getByIncidentId(incident.id),
+      ).toBeNull();
+    },
+  );
 
   it.each([
     { mcp_server: connectionMcpServerName },
@@ -863,10 +1077,10 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
   });
 
-  it("captures first evidence from the correlated tool.response", async () => {
+  it("accepts the existing direct MCP form and captures first evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const client = createClient(makeStream());
+    const client = createClient(makeStream({ providerToolShape: "direct-mcp" }));
     const service = createProviderInvestigationService(
       database,
       client,
@@ -884,6 +1098,33 @@ describe("TrueForge provider investigation", () => {
       providerDeliveryId: deliveryId,
       deliveryGuid: "logical-guid-1",
       outcome: { statusCode: 500 },
+    });
+  });
+
+  it("accepts the live TrueForge call_tool provider wrapper", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(
+      makeStream({ providerToolShape: "truefoundry-system-wrapper" }),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      evidenceDisposition: "CAPTURED",
+      providerInvestigatorThreadId: "provider-thread-1",
+      providerStatusCode: 500,
+    });
+    expect(
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
+    ).toMatchObject({
+      providerDeliveryId: deliveryId,
+      deliveryGuid: "logical-guid-1",
     });
   });
 
@@ -925,12 +1166,12 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).not.toHaveBeenCalled();
   });
 
-  it("does not start a turn when current v2 session reconciliation fails", async () => {
+  it("does not start a turn when prior session spec reconciliation fails", async () => {
     const incident = createIncident();
     installActiveBinding(
       incident.id,
       "v2-session",
-      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+      "m2.6b-v1",
     );
     const client = createClient(makeStream());
     client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
@@ -946,7 +1187,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: "m2.6b-v1" });
   });
 
   it("rejects root-thread calls, wrong subagents, wrong MCP resources, and wrong IDs", async () => {
@@ -954,6 +1195,7 @@ describe("TrueForge provider investigation", () => {
       { modelThreadId: "main" },
       { agentName: "other-investigator" },
       { toolInfoServerName: "other-server" },
+      { toolInfoServerName: "redrive-receiver" },
       { toolName: "redeliver_webhook_delivery", toolInfoName: "redeliver_webhook_delivery" },
       { connectionArgument: "wrong-connection" },
       { deliveryArgument: "wrong-delivery" },
@@ -980,6 +1222,88 @@ describe("TrueForge provider investigation", () => {
         createProviderEvidenceService(database).getByIncidentId(incident.id),
       ).toBeNull();
     }
+  });
+
+  it.each([
+    [
+      "wrong wrapper MCP server",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperMcpServer: "other-server",
+      },
+    ],
+    [
+      "wrong wrapper tool name",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperToolName: "redeliver_webhook_delivery",
+      },
+    ],
+    [
+      "extra wrapper key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperExtraOuterField: true,
+      },
+    ],
+    [
+      "missing wrapper key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperMissingOuterField: "input",
+      },
+    ],
+    [
+      "extra inner input key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperExtraInnerField: true,
+      },
+    ],
+    [
+      "wrong wrapper connection ID",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperConnectionArgument: "wrong-connection",
+      },
+    ],
+    [
+      "wrong wrapper delivery ID",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperDeliveryArgument: "wrong-delivery",
+      },
+    ],
+    [
+      "more than one provider child tool call",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        extraProviderToolCall: true,
+      },
+    ],
+    [
+      "mismatched tool.response",
+      {
+        responseThreadId: "main",
+        responseToolCallId: "not-provider-call",
+      },
+    ],
+  ] as const)("rejects %s", async (_description, options) => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream(options));
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+    expect(
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
+    ).toBeNull();
   });
 
   it("requires the matching response and never treats prose as evidence", async () => {

@@ -37,6 +37,13 @@ import {
 
 export const PROVIDER_INVESTIGATOR_NAME = "provider-investigator" as const;
 const CREATE_SUB_AGENT_TOOL = "create_sub_agent" as const;
+const EXEC_TOOL = "exec" as const;
+const READ_FILE_TOOL = "read_file" as const;
+const MAX_SKILL_BOOTSTRAP_CALLS = 8;
+const ALLOWED_REDRIVE_SKILL_PATHS = [
+  "/opt/tf/skills/redrive-connection-provider-investigation/SKILL.md",
+  "/opt/tf/skills/redrive-connection-receiver-investigation/SKILL.md",
+] as const;
 
 export class ProviderInvestigationConfigurationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -129,6 +136,12 @@ interface CollectedProviderTurn {
   toolCall: ProviderToolCall;
   toolResponse: ProviderToolResponse;
 }
+
+type ProviderToolCategory =
+  | "create_sub_agent"
+  | "skill_bootstrap"
+  | "evidence"
+  | "forbidden";
 
 interface ProviderTurnAttribution {
   turnId: string | null;
@@ -223,6 +236,151 @@ function parseToolArguments(
     connection_id: expectedConnectionId,
     delivery_id: expectedDeliveryId,
   };
+}
+
+function parseTrueForgeProviderToolArguments(
+  argumentsText: string,
+  expectedConnectionId: string,
+  expectedDeliveryId: string,
+  expectedMcpServerName: string,
+): ProviderToolArguments {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsText) as unknown;
+  } catch {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments are not valid JSON.",
+    );
+  }
+
+  if (!isRecord(parsed)) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments must be an object.",
+    );
+  }
+
+  const expectedKeys = ["mcp_server", "tool_name", "input"] as const;
+  const additionalKeys = Object.keys(parsed)
+    .filter((key) => !expectedKeys.includes(key as (typeof expectedKeys)[number]))
+    .sort();
+  if (additionalKeys.length > 0) {
+    throw new ProviderInvestigationUnexpectedArgumentsError(additionalKeys);
+  }
+  if (
+    expectedKeys.some(
+      (key) => !Object.prototype.hasOwnProperty.call(parsed, key),
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments are missing required fields.",
+    );
+  }
+
+  if (
+    parsed.mcp_server !== expectedMcpServerName ||
+    parsed.tool_name !== GITHUB_WEBHOOK_DELIVERY_TOOL
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper did not identify the configured GitHub MCP tool.",
+    );
+  }
+  if (!isRecord(parsed.input)) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper input must be an object.",
+    );
+  }
+
+  const inputArguments = JSON.stringify(parsed.input);
+  if (typeof inputArguments !== "string") {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper input could not be normalized.",
+    );
+  }
+  return parseToolArguments(
+    inputArguments,
+    expectedConnectionId,
+    expectedDeliveryId,
+  );
+}
+
+function allowedSkillPath(value: unknown): string | null {
+  return typeof value === "string" &&
+    (ALLOWED_REDRIVE_SKILL_PATHS as readonly string[]).includes(value)
+    ? value
+    : null;
+}
+
+function parseSkillBootstrapPath(toolCall: ObservedToolCall): string | null {
+  if (
+    toolCall.toolInfoType === "truefoundry-system" &&
+    toolCall.toolInfoName === EXEC_TOOL &&
+    toolCall.functionName === EXEC_TOOL
+  ) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(toolCall.argumentsText) as unknown;
+    } catch {
+      return null;
+    }
+    if (!isRecord(parsed)) return null;
+    const keys = Object.keys(parsed);
+    if (
+      !Object.prototype.hasOwnProperty.call(parsed, "command") ||
+      keys.some((key) => key !== "command" && key !== "intent") ||
+      (Object.prototype.hasOwnProperty.call(parsed, "intent") &&
+        typeof parsed.intent !== "string") ||
+      typeof parsed.command !== "string"
+    ) {
+      return null;
+    }
+    for (const path of ALLOWED_REDRIVE_SKILL_PATHS) {
+      if (parsed.command === `cat ${path}`) return path;
+    }
+    return null;
+  }
+
+  if (
+    toolCall.functionName !== READ_FILE_TOOL ||
+    toolCall.toolInfoName !== READ_FILE_TOOL
+  ) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(toolCall.argumentsText) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof parsed === "string") return allowedSkillPath(parsed);
+  if (!isRecord(parsed) || Object.keys(parsed).length !== 1) return null;
+  return allowedSkillPath(parsed.path);
+}
+
+function classifyProviderToolCall(
+  toolCall: ObservedToolCall,
+  expectedMcpServerName: string,
+): ProviderToolCategory {
+  if (
+    toolCall.toolInfoType === "truefoundry-system" &&
+    toolCall.toolInfoName === CREATE_SUB_AGENT_TOOL &&
+    toolCall.functionName === CREATE_SUB_AGENT_TOOL
+  ) {
+    return "create_sub_agent";
+  }
+  if (parseSkillBootstrapPath(toolCall) !== null) return "skill_bootstrap";
+  if (
+    (toolCall.toolInfoType === "mcp" &&
+      toolCall.toolInfoServerName === expectedMcpServerName &&
+      toolCall.toolInfoName === GITHUB_WEBHOOK_DELIVERY_TOOL &&
+      toolCall.functionName === GITHUB_WEBHOOK_DELIVERY_TOOL) ||
+    (toolCall.toolInfoType === "truefoundry-system" &&
+      toolCall.toolInfoName === "call_tool" &&
+      toolCall.functionName === "call_tool")
+  ) {
+    return "evidence";
+  }
+  return "forbidden";
 }
 
 /**
@@ -487,6 +645,7 @@ async function collectProviderTurn(
   const threads: ProviderInvestigatorThread[] = [];
   const observedToolCalls: ObservedToolCall[] = [];
   const toolResponses: ProviderToolResponse[] = [];
+  const toolCallIds = new Set<string>();
   let providerThreadId: string | null = null;
   let providerToolCallId: string | null = null;
 
@@ -630,6 +789,12 @@ async function collectProviderTurn(
             "TrueForge model.message contained an invalid tool call shape.",
           );
         }
+        if (toolCallIds.has(rawToolCall.id)) {
+          throw new ProviderInvestigationTurnError(
+            "TrueForge provider tool-call IDs are not unique within the completed turn.",
+          );
+        }
+        toolCallIds.add(rawToolCall.id);
 
         const observedToolCall = {
           toolCallId: rawToolCall.id,
@@ -725,50 +890,143 @@ async function collectProviderTurn(
   }
   const thread = threads[0];
 
-  // Dynamic subagents are created by the root thread through TrueForge's
-  // built-in create_sub_agent tool. It is the one allowed non-provider call;
-  // correlate it to thread.created so a root GitHub lookup never qualifies.
-  const parentToolCalls = observedToolCalls.filter(
-    (toolCall) => toolCall.threadId !== thread.threadId,
+  const classifiedToolCalls = observedToolCalls.map((toolCall) => ({
+    toolCall,
+    category: classifyProviderToolCall(toolCall, expectedMcpServerName),
+  }));
+  const parentToolCalls = classifiedToolCalls.filter(
+    ({ toolCall }) => toolCall.threadId !== thread.threadId,
+  );
+  if (parentToolCalls.some(({ toolCall }) => toolCall.threadId !== thread.parentThreadId)) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge emitted a provider tool call outside the root or expected child thread.",
+    );
+  }
+  const rootCreateToolCalls = parentToolCalls.filter(
+    ({ category }) => category === "create_sub_agent",
   );
   if (
-    parentToolCalls.length !== 1 ||
-    parentToolCalls[0].threadId !== thread.parentThreadId ||
-    parentToolCalls[0].toolCallId !== thread.parentToolCallId ||
-    parentToolCalls[0].toolInfoType !== "truefoundry-system" ||
-    parentToolCalls[0].toolInfoName !== CREATE_SUB_AGENT_TOOL ||
-    parentToolCalls[0].functionName !== CREATE_SUB_AGENT_TOOL
+    rootCreateToolCalls.length !== 1 ||
+    rootCreateToolCalls[0].toolCall.toolCallId !== thread.parentToolCallId
   ) {
     throw new ProviderInvestigationTurnError(
       "TrueForge did not attribute provider-investigator creation to its expected dynamic-subagent call.",
     );
   }
 
-  const providerToolCalls = observedToolCalls.filter(
-    (toolCall) => toolCall.threadId === thread.threadId,
+  if (
+    parentToolCalls.some(
+      ({ category }) =>
+        category === "forbidden" || category === "evidence",
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge root provider calls may only create the investigator or read an attached Redrive skill.",
+    );
+  }
+
+  const childToolCalls = classifiedToolCalls.filter(
+    ({ toolCall }) => toolCall.threadId === thread.threadId,
+  );
+  if (
+    childToolCalls.some(
+      ({ category }) =>
+        category === "forbidden" || category === "create_sub_agent",
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator emitted a forbidden tool call.",
+    );
+  }
+  const bootstrapToolCalls = classifiedToolCalls.filter(
+    ({ category }) => category === "skill_bootstrap",
+  );
+  if (bootstrapToolCalls.length > MAX_SKILL_BOOTSTRAP_CALLS) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge emitted more than the allowed number of skill-bootstrap reads.",
+    );
+  }
+
+  const providerToolCalls = childToolCalls.filter(
+    ({ category }) => category === "evidence",
   );
   if (providerToolCalls.length !== 1) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator did not make exactly one GitHub MCP call.",
     );
   }
-  const observedToolCall = providerToolCalls[0];
+  const observedToolCall = providerToolCalls[0].toolCall;
+  const isDirectMcpCall = observedToolCall.toolInfoType === "mcp";
+  const isTrueForgeWrapperCall =
+    observedToolCall.toolInfoType === "truefoundry-system";
+  if (!isDirectMcpCall && !isTrueForgeWrapperCall) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator did not call the configured read-only GitHub MCP tool.",
+    );
+  }
   if (
-    observedToolCall.toolInfoType !== "mcp" ||
-    observedToolCall.toolInfoServerName !== expectedMcpServerName ||
-    observedToolCall.toolInfoName !== GITHUB_WEBHOOK_DELIVERY_TOOL ||
-    observedToolCall.functionName !== GITHUB_WEBHOOK_DELIVERY_TOOL
+    isDirectMcpCall &&
+    (observedToolCall.toolInfoServerName !== expectedMcpServerName ||
+      observedToolCall.toolInfoName !== GITHUB_WEBHOOK_DELIVERY_TOOL ||
+      observedToolCall.functionName !== GITHUB_WEBHOOK_DELIVERY_TOOL)
   ) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator did not call the configured read-only GitHub MCP tool.",
     );
   }
+  if (
+    isTrueForgeWrapperCall &&
+    (observedToolCall.toolInfoName !== "call_tool" ||
+      observedToolCall.functionName !== "call_tool")
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator did not call the configured GitHub MCP tool through the TrueForge system wrapper.",
+    );
+  }
 
-  const matchingResponses = toolResponses.filter(
-    (response) =>
-      response.threadId === thread.threadId &&
-      response.toolCallId === observedToolCall.toolCallId,
+  const responsesFor = (toolCall: ObservedToolCall) =>
+    toolResponses.filter(
+      (response) =>
+        response.threadId === toolCall.threadId &&
+        response.toolCallId === toolCall.toolCallId,
+    );
+  const observedToolCallSet = new Set(
+    observedToolCalls.map(
+      (toolCall) => `${toolCall.threadId}\u0000${toolCall.toolCallId}`,
+    ),
   );
+  if (
+    toolResponses.some(
+      (response) =>
+        !observedToolCallSet.has(
+          `${response.threadId}\u0000${response.toolCallId}`,
+        ),
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge emitted a tool.response without a correlated provider tool call.",
+    );
+  }
+
+  for (const bootstrap of bootstrapToolCalls) {
+    if (responsesFor(bootstrap.toolCall).length !== 1) {
+      throw new ProviderInvestigationTurnError(
+        "TrueForge did not emit exactly one response for a skill-bootstrap read.",
+      );
+    }
+  }
+
+  const createResponses = responsesFor(rootCreateToolCalls[0].toolCall);
+  if (
+    createResponses.length > 1 ||
+    (createResponses.length === 1 && createResponses[0].content !== "")
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge emitted an invalid create_sub_agent tool.response.",
+    );
+  }
+
+  const matchingResponses = responsesFor(observedToolCall);
   if (
     matchingResponses.length !== 1 ||
     matchingResponses[0].content.trim().length === 0
@@ -780,11 +1038,18 @@ async function collectProviderTurn(
 
   let argumentsValue: ProviderToolArguments;
   try {
-    argumentsValue = parseToolArguments(
-      observedToolCall.argumentsText,
-      expectedConnectionId,
-      expectedDeliveryId,
-    );
+    argumentsValue = isDirectMcpCall
+      ? parseToolArguments(
+          observedToolCall.argumentsText,
+          expectedConnectionId,
+          expectedDeliveryId,
+        )
+      : parseTrueForgeProviderToolArguments(
+          observedToolCall.argumentsText,
+          expectedConnectionId,
+          expectedDeliveryId,
+          expectedMcpServerName,
+        );
   } catch (error) {
     if (error instanceof ProviderInvestigationUnexpectedArgumentsError) {
       // Keep the failed attempt attributable to the model tool-call event,

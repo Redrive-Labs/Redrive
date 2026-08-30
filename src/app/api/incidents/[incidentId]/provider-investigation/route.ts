@@ -6,15 +6,27 @@ import {
   UnsupportedProviderEvidenceError,
 } from "@/server/provider-evidence-service";
 import {
-  investigateProviderForIncident,
+  investigateIncidentForRecovery,
+} from "@/server/incident-investigation-service";
+import {
   ProviderInvestigationConfigurationError,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
 } from "@/server/provider-investigation-service";
 import {
+  ReceiverInvestigationConfigurationError,
+  ReceiverInvestigationEvidenceError,
+  ReceiverInvestigationTurnError,
+} from "@/server/receiver-investigation-service";
+import {
+  ReceiverObservationProvenanceConflictError,
+  ReceiverObservationSessionBindingError,
+} from "@/server/receiver-observation-service";
+import {
   TrueForgeSessionBindingError,
   TrueForgeSessionSpecUpgradeError,
   TrueForgeSessionUnavailableError,
+  TrueForgeSessionMismatchError,
   TrueForgeUnsupportedCoordinatorSpecError,
 } from "@/server/trueforge-session-service";
 import {
@@ -38,7 +50,7 @@ export async function POST(
   const { incidentId } = await context.params;
 
   try {
-    return NextResponse.json(await investigateProviderForIncident(incidentId));
+    return NextResponse.json(await investigateIncidentForRecovery(incidentId));
   } catch (error) {
     return providerInvestigationErrorResponse(error);
   }
@@ -59,7 +71,8 @@ function providerInvestigationErrorResponse(error: unknown): Response {
   if (
     error instanceof RecoveryCoordinatorConfigurationError ||
     error instanceof TrueForgeConfigurationError ||
-    error instanceof ProviderInvestigationConfigurationError
+    error instanceof ProviderInvestigationConfigurationError ||
+    error instanceof ReceiverInvestigationConfigurationError
   ) {
     return NextResponse.json(
       { error: "Provider investigation is not configured." },
@@ -69,11 +82,19 @@ function providerInvestigationErrorResponse(error: unknown): Response {
 
   if (
     error instanceof TrueForgeSessionUnavailableError ||
+    error instanceof TrueForgeSessionMismatchError ||
     error instanceof TrueForgeSessionSpecUpgradeError ||
     error instanceof TrueForgeUnsupportedCoordinatorSpecError
   ) {
     return NextResponse.json(
       { error: "The TrueForge session is not ready for provider investigation." },
+      { status: 503 },
+    );
+  }
+
+  if (error instanceof ReceiverObservationSessionBindingError) {
+    return NextResponse.json(
+      { error: "The receiver evidence session binding is not ready." },
       { status: 503 },
     );
   }
@@ -95,10 +116,27 @@ function providerInvestigationErrorResponse(error: unknown): Response {
     );
   }
 
-  if (error instanceof ProviderInvestigationTurnError) {
+  if (error instanceof ReceiverInvestigationEvidenceError) {
     return NextResponse.json(
-      { error: "TrueForge provider investigation did not produce valid evidence." },
+      { error: "TrueForge receiver evidence was malformed or mismatched." },
+      { status: 422 },
+    );
+  }
+
+  if (
+    error instanceof ProviderInvestigationTurnError ||
+    error instanceof ReceiverInvestigationTurnError
+  ) {
+    return NextResponse.json(
+      { error: "TrueForge investigation did not produce valid evidence." },
       { status: 502 },
+    );
+  }
+
+  if (error instanceof ReceiverObservationProvenanceConflictError) {
+    return NextResponse.json(
+      { error: "The receiver observation conflicts with immutable provenance." },
+      { status: 409 },
     );
   }
 
@@ -111,7 +149,7 @@ function providerInvestigationErrorResponse(error: unknown): Response {
 
   if (error instanceof TrueForgeTurnCreateError) {
     return NextResponse.json(
-      { error: "TrueForge provider investigation could not be started." },
+      { error: "TrueForge investigation could not be started." },
       { status: 502 },
     );
   }
