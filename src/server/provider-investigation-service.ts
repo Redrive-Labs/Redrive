@@ -225,6 +225,71 @@ function parseToolArguments(
   };
 }
 
+function parseTrueForgeProviderToolArguments(
+  argumentsText: string,
+  expectedConnectionId: string,
+  expectedDeliveryId: string,
+  expectedMcpServerName: string,
+): ProviderToolArguments {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsText) as unknown;
+  } catch {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments are not valid JSON.",
+    );
+  }
+
+  if (!isRecord(parsed)) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments must be an object.",
+    );
+  }
+
+  const expectedKeys = ["mcp_server", "tool_name", "input"] as const;
+  const additionalKeys = Object.keys(parsed)
+    .filter((key) => !expectedKeys.includes(key as (typeof expectedKeys)[number]))
+    .sort();
+  if (additionalKeys.length > 0) {
+    throw new ProviderInvestigationUnexpectedArgumentsError(additionalKeys);
+  }
+  if (
+    expectedKeys.some(
+      (key) => !Object.prototype.hasOwnProperty.call(parsed, key),
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper arguments are missing required fields.",
+    );
+  }
+
+  if (
+    parsed.mcp_server !== expectedMcpServerName ||
+    parsed.tool_name !== GITHUB_WEBHOOK_DELIVERY_TOOL
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper did not identify the configured GitHub MCP tool.",
+    );
+  }
+  if (!isRecord(parsed.input)) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper input must be an object.",
+    );
+  }
+
+  const inputArguments = JSON.stringify(parsed.input);
+  if (typeof inputArguments !== "string") {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator TrueForge MCP wrapper input could not be normalized.",
+    );
+  }
+  return parseToolArguments(
+    inputArguments,
+    expectedConnectionId,
+    expectedDeliveryId,
+  );
+}
+
 /**
  * TrueForge's installed runtime turns the proven remote MCP text item into the
  * tool.response content string directly. That string is one JSON document
@@ -753,14 +818,31 @@ async function collectProviderTurn(
     );
   }
   const observedToolCall = providerToolCalls[0];
+  const isDirectMcpCall = observedToolCall.toolInfoType === "mcp";
+  const isTrueForgeWrapperCall =
+    observedToolCall.toolInfoType === "truefoundry-system";
+  if (!isDirectMcpCall && !isTrueForgeWrapperCall) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator did not call the configured read-only GitHub MCP tool.",
+    );
+  }
   if (
-    observedToolCall.toolInfoType !== "mcp" ||
-    observedToolCall.toolInfoServerName !== expectedMcpServerName ||
-    observedToolCall.toolInfoName !== GITHUB_WEBHOOK_DELIVERY_TOOL ||
-    observedToolCall.functionName !== GITHUB_WEBHOOK_DELIVERY_TOOL
+    isDirectMcpCall &&
+    (observedToolCall.toolInfoServerName !== expectedMcpServerName ||
+      observedToolCall.toolInfoName !== GITHUB_WEBHOOK_DELIVERY_TOOL ||
+      observedToolCall.functionName !== GITHUB_WEBHOOK_DELIVERY_TOOL)
   ) {
     throw new ProviderInvestigationTurnError(
       "Provider Investigator did not call the configured read-only GitHub MCP tool.",
+    );
+  }
+  if (
+    isTrueForgeWrapperCall &&
+    (observedToolCall.toolInfoName !== "call_tool" ||
+      observedToolCall.functionName !== "call_tool")
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "Provider Investigator did not call the configured GitHub MCP tool through the TrueForge system wrapper.",
     );
   }
 
@@ -778,13 +860,39 @@ async function collectProviderTurn(
     );
   }
 
+  const unrelatedResponses = toolResponses.filter(
+    (response) =>
+      response.threadId !== thread.threadId ||
+      response.toolCallId !== observedToolCall.toolCallId,
+  );
+  if (
+    unrelatedResponses.length > 1 ||
+    unrelatedResponses.some(
+      (response) =>
+        response.threadId !== thread.parentThreadId ||
+        response.toolCallId !== thread.parentToolCallId ||
+        response.content !== "",
+    )
+  ) {
+    throw new ProviderInvestigationTurnError(
+      "TrueForge emitted an unrelated or duplicate provider tool.response.",
+    );
+  }
+
   let argumentsValue: ProviderToolArguments;
   try {
-    argumentsValue = parseToolArguments(
-      observedToolCall.argumentsText,
-      expectedConnectionId,
-      expectedDeliveryId,
-    );
+    argumentsValue = isDirectMcpCall
+      ? parseToolArguments(
+          observedToolCall.argumentsText,
+          expectedConnectionId,
+          expectedDeliveryId,
+        )
+      : parseTrueForgeProviderToolArguments(
+          observedToolCall.argumentsText,
+          expectedConnectionId,
+          expectedDeliveryId,
+          expectedMcpServerName,
+        );
   } catch (error) {
     if (error instanceof ProviderInvestigationUnexpectedArgumentsError) {
       // Keep the failed attempt attributable to the model tool-call event,

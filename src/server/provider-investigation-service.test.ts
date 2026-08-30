@@ -81,6 +81,7 @@ function makeGithubResult(
 interface StreamOptions {
   agentName?: string;
   modelThreadId?: string;
+  providerToolShape?: "direct-mcp" | "truefoundry-system-wrapper";
   toolName?: string;
   toolInfoName?: string;
   toolInfoServerName?: string;
@@ -88,6 +89,15 @@ interface StreamOptions {
   deliveryArgument?: string;
   providerArgumentsText?: string;
   extraArguments?: Record<string, unknown>;
+  wrapperMcpServer?: string;
+  wrapperToolName?: string;
+  wrapperConnectionArgument?: string;
+  wrapperDeliveryArgument?: string;
+  wrapperExtraOuterField?: boolean;
+  wrapperMissingOuterField?: "mcp_server" | "tool_name" | "input";
+  wrapperExtraInnerField?: boolean;
+  wrapperMissingInnerField?: "connection_id" | "delivery_id";
+  extraProviderToolCall?: boolean;
   expectedDeliveryId?: string;
   turnId?: string;
   providerThreadId?: string;
@@ -110,14 +120,68 @@ function makeStream(
   const providerSpawnToolCallId =
     options.providerSpawnToolCallId ?? "spawn-provider-1";
   const turnId = options.turnId ?? "turn-1";
-  const providerToolArguments = {
+  const directProviderToolArguments = {
     connection_id: options.connectionArgument ?? "connection-1",
     delivery_id:
       options.deliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
     ...options.extraArguments,
   };
+  const wrapperInput: Record<string, unknown> = {
+    connection_id: options.wrapperConnectionArgument ?? "connection-1",
+    delivery_id:
+      options.wrapperDeliveryArgument ?? options.expectedDeliveryId ?? deliveryId,
+  };
+  if (options.wrapperExtraInnerField) {
+    wrapperInput.extra = "not-allowed";
+  }
+  if (options.wrapperMissingInnerField !== undefined) {
+    delete wrapperInput[options.wrapperMissingInnerField];
+  }
+  const wrapperArguments: Record<string, unknown> = {
+    mcp_server: options.wrapperMcpServer ?? connectionMcpServerName,
+    tool_name: options.wrapperToolName ?? "get_webhook_delivery",
+    input: wrapperInput,
+  };
+  if (options.wrapperExtraOuterField) {
+    wrapperArguments.extra = "not-allowed";
+  }
+  if (options.wrapperMissingOuterField !== undefined) {
+    delete wrapperArguments[options.wrapperMissingOuterField];
+  }
+  const isProviderToolWrapper =
+    options.providerToolShape === "truefoundry-system-wrapper";
   const providerToolArgumentsText =
-    options.providerArgumentsText ?? JSON.stringify(providerToolArguments);
+    options.providerArgumentsText ??
+    JSON.stringify(
+      isProviderToolWrapper
+        ? wrapperArguments
+        : directProviderToolArguments,
+    );
+  const providerToolCall = {
+    id: toolCallId,
+    type: "function",
+    function: {
+      name: isProviderToolWrapper
+        ? "call_tool"
+        : options.toolName ?? "get_webhook_delivery",
+      arguments: providerToolArgumentsText,
+    },
+    toolInfo: isProviderToolWrapper
+      ? {
+          type: "truefoundry-system",
+          name: "call_tool",
+        }
+      : {
+          type: "mcp",
+          name: options.toolInfoName ?? "get_webhook_delivery",
+          serverId: "mcp-server-1",
+          serverName: options.toolInfoServerName ?? connectionMcpServerName,
+        },
+  };
+  const providerToolCalls: Record<string, unknown>[] = [providerToolCall];
+  if (options.extraProviderToolCall) {
+    providerToolCalls.push({ ...providerToolCall, id: "github-call-2" });
+  }
   const events: unknown[] = [
     {
       type: "turn.created",
@@ -169,22 +233,7 @@ function makeStream(
       id: "provider-model-event",
       threadId: options.modelThreadId ?? providerThreadId,
       content: null,
-      toolCalls: [
-        {
-          id: toolCallId,
-          type: "function",
-          function: {
-            name: options.toolName ?? "get_webhook_delivery",
-            arguments: providerToolArgumentsText,
-          },
-          toolInfo: {
-            type: "mcp",
-            name: options.toolInfoName ?? "get_webhook_delivery",
-            serverId: "mcp-server-1",
-            serverName: options.toolInfoServerName ?? connectionMcpServerName,
-          },
-        },
-      ],
+      toolCalls: providerToolCalls,
     },
   ];
 
@@ -855,10 +904,10 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
   });
 
-  it("captures first evidence from the correlated tool.response", async () => {
+  it("accepts the existing direct MCP form and captures first evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
-    const client = createClient(makeStream());
+    const client = createClient(makeStream({ providerToolShape: "direct-mcp" }));
     const service = createProviderInvestigationService(
       database,
       client,
@@ -876,6 +925,33 @@ describe("TrueForge provider investigation", () => {
       providerDeliveryId: deliveryId,
       deliveryGuid: "logical-guid-1",
       outcome: { statusCode: 500 },
+    });
+  });
+
+  it("accepts the live TrueForge call_tool provider wrapper", async () => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(
+      makeStream({ providerToolShape: "truefoundry-system-wrapper" }),
+    );
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    const result = await service.investigateProviderForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      evidenceDisposition: "CAPTURED",
+      providerInvestigatorThreadId: "provider-thread-1",
+      providerStatusCode: 500,
+    });
+    expect(
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
+    ).toMatchObject({
+      providerDeliveryId: deliveryId,
+      deliveryGuid: "logical-guid-1",
     });
   });
 
@@ -973,6 +1049,88 @@ describe("TrueForge provider investigation", () => {
         createProviderEvidenceService(database).getByIncidentId(incident.id),
       ).toBeNull();
     }
+  });
+
+  it.each([
+    [
+      "wrong wrapper MCP server",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperMcpServer: "other-server",
+      },
+    ],
+    [
+      "wrong wrapper tool name",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperToolName: "redeliver_webhook_delivery",
+      },
+    ],
+    [
+      "extra wrapper key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperExtraOuterField: true,
+      },
+    ],
+    [
+      "missing wrapper key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperMissingOuterField: "input",
+      },
+    ],
+    [
+      "extra inner input key",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperExtraInnerField: true,
+      },
+    ],
+    [
+      "wrong wrapper connection ID",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperConnectionArgument: "wrong-connection",
+      },
+    ],
+    [
+      "wrong wrapper delivery ID",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        wrapperDeliveryArgument: "wrong-delivery",
+      },
+    ],
+    [
+      "more than one provider child tool call",
+      {
+        providerToolShape: "truefoundry-system-wrapper",
+        extraProviderToolCall: true,
+      },
+    ],
+    [
+      "mismatched tool.response",
+      {
+        responseThreadId: "main",
+        responseToolCallId: "not-provider-call",
+      },
+    ],
+  ] as const)("rejects %s", async (_description, options) => {
+    const incident = createIncident();
+    installActiveBinding(incident.id);
+    const client = createClient(makeStream(options));
+    const service = createProviderInvestigationService(
+      database,
+      client,
+      environment,
+    );
+
+    await expect(
+      service.investigateProviderForIncident(incident.id),
+    ).rejects.toBeInstanceOf(ProviderInvestigationTurnError);
+    expect(
+      createProviderEvidenceService(database).getByIncidentId(incident.id),
+    ).toBeNull();
   });
 
   it("requires the matching response and never treats prose as evidence", async () => {
