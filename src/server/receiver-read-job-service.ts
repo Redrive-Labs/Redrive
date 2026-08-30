@@ -359,6 +359,24 @@ function nextHealthState(
   return RECEIVER_CONNECTION_UNHEALTHY;
 }
 
+function isNewerHealthObservation(
+  currentObservedAt: unknown,
+  incomingObservedAt: string,
+): boolean {
+  if (currentObservedAt === null || currentObservedAt === undefined) return true;
+  if (
+    typeof currentObservedAt !== "string" ||
+    !Number.isFinite(Date.parse(currentObservedAt))
+  ) {
+    throw new ReceiverReadJobError(
+      "INVALID_STATE",
+      "The persisted receiver health observation is invalid.",
+    );
+  }
+  // Equal timestamps are deterministic: the existing durable projection wins.
+  return Date.parse(incomingObservedAt) > Date.parse(currentObservedAt);
+}
+
 function readDueDate(value: string, field: string): number {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) {
@@ -405,6 +423,143 @@ function markJobExpired(
       "The receiver read job is no longer available.",
     );
   }
+}
+
+function assertReceiverCanLeaseCapability(
+  database: SqliteDatabase,
+  receiverConnectionId: string,
+  capability: ReceiverCapability,
+): void {
+  if (capability !== RECEIVER_CAPABILITY_BUSINESS_STATE) return;
+  const receiver = database.get<{ state: unknown }>(
+    `SELECT state FROM receiver_connections WHERE id = ?`,
+    [receiverConnectionId],
+  );
+  if (receiver === undefined) {
+    throw new ReceiverReadJobError(
+      "INVALID_STATE",
+      "The receiver connection could not be read while leasing.",
+    );
+  }
+  if (readReceiverState(receiver.state) !== RECEIVER_CONNECTION_READY) {
+    throw new ReceiverReadJobError(
+      "JOB_NOT_AVAILABLE",
+      "Business state reads require a ready receiver connection.",
+    );
+  }
+}
+
+function acquireLeaseWithinTransaction(
+  database: SqliteDatabase,
+  row: ReceiverReadJobRow,
+  authentication: { receiverConnectionId: string; connectorId: string },
+  now: Date,
+  timestamp: string,
+): { kind: "deadline" } | { kind: "leased"; row: ReceiverReadJobRow } {
+  const jobId = readText(row, "id");
+  const receiverConnectionId = readText(row, "receiverConnectionId");
+  const capability = readCapability(row);
+  const state = readJobState(row);
+  assertTerminalState(state);
+  if (state !== RECEIVER_READ_JOB_QUEUED && state !== RECEIVER_READ_JOB_LEASED) {
+    throw new ReceiverReadJobError(
+      "JOB_NOT_AVAILABLE",
+      "The receiver read job is not available for leasing.",
+    );
+  }
+  const deadlineAt = readText(row, "deadlineAt");
+  if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {
+    markJobExpired(database, jobId, receiverConnectionId, timestamp);
+    return { kind: "deadline" };
+  }
+  assertReceiverCanLeaseCapability(database, receiverConnectionId, capability);
+
+  const generation = readLeaseGeneration(row);
+  const oldLeaseExpiresAt = readNullableText(row, "leaseExpiresAt");
+  if (state === RECEIVER_READ_JOB_LEASED) {
+    if (oldLeaseExpiresAt === null) {
+      throw new ReceiverReadJobError(
+        "INVALID_STATE",
+        "The leased receiver read job has no lease expiry.",
+      );
+    }
+    if (readDueDate(oldLeaseExpiresAt, "leaseExpiresAt") > now.getTime()) {
+      throw new ReceiverReadJobError(
+        "JOB_ALREADY_LEASED",
+        "The receiver read job is already leased.",
+      );
+    }
+  }
+
+  const leaseExpiresAt = new Date(
+    now.getTime() + RECEIVER_READ_JOB_LEASE_MS,
+  ).toISOString();
+  const update = state === RECEIVER_READ_JOB_QUEUED
+    ? database.run(
+        `
+          UPDATE receiver_read_jobs
+             SET state = ?,
+                 lease_generation = lease_generation + 1,
+                 leased_connector_id = ?,
+                 lease_expires_at = ?,
+                 updated_at = ?
+           WHERE id = ? AND receiver_connection_id = ?
+             AND state = ? AND lease_generation = ?
+             AND leased_connector_id IS NULL AND lease_expires_at IS NULL
+             AND deadline_at = ?
+        `,
+        [
+          RECEIVER_READ_JOB_LEASED,
+          authentication.connectorId,
+          leaseExpiresAt,
+          timestamp,
+          jobId,
+          receiverConnectionId,
+          RECEIVER_READ_JOB_QUEUED,
+          generation,
+          deadlineAt,
+        ],
+      )
+    : database.run(
+        `
+          UPDATE receiver_read_jobs
+             SET state = ?,
+                 lease_generation = lease_generation + 1,
+                 leased_connector_id = ?,
+                 lease_expires_at = ?,
+                 updated_at = ?
+           WHERE id = ? AND receiver_connection_id = ?
+             AND state = ? AND lease_generation = ?
+             AND lease_expires_at = ?
+             AND deadline_at = ?
+        `,
+        [
+          RECEIVER_READ_JOB_LEASED,
+          authentication.connectorId,
+          leaseExpiresAt,
+          timestamp,
+          jobId,
+          receiverConnectionId,
+          RECEIVER_READ_JOB_LEASED,
+          generation,
+          oldLeaseExpiresAt,
+          deadlineAt,
+        ],
+      );
+  if (update.changes !== 1) {
+    throw new ReceiverReadJobError(
+      "JOB_NOT_AVAILABLE",
+      "The receiver read job is no longer available for leasing.",
+    );
+  }
+  const leasedRow = getReceiverReadJobRow(database, jobId);
+  if (leasedRow === undefined) {
+    throw new ReceiverReadJobError(
+      "INVALID_STATE",
+      "The receiver read job could not be read after leasing.",
+    );
+  }
+  return { kind: "leased", row: leasedRow };
 }
 
 function parseLeaseGeneration(value: unknown): number {
@@ -691,99 +846,13 @@ function createReceiverReadJobServiceWithOptions(
         authentication,
         receiverConnectionId,
       );
-      const state = readJobState(row);
-      assertTerminalState(state);
-      if (state !== RECEIVER_READ_JOB_QUEUED && state !== RECEIVER_READ_JOB_LEASED) {
-        throw new ReceiverReadJobError(
-          "JOB_NOT_AVAILABLE",
-          "The receiver read job is not available for leasing.",
-        );
-      }
-      const deadlineAt = readText(row, "deadlineAt");
-      if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {
-        markJobExpired(database, jobId, receiverConnectionId, timestamp);
-        return { kind: "deadline" as const };
-      }
-
-      const generation = readLeaseGeneration(row);
-      const oldLeaseExpiresAt = readNullableText(row, "leaseExpiresAt");
-      if (state === RECEIVER_READ_JOB_LEASED) {
-        if (oldLeaseExpiresAt === null) {
-          throw new ReceiverReadJobError(
-            "INVALID_STATE",
-            "The leased receiver read job has no lease expiry.",
-          );
-        }
-        if (readDueDate(oldLeaseExpiresAt, "leaseExpiresAt") > now.getTime()) {
-          throw new ReceiverReadJobError(
-            "JOB_ALREADY_LEASED",
-            "The receiver read job is already leased.",
-          );
-        }
-      }
-
-      const leaseExpiresAt = new Date(
-        now.getTime() + RECEIVER_READ_JOB_LEASE_MS,
-      ).toISOString();
-      const update = state === RECEIVER_READ_JOB_QUEUED
-        ? database.run(
-            `
-              UPDATE receiver_read_jobs
-                 SET state = ?,
-                     lease_generation = lease_generation + 1,
-                     leased_connector_id = ?,
-                     lease_expires_at = ?,
-                     updated_at = ?
-               WHERE id = ? AND receiver_connection_id = ?
-                 AND state = ? AND lease_generation = ?
-                 AND leased_connector_id IS NULL AND lease_expires_at IS NULL
-                 AND deadline_at = ?
-            `,
-            [
-              RECEIVER_READ_JOB_LEASED,
-              auth.connectorId,
-              leaseExpiresAt,
-              timestamp,
-              jobId,
-              receiverConnectionId,
-              RECEIVER_READ_JOB_QUEUED,
-              generation,
-              deadlineAt,
-            ],
-          )
-        : database.run(
-            `
-              UPDATE receiver_read_jobs
-                 SET state = ?,
-                     lease_generation = lease_generation + 1,
-                     leased_connector_id = ?,
-                     lease_expires_at = ?,
-                     updated_at = ?
-               WHERE id = ? AND receiver_connection_id = ?
-                 AND state = ? AND lease_generation = ?
-                 AND lease_expires_at = ?
-                 AND deadline_at = ?
-            `,
-            [
-              RECEIVER_READ_JOB_LEASED,
-              auth.connectorId,
-              leaseExpiresAt,
-              timestamp,
-              jobId,
-              receiverConnectionId,
-              RECEIVER_READ_JOB_LEASED,
-              generation,
-              oldLeaseExpiresAt,
-              deadlineAt,
-            ],
-          );
-      if (update.changes !== 1) {
-        throw new ReceiverReadJobError(
-          "JOB_NOT_AVAILABLE",
-          "The receiver read job is no longer available for leasing.",
-        );
-      }
-      return { kind: "leased" as const };
+      return acquireLeaseWithinTransaction(
+        database,
+        row,
+        auth,
+        now,
+        timestamp,
+      );
     }, "immediate");
 
     if (outcome.kind === "deadline") {
@@ -792,7 +861,7 @@ function createReceiverReadJobServiceWithOptions(
         "The receiver read job deadline has expired.",
       );
     }
-    return getReceiverReadJobOrThrow(database, jobId);
+    return mapReceiverReadJob(outcome.row);
   }
 
   function leaseNext(
@@ -831,33 +900,62 @@ function createReceiverReadJobServiceWithOptions(
           nowIso,
         ],
       );
-      return database.get<{ id: string }>(
-      `
-        SELECT id
-          FROM receiver_read_jobs
-         WHERE receiver_connection_id = ?
-           AND deadline_at > ?
-           AND (
-             state = ?
-             OR (state = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-           )
-           AND (? IS NULL OR capability = ?)
-         ORDER BY created_at ASC, id ASC
-         LIMIT 1
-      `,
-      [
-        auth.receiverConnectionId,
+      const receiver = database.get<{ state: unknown }>(
+        `SELECT state FROM receiver_connections WHERE id = ?`,
+        [auth.receiverConnectionId],
+      );
+      if (receiver === undefined) {
+        throw new ReceiverReadJobError(
+          "INVALID_STATE",
+          "The receiver connection could not be read while leasing.",
+        );
+      }
+      const receiverState = readReceiverState(receiver.state);
+      const candidate = database.get<ReceiverReadJobRow>(
+        `
+          SELECT ${receiverReadJobColumns}
+            FROM receiver_read_jobs
+           WHERE receiver_connection_id = ?
+             AND deadline_at > ?
+             AND (
+               state = ?
+               OR (state = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+             )
+             AND (? IS NULL OR capability = ?)
+             AND (capability = ? OR ? = ?)
+           ORDER BY created_at ASC, id ASC
+           LIMIT 1
+        `,
+        [
+          auth.receiverConnectionId,
+          nowIso,
+          RECEIVER_READ_JOB_QUEUED,
+          RECEIVER_READ_JOB_LEASED,
+          nowIso,
+          capability ?? null,
+          capability ?? null,
+          RECEIVER_CAPABILITY_HEALTH,
+          receiverState,
+          RECEIVER_CONNECTION_READY,
+        ],
+      );
+      if (candidate === undefined) return null;
+      return acquireLeaseWithinTransaction(
+        database,
+        candidate,
+        auth,
+        now,
         nowIso,
-        RECEIVER_READ_JOB_QUEUED,
-        RECEIVER_READ_JOB_LEASED,
-        nowIso,
-        capability ?? null,
-        capability ?? null,
-      ],
       );
     }, "immediate");
-    if (row === undefined) return null;
-    return lease(row.id, authentication, now);
+    if (row === null) return null;
+    if (row.kind === "deadline") {
+      throw new ReceiverReadJobError(
+        "DEADLINE_EXPIRED",
+        "The receiver read job deadline has expired.",
+      );
+    }
+    return mapReceiverReadJob(row.row);
   }
 
   return {
@@ -1090,8 +1188,8 @@ function createReceiverReadJobServiceWithCompletion(
       }
 
       if (capability === RECEIVER_CAPABILITY_HEALTH) {
-        const receiver = database.get<{ state: unknown }>(
-          `SELECT state FROM receiver_connections WHERE id = ?`,
+        const receiver = database.get<{ state: unknown; lastHealthAt: unknown }>(
+          `SELECT state, last_health_at AS lastHealthAt FROM receiver_connections WHERE id = ?`,
           [receiverConnectionId],
         );
         if (receiver === undefined) {
@@ -1100,34 +1198,33 @@ function createReceiverReadJobServiceWithCompletion(
             "The receiver connection could not be read while completing health.",
           );
         }
-        const receiverState = readReceiverState(receiver.state);
         const healthResult = parseHealthReadResult(result);
-        const nextState = nextHealthState(
-          receiverState,
-          healthResult.healthStatus,
-        );
-        const receiverUpdate = database.run(
-          `
-            UPDATE receiver_connections
-               SET state = ?,
-                   last_health_status = ?,
-                   last_health_at = ?,
-                   updated_at = ?
-             WHERE id = ?
-          `,
-          [
-            nextState,
-            healthResult.healthStatus,
-            healthResult.observedAt,
-            timestamp,
-            receiverConnectionId,
-          ],
-        );
-        if (receiverUpdate.changes !== 1) {
-          throw new ReceiverReadJobError(
-            "INVALID_STATE",
-            "The receiver connection could not be updated while completing health.",
+        if (isNewerHealthObservation(receiver.lastHealthAt, healthResult.observedAt)) {
+          const receiverState = readReceiverState(receiver.state);
+          const nextState = nextHealthState(receiverState, healthResult.healthStatus);
+          const receiverUpdate = database.run(
+            `
+              UPDATE receiver_connections
+                 SET state = ?,
+                     last_health_status = ?,
+                     last_health_at = ?,
+                     updated_at = ?
+               WHERE id = ?
+            `,
+            [
+              nextState,
+              healthResult.healthStatus,
+              healthResult.observedAt,
+              timestamp,
+              receiverConnectionId,
+            ],
           );
+          if (receiverUpdate.changes !== 1) {
+            throw new ReceiverReadJobError(
+              "INVALID_STATE",
+              "The receiver connection could not be updated while completing health.",
+            );
+          }
         }
       }
       return { kind: "completed" as const };

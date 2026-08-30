@@ -126,6 +126,16 @@ describe("central receiver connector transport foundation", () => {
     });
   }
 
+  function setReceiverState(
+    receiverConnectionId: string,
+    state: string,
+  ): void {
+    database.run(
+      "UPDATE receiver_connections SET state = ? WHERE id = ?",
+      [state, receiverConnectionId],
+    );
+  }
+
   it("migrates the receiver schema without changing a populated READY application connection", () => {
     expect(database.get<{ state: string }>(
       "SELECT state FROM application_connections WHERE id = ?",
@@ -266,6 +276,7 @@ describe("central receiver connector transport foundation", () => {
   it("creates typed jobs, fences lease generations, and accepts only the current completion", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const job = jobs.createBusinessStateJob(enrollment.receiverConnection.id, "delivery-guid-1");
     expect(job).toMatchObject({
       capability: RECEIVER_CAPABILITY_BUSINESS_STATE,
@@ -303,9 +314,78 @@ describe("central receiver connector transport foundation", () => {
     expect(jobs.complete(job.id, auth, 2, completed.result)).toEqual(completed);
   });
 
+  it("does not turn overlapping polls into already-leased contention failures", async () => {
+    const enrollment = enroll(issue().token);
+    const job = jobs.getById(enrollment.healthJobId as string);
+    expect(job).not.toBeNull();
+    if (job === null) throw new Error("The enrollment health job was not created.");
+    const contendingDatabase = openDatabase(path.join(directory, "records.sqlite"));
+    try {
+      const contendingConnections = createReceiverConnectionService({
+        database: contendingDatabase,
+        clock: () => now,
+      });
+      const contendingJobs = createReceiverReadJobService({
+        database: contendingDatabase,
+        clock: () => now,
+      });
+      const firstAuth = authenticated();
+      const secondAuth = contendingConnections.authenticate({
+        connectorId: CONNECTOR_ID,
+        connectorSecret: CONNECTOR_SECRET,
+      });
+      const results = await Promise.all([
+        Promise.resolve(jobs.leaseNext(firstAuth)),
+        Promise.resolve(contendingJobs.leaseNext(secondAuth)),
+      ]);
+
+      expect(results.filter((result) => result !== null)).toHaveLength(1);
+      expect(results.filter((result) => result === null)).toHaveLength(1);
+      expect(results.find((result) => result !== null)).toMatchObject({
+        id: job?.id,
+        state: "LEASED",
+        leaseGeneration: 1,
+      });
+      expect(jobs.getById(job.id)?.leaseGeneration).toBe(1);
+    } finally {
+      contendingDatabase.close();
+    }
+  });
+
+  it("revalidates READY when leasing business observations", () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+    const initialHealth = jobs.getById(enrollment.healthJobId as string);
+    const initialLease = jobs.lease(initialHealth?.id as string, auth);
+    jobs.complete(initialHealth?.id as string, auth, initialLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: now.toISOString(),
+    });
+
+    const businessJob = jobs.createBusinessStateJob(
+      enrollment.receiverConnection.id,
+      "ready-check-guid",
+    );
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_UNHEALTHY);
+
+    expect(jobs.leaseNext(auth, RECEIVER_CAPABILITY_BUSINESS_STATE)).toBeNull();
+    expect(jobs.getById(businessJob.id)?.state).toBe("QUEUED");
+    expect(() => jobs.lease(businessJob.id, auth)).toThrowError(
+      expect.objectContaining({ code: "JOB_NOT_AVAILABLE" }),
+    );
+
+    const healthJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    expect(jobs.leaseNext(auth, RECEIVER_CAPABILITY_HEALTH)).toMatchObject({
+      id: healthJob.id,
+      state: "LEASED",
+    });
+  });
+
   it("accepts only exact terminal replays and keeps ownership checks ahead of replay", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const result = {
       schemaVersion: 1 as const,
       deliveryGuid: "delivery-guid-1",
@@ -386,6 +466,7 @@ describe("central receiver connector transport foundation", () => {
   it("recovers a lost completion response through exact HTTP replay", async () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const job = jobs.lease(
       jobs.createBusinessStateJob(
         enrollment.receiverConnection.id,
@@ -562,6 +643,7 @@ describe("central receiver connector transport foundation", () => {
   it("validates all business result counts and delivery identity", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const completeWith = (mutationCount: number, businessState: string, deliveryGuid = "delivery-guid-1") => {
       const job = jobs.createBusinessStateJob(enrollment.receiverConnection.id, "delivery-guid-1");
       const lease = jobs.lease(job.id, auth);
@@ -583,6 +665,7 @@ describe("central receiver connector transport foundation", () => {
   it("rejects completion after the durable deadline and fences the job as expired", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const job = jobs.createBusinessStateJob(enrollment.receiverConnection.id, "deadline-guid");
     const lease = jobs.lease(job.id, auth);
     now = new Date(START.getTime() + 60 * 1000 + 1);
@@ -637,6 +720,7 @@ describe("central receiver connector transport foundation", () => {
   it("expires before fencing stale late reports and rejects all terminal payloads", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
+    setReceiverState(enrollment.receiverConnection.id, RECEIVER_CONNECTION_READY);
     const job = jobs.createBusinessStateJob(enrollment.receiverConnection.id, "late-guid");
     const lateFailureJob = jobs.createHealthJob(enrollment.receiverConnection.id);
     const firstLease = jobs.lease(job.id, auth);
@@ -723,6 +807,7 @@ describe("central receiver connector transport foundation", () => {
     expect(healthy.state).toBe("SUCCEEDED");
     expect(connections.getById(enrollment.receiverConnection.id)?.state).toBe(RECEIVER_CONNECTION_READY);
 
+    now = new Date(START.getTime() + 1_000);
     const unhealthyJob = jobs.createHealthJob(enrollment.receiverConnection.id);
     const unhealthyLease = jobs.lease(unhealthyJob.id, auth);
     jobs.complete(unhealthyJob.id, auth, unhealthyLease.leaseGeneration, {
@@ -732,6 +817,7 @@ describe("central receiver connector transport foundation", () => {
     });
     expect(connections.getById(enrollment.receiverConnection.id)?.state).toBe(RECEIVER_CONNECTION_UNHEALTHY);
 
+    now = new Date(START.getTime() + 2_000);
     const healthyAgainJob = jobs.createHealthJob(enrollment.receiverConnection.id);
     const healthyAgainLease = jobs.lease(healthyAgainJob.id, auth);
     jobs.complete(healthyAgainJob.id, auth, healthyAgainLease.leaseGeneration, {
@@ -740,6 +826,61 @@ describe("central receiver connector transport foundation", () => {
       observedAt: now.toISOString(),
     });
     expect(connections.getById(enrollment.receiverConnection.id)?.state).toBe(RECEIVER_CONNECTION_READY);
+  });
+
+  it("does not promote older or equal health observations", () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+    const initialHealth = jobs.getById(enrollment.healthJobId as string);
+    const firstObservationAt = new Date(START.getTime() + 20_000);
+    now = firstObservationAt;
+    const firstLease = jobs.lease(initialHealth?.id as string, auth);
+    jobs.complete(initialHealth?.id as string, auth, firstLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: firstObservationAt.toISOString(),
+    });
+
+    const staleJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const staleLease = jobs.lease(staleJob.id, auth);
+    const stale = jobs.complete(staleJob.id, auth, staleLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "UNHEALTHY",
+      observedAt: new Date(START.getTime() + 10_000).toISOString(),
+    });
+    expect(stale.state).toBe("SUCCEEDED");
+    expect(connections.getById(enrollment.receiverConnection.id)).toMatchObject({
+      state: RECEIVER_CONNECTION_READY,
+      lastHealthStatus: "HEALTHY",
+      lastHealthAt: firstObservationAt.toISOString(),
+    });
+
+    const equalJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const equalLease = jobs.lease(equalJob.id, auth);
+    const equal = jobs.complete(equalJob.id, auth, equalLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "UNHEALTHY",
+      observedAt: firstObservationAt.toISOString(),
+    });
+    expect(equal.state).toBe("SUCCEEDED");
+    expect(connections.getById(enrollment.receiverConnection.id)).toMatchObject({
+      state: RECEIVER_CONNECTION_READY,
+      lastHealthStatus: "HEALTHY",
+      lastHealthAt: firstObservationAt.toISOString(),
+    });
+
+    const newerJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const newerLease = jobs.lease(newerJob.id, auth);
+    jobs.complete(newerJob.id, auth, newerLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "UNHEALTHY",
+      observedAt: new Date(START.getTime() + 30_000).toISOString(),
+    });
+    expect(connections.getById(enrollment.receiverConnection.id)).toMatchObject({
+      state: RECEIVER_CONNECTION_UNHEALTHY,
+      lastHealthStatus: "UNHEALTHY",
+      lastHealthAt: new Date(START.getTime() + 30_000).toISOString(),
+    });
   });
 
   it("rolls back a health state failure together with the terminal job update", () => {

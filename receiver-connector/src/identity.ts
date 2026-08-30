@@ -3,9 +3,12 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -130,14 +133,49 @@ function persistIdentity(
   identity: ConnectorIdentity,
   enrollmentAcknowledged: boolean,
 ): void {
+  const directory = path.dirname(identityPath);
+  const temporaryPath = path.join(
+    directory,
+    `.${CONNECTOR_IDENTITY_FILE_NAME}.${randomUUID()}.tmp`,
+  );
+  let descriptor: number | undefined;
+  let replaced = false;
   try {
-    writeFileSync(
-      identityPath,
-      serializedIdentity(identity, enrollmentAcknowledged),
-      { encoding: "utf8" },
-    );
-    chmodSync(identityPath, 0o600);
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(descriptor, serializedIdentity(identity, enrollmentAcknowledged), {
+      encoding: "utf8",
+    });
+    chmodSync(temporaryPath, 0o600);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, identityPath);
+    replaced = true;
+    try {
+      const directoryDescriptor = openSync(directory, "r");
+      try {
+        fsyncSync(directoryDescriptor);
+      } finally {
+        closeSync(directoryDescriptor);
+      }
+    } catch {
+      // Directory fsync is not available on every supported filesystem.
+    }
   } catch {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Preserve the original persistence error.
+      }
+    }
+    if (!replaced) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // The temporary file may not have been created.
+      }
+    }
     throw new IdentityStateError("Connector identity state could not be persisted.");
   }
 }

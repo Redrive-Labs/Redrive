@@ -13,11 +13,26 @@ import { loadConfig } from "../src/config.js";
 import {
   connectorIdentityPath,
   loadOrCreateIdentity,
+  markEnrollmentAcknowledged,
 } from "../src/identity.js";
+
+const filesystemTestState = vi.hoisted(() => ({ failRename: false }));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    renameSync: (...args: Parameters<typeof actual.renameSync>) => {
+      if (filesystemTestState.failRename) throw new Error("replacement failed");
+      return actual.renameSync(...args);
+    },
+  };
+});
 
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
+  filesystemTestState.failRename = false;
   vi.restoreAllMocks();
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -182,5 +197,22 @@ describe("receiver connector configuration and identity", () => {
     });
     expect(second.identity).toEqual(first.identity);
     expect(statSync(first.identityPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("preserves the previous identity when atomic replacement fails", () => {
+    const stateDir = temporaryDirectory();
+    const first = loadOrCreateIdentity({
+      stateDir,
+      serverOrigin: "http://redrive.test:4317",
+      generator: {
+        connectorId: () => "connector-id",
+        connectorSecret: () => "connector-secret",
+      },
+    });
+    const previousContents = readFileSync(first.identityPath, "utf8");
+    filesystemTestState.failRename = true;
+
+    expect(() => markEnrollmentAcknowledged(first)).toThrowError(/persisted/i);
+    expect(readFileSync(first.identityPath, "utf8")).toBe(previousContents);
   });
 });
