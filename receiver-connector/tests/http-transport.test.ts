@@ -521,21 +521,103 @@ describe("ConcreteRedriveHttpTransport", () => {
     });
     expect(server.requests[0].body).not.toContain("local detail");
 
-    const rejectedServer = await startServer((_request, response) => {
-      sendJson(response, { error: "stale lease details" }, 409);
+  });
+
+  it.each([
+    [409, "STALE_LEASE", "TRANSPORT_COMPLETION_FENCED"],
+    [409, "LEASE_EXPIRED", "TRANSPORT_COMPLETION_FENCED"],
+    [422, "DEADLINE_EXPIRED", "TRANSPORT_COMPLETION_FENCED"],
+    [422, "JOB_EXPIRED", "TRANSPORT_COMPLETION_FENCED"],
+    [409, "JOB_ALREADY_COMPLETED", "TRANSPORT_REJECTED"],
+    [409, "INVALID_STATE", "TRANSPORT_REJECTED"],
+    [409, undefined, "TRANSPORT_REJECTED"],
+    [422, undefined, "TRANSPORT_REJECTED"],
+  ] as const)("classifies completion status %s and code %s", async (status, centralCode, expectedCode) => {
+    const server = await startServer((_request, response) => {
+      sendJson(
+        response,
+        centralCode === undefined
+          ? { error: "central rejection" }
+          : { error: "central rejection", code: centralCode },
+        status,
+      );
     });
-    const rejectedTransport = new ConcreteRedriveHttpTransport({
-      redriveUrl: rejectedServer.origin,
-    });
-    await expect(rejectedTransport.complete({
-      identity: identity(rejectedServer.origin),
-      jobId,
+    const transport = new ConcreteRedriveHttpTransport({ redriveUrl: server.origin });
+
+    await expect(transport.complete({
+      identity: identity(server.origin),
+      jobId: "completion-job",
       capability: RECEIVER_CAPABILITY_BUSINESS_STATE,
       input: { deliveryGuid: "delivery-guid" },
       leaseGeneration: 17,
       result: businessResult(),
     })).rejects.toMatchObject({
-      code: "TRANSPORT_REJECTED",
+      code: expectedCode,
+      retryable: false,
+    });
+  });
+
+  it("classifies a malformed completion error response as malformed, not fenced", async () => {
+    const server = await startServer((_request, response) => {
+      response.statusCode = 409;
+      response.setHeader("content-type", "application/json");
+      response.end("not-json");
+    });
+    const transport = new ConcreteRedriveHttpTransport({ redriveUrl: server.origin });
+
+    await expect(transport.complete({
+      identity: identity(server.origin),
+      jobId: "completion-job",
+      capability: RECEIVER_CAPABILITY_BUSINESS_STATE,
+      input: { deliveryGuid: "delivery-guid" },
+      leaseGeneration: 17,
+      result: businessResult(),
+    })).rejects.toMatchObject({
+      code: "TRANSPORT_MALFORMED_RESPONSE",
+      retryable: false,
+    });
+  });
+
+  it.each([
+    [502, "<html>bad gateway</html>"],
+    [503, ""],
+    [503, "not-json"],
+  ] as const)("preserves retryable completion transport errors for %s with a transient body", async (status, body) => {
+    const server = await startServer((_request, response) => {
+      response.statusCode = status;
+      response.end(body);
+    });
+    const transport = new ConcreteRedriveHttpTransport({ redriveUrl: server.origin });
+
+    await expect(transport.complete({
+      identity: identity(server.origin),
+      jobId: "completion-job",
+      capability: RECEIVER_CAPABILITY_BUSINESS_STATE,
+      input: { deliveryGuid: "delivery-guid" },
+      leaseGeneration: 17,
+      result: businessResult(),
+    })).rejects.toMatchObject({
+      code: "TRANSPORT_ERROR",
+      retryable: true,
+    });
+  });
+
+  it("classifies completion authentication without parsing a malformed body", async () => {
+    const server = await startServer((_request, response) => {
+      response.statusCode = 401;
+      response.end("not-json");
+    });
+    const transport = new ConcreteRedriveHttpTransport({ redriveUrl: server.origin });
+
+    await expect(transport.complete({
+      identity: identity(server.origin),
+      jobId: "completion-job",
+      capability: RECEIVER_CAPABILITY_BUSINESS_STATE,
+      input: { deliveryGuid: "delivery-guid" },
+      leaseGeneration: 17,
+      result: businessResult(),
+    })).rejects.toMatchObject({
+      code: "TRANSPORT_AUTHENTICATION",
       retryable: false,
     });
   });

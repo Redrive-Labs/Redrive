@@ -8,6 +8,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -42,7 +43,6 @@ export interface LoadedIdentity {
 interface ParsedPersistedIdentity {
   readonly identity: ConnectorIdentity;
   readonly enrollmentAcknowledged: boolean;
-  readonly needsMigration: boolean;
 }
 
 const defaultGenerator: IdentityGenerator = {
@@ -103,7 +103,7 @@ function parsePersistedIdentity(
     connectorSecret: readIdentityText(value.connectorSecret),
   });
   if (schemaVersion === CONNECTOR_SCHEMA_VERSION) {
-    return { identity, enrollmentAcknowledged: false, needsMigration: true };
+    return { identity, enrollmentAcknowledged: false };
   }
   if (typeof value.enrollmentAcknowledged !== "boolean") {
     throw new IdentityStateError("Persisted connector identity is malformed.");
@@ -111,7 +111,6 @@ function parsePersistedIdentity(
   return {
     identity,
     enrollmentAcknowledged: value.enrollmentAcknowledged,
-    needsMigration: false,
   };
 }
 
@@ -151,16 +150,7 @@ function persistIdentity(
     descriptor = undefined;
     renameSync(temporaryPath, identityPath);
     replaced = true;
-    try {
-      const directoryDescriptor = openSync(directory, "r");
-      try {
-        fsyncSync(directoryDescriptor);
-      } finally {
-        closeSync(directoryDescriptor);
-      }
-    } catch {
-      // Directory fsync is not available on every supported filesystem.
-    }
+    fsyncDirectory(directory);
   } catch {
     if (descriptor !== undefined) {
       try {
@@ -180,6 +170,61 @@ function persistIdentity(
   }
 }
 
+function fsyncDirectory(directory: string): void {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function fsyncIdentityFile(identityPath: string): void {
+  const descriptor = openSync(identityPath, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function ensureIdentityDurable(identityPath: string): void {
+  fsyncIdentityFile(identityPath);
+  fsyncDirectory(path.dirname(identityPath));
+}
+
+function missingDirectoryComponents(directory: string): string[] {
+  const missing: string[] = [];
+  let current = path.resolve(directory);
+  while (!existsSync(current)) {
+    missing.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return missing.reverse();
+}
+
+function prepareStateDirectory(stateDir: string): void {
+  const createdDirectories = missingDirectoryComponents(stateDir);
+  try {
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    chmodSync(stateDir, 0o700);
+    for (const directory of createdDirectories) {
+      fsyncDirectory(path.dirname(directory));
+    }
+  } catch {
+    for (const directory of [...createdDirectories].reverse()) {
+      try {
+        rmdirSync(directory);
+      } catch {
+        // Preserve the original preparation error.
+      }
+    }
+    throw new IdentityStateError("Connector state directory could not be prepared.");
+  }
+}
+
 function readExistingIdentity(
   identityPath: string,
   serverOrigin: string,
@@ -191,16 +236,19 @@ function readExistingIdentity(
   } catch {
     throw new IdentityStateError("Persisted connector identity could not be read.");
   }
+  let parsed: ParsedPersistedIdentity;
   try {
-    const parsed = parsePersistedIdentity(JSON.parse(raw) as unknown, serverOrigin);
-    if (parsed.needsMigration) {
-      persistIdentity(identityPath, parsed.identity, false);
-    }
-    return parsed;
+    parsed = parsePersistedIdentity(JSON.parse(raw) as unknown, serverOrigin);
   } catch (error) {
     if (error instanceof IdentityStateError) throw error;
     throw new IdentityStateError("Persisted connector identity is malformed.");
   }
+  try {
+    ensureIdentityDurable(identityPath);
+  } catch {
+    throw new IdentityStateError("Connector identity durability could not be confirmed.");
+  }
+  return parsed;
 }
 
 function makeIdentity(
@@ -233,12 +281,7 @@ export function loadOrCreateIdentity(
   options: LoadOrCreateIdentityOptions,
 ): LoadedIdentity {
   const identityPath = connectorIdentityPath(options.stateDir);
-  try {
-    mkdirSync(options.stateDir, { recursive: true, mode: 0o700 });
-    chmodSync(options.stateDir, 0o700);
-  } catch {
-    throw new IdentityStateError("Connector state directory could not be prepared.");
-  }
+  prepareStateDirectory(options.stateDir);
 
   if (existsSync(identityPath)) {
     const existing = readExistingIdentity(identityPath, options.serverOrigin);
@@ -257,10 +300,12 @@ export function loadOrCreateIdentity(
       writeFileSync(descriptor, serializedIdentity(identity, false), {
         encoding: "utf8",
       });
+      chmodSync(identityPath, 0o600);
+      fsyncSync(descriptor);
     } finally {
       closeSync(descriptor);
     }
-    chmodSync(identityPath, 0o600);
+    fsyncDirectory(options.stateDir);
     return {
       identity,
       identityPath,

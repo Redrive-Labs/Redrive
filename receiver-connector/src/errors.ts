@@ -23,6 +23,7 @@ export type ConnectorErrorCode =
   | "TRANSPORT_INTEGRATION_PENDING"
   | "TRANSPORT_TIMEOUT"
   | "TRANSPORT_AUTHENTICATION"
+  | "TRANSPORT_COMPLETION_FENCED"
   | "TRANSPORT_REJECTED"
   | "TRANSPORT_MALFORMED_RESPONSE"
   | "TRANSPORT_REDIRECT"
@@ -32,6 +33,7 @@ export type TransportErrorCode =
   | "TRANSPORT_INTEGRATION_PENDING"
   | "TRANSPORT_TIMEOUT"
   | "TRANSPORT_AUTHENTICATION"
+  | "TRANSPORT_COMPLETION_FENCED"
   | "TRANSPORT_REJECTED"
   | "TRANSPORT_MALFORMED_RESPONSE"
   | "TRANSPORT_REDIRECT"
@@ -72,6 +74,7 @@ export class ObservationError extends ConnectorError {
       | "TRANSPORT_INTEGRATION_PENDING"
       | "TRANSPORT_TIMEOUT"
       | "TRANSPORT_AUTHENTICATION"
+      | "TRANSPORT_COMPLETION_FENCED"
       | "TRANSPORT_REJECTED"
       | "TRANSPORT_MALFORMED_RESPONSE"
       | "TRANSPORT_REDIRECT"
@@ -123,4 +126,8 @@ export function toCapabilityError(
 export function isRetryableTransportError(error: unknown): boolean {
   if (error instanceof TransportError) return error.retryable;
   return true;
+}
+
+export function isCompletionFencedError(error: unknown): boolean {
+  return error instanceof TransportError && error.code === "TRANSPORT_COMPLETION_FENCED";
 }

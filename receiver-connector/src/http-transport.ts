@@ -239,6 +239,15 @@ function parseJson(body: string): unknown {
   }
 }
 
+function parseCompletionErrorCode(body: string): string | undefined {
+  const value = parseJson(body);
+  if (!isRecord(value)) {
+    throw malformedResponse("The Redrive completion error response was incompatible.");
+  }
+  if (!hasOwn(value, "code")) return undefined;
+  return boundedText(value.code, "completion error code", 128);
+}
+
 function parseEnrollmentResponse(value: unknown): EnrollmentResult {
   if (!isRecord(value) || !hasOwn(value, "receiverConnection")) {
     throw malformedResponse("The Redrive enrollment response was incompatible.");
@@ -329,11 +338,26 @@ function validateLeaseGeneration(value: unknown): asserts value is number {
 function httpError(
   operation: TransportOperation,
   status: number,
+  completionErrorCode?: string,
 ): TransportError {
   if (operation !== "enroll" && (status === 401 || status === 403)) {
     return new TransportError(
       "TRANSPORT_AUTHENTICATION",
       "Redrive rejected connector authentication.",
+      false,
+    );
+  }
+  if (
+    operation === "completion" &&
+    (status === 409 || status === 422) &&
+    (completionErrorCode === "STALE_LEASE" ||
+      completionErrorCode === "LEASE_EXPIRED" ||
+      completionErrorCode === "DEADLINE_EXPIRED" ||
+      completionErrorCode === "JOB_EXPIRED")
+  ) {
+    return new TransportError(
+      "TRANSPORT_COMPLETION_FENCED",
+      "Redrive rejected completion because the receiver job is no longer completable.",
       false,
     );
   }
@@ -581,6 +605,20 @@ export class ConcreteRedriveHttpTransport implements RedriveTransport {
         );
       }
       if (response.status < 200 || response.status >= 300) {
+        if (
+          operation === "completion" &&
+          (response.status === 409 || response.status === 422)
+        ) {
+          const body = await Promise.race([
+            readBoundedBody(response, this.maxResponseBytes),
+            timeoutPromise,
+          ]);
+          throw httpError(
+            operation,
+            response.status,
+            parseCompletionErrorCode(body),
+          );
+        }
         throw httpError(operation, response.status);
       }
       const body = await Promise.race([

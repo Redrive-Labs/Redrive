@@ -359,22 +359,34 @@ function nextHealthState(
   return RECEIVER_CONNECTION_UNHEALTHY;
 }
 
-function isNewerHealthObservation(
-  currentObservedAt: unknown,
-  incomingObservedAt: string,
+function readHealthOrderTimestamp(row: ReceiverReadJobRow): string {
+  const updatedAt = readText(row, "updatedAt");
+  if (!Number.isFinite(Date.parse(updatedAt))) {
+    throw new ReceiverReadJobError(
+      "INVALID_STATE",
+      "The leased receiver health job has an invalid central order timestamp.",
+    );
+  }
+  return updatedAt;
+}
+
+function isNewerHealthOrder(
+  currentOrderAt: unknown,
+  incomingOrderAt: string,
 ): boolean {
-  if (currentObservedAt === null || currentObservedAt === undefined) return true;
+  if (currentOrderAt === null || currentOrderAt === undefined) return true;
   if (
-    typeof currentObservedAt !== "string" ||
-    !Number.isFinite(Date.parse(currentObservedAt))
+    typeof currentOrderAt !== "string" ||
+    !Number.isFinite(Date.parse(currentOrderAt))
   ) {
     throw new ReceiverReadJobError(
       "INVALID_STATE",
-      "The persisted receiver health observation is invalid.",
+      "The persisted receiver health order timestamp is invalid.",
     );
   }
-  // Equal timestamps are deterministic: the existing durable projection wins.
-  return Date.parse(incomingObservedAt) > Date.parse(currentObservedAt);
+  // Equal central order timestamps are deterministic: the existing durable
+  // projection wins.
+  return Date.parse(incomingOrderAt) > Date.parse(currentOrderAt);
 }
 
 function readDueDate(value: string, field: string): number {
@@ -600,6 +612,16 @@ function assertTerminalState(state: ReceiverReadJobState): void {
       "The receiver read job is already terminal.",
     );
   }
+}
+
+function assertCompletionState(state: ReceiverReadJobState): void {
+  if (state === RECEIVER_READ_JOB_EXPIRED) {
+    throw new ReceiverReadJobError(
+      "JOB_EXPIRED",
+      "The receiver read job has expired.",
+    );
+  }
+  assertTerminalState(state);
 }
 
 function assertSerializedJson(value: unknown, field: string): string {
@@ -1115,7 +1137,7 @@ function createReceiverReadJobServiceWithCompletion(
           "The receiver read job is already terminal.",
         );
       }
-      assertTerminalState(state);
+      assertCompletionState(state);
       const deadlineAt = readText(row, "deadlineAt");
       if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {
         markJobExpired(database, jobId, receiverConnectionId, timestamp);
@@ -1149,6 +1171,9 @@ function createReceiverReadJobServiceWithCompletion(
 
       const capability = readCapability(row);
       const input = readStoredInput(row, capability);
+      const healthOrderAt = capability === RECEIVER_CAPABILITY_HEALTH
+        ? readHealthOrderTimestamp(row)
+        : null;
       const parsedResult = parseCompletionResult(capability, input, result);
       const resultJson = assertSerializedJson(parsedResult, "result");
       const update = database.run(
@@ -1199,7 +1224,13 @@ function createReceiverReadJobServiceWithCompletion(
           );
         }
         const healthResult = parseHealthReadResult(result);
-        if (isNewerHealthObservation(receiver.lastHealthAt, healthResult.observedAt)) {
+        if (healthOrderAt === null) {
+          throw new ReceiverReadJobError(
+            "INVALID_STATE",
+            "The health job is missing its central order timestamp.",
+          );
+        }
+        if (isNewerHealthOrder(receiver.lastHealthAt, healthOrderAt)) {
           const receiverState = readReceiverState(receiver.state);
           const nextState = nextHealthState(receiverState, healthResult.healthStatus);
           const receiverUpdate = database.run(
@@ -1214,7 +1245,7 @@ function createReceiverReadJobServiceWithCompletion(
             [
               nextState,
               healthResult.healthStatus,
-              healthResult.observedAt,
+              healthOrderAt,
               timestamp,
               receiverConnectionId,
             ],
@@ -1278,7 +1309,7 @@ function createReceiverReadJobServiceWithCompletion(
           "The receiver read job is already terminal.",
         );
       }
-      assertTerminalState(state);
+      assertCompletionState(state);
       const deadlineAt = readText(row, "deadlineAt");
       if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {
         markJobExpired(database, jobId, receiverConnectionId, timestamp);

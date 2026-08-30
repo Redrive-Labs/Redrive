@@ -1,6 +1,7 @@
 import {
   ConfigurationError,
   ConnectorError,
+  isCompletionFencedError,
   isRetryableTransportError,
   toCapabilityError,
 } from "./errors.js";
@@ -57,7 +58,7 @@ export interface ReceiverConnectorWorkerOptions {
   readonly transportFailureDelayMs?: number;
 }
 
-export type WorkerIterationKind = "NO_WORK" | "COMPLETED" | "FAILED";
+export type WorkerIterationKind = "NO_WORK" | "COMPLETED" | "FAILED" | "FENCED";
 
 export interface WorkerIteration {
   readonly kind: WorkerIterationKind;
@@ -210,8 +211,8 @@ export class ReceiverConnectorWorker {
       await this.failJob(identity, job, capabilityError);
       return { kind: "FAILED", job, error: capabilityError };
     }
-    await this.completeJob(identity, job, normalizedResult);
-    return { kind: "COMPLETED", job };
+    const completed = await this.completeJob(identity, job, normalizedResult);
+    return { kind: completed ? "COMPLETED" : "FENCED", job };
   }
 
   async run(signal?: AbortSignal): Promise<void> {
@@ -238,7 +239,7 @@ export class ReceiverConnectorWorker {
     identity: ConnectorIdentity,
     job: CapabilityJob,
     result: CapabilityResult,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const request: CompleteRequest = {
       identity,
       jobId: job.jobId,
@@ -247,7 +248,13 @@ export class ReceiverConnectorWorker {
       leaseGeneration: job.leaseGeneration,
       result,
     };
-    await this.withTransportRetry(() => this.transport.complete(request));
+    try {
+      await this.withTransportRetry(() => this.transport.complete(request));
+      return true;
+    } catch (error) {
+      if (isCompletionFencedError(error)) return false;
+      throw error;
+    }
   }
 
   private async failJob(
@@ -262,7 +269,12 @@ export class ReceiverConnectorWorker {
       leaseGeneration: job.leaseGeneration,
       error,
     };
-    await this.withTransportRetry(() => this.transport.fail(request));
+    try {
+      await this.withTransportRetry(() => this.transport.fail(request));
+    } catch (error) {
+      if (isCompletionFencedError(error)) return;
+      throw error;
+    }
   }
 
   private async withTransportRetry<T>(operation: () => Promise<T>): Promise<T> {

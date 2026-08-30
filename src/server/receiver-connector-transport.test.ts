@@ -746,9 +746,9 @@ describe("central receiver connector transport foundation", () => {
       mutationCount: 1,
       businessState: "EXACTLY_ONE",
       observedAt: now.toISOString(),
-    })).toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+    })).toThrowError(expect.objectContaining({ code: "JOB_EXPIRED" }));
     expect(() => jobs.fail(job.id, auth, currentLease.leaseGeneration, "CONNECTOR_ERROR"))
-      .toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+      .toThrowError(expect.objectContaining({ code: "JOB_EXPIRED" }));
     expect(jobs.getById(job.id)?.state).toBe("EXPIRED");
 
     expect(() => jobs.fail(lateFailureJob.id, auth, 0, "CONNECTOR_ERROR"))
@@ -828,7 +828,7 @@ describe("central receiver connector transport foundation", () => {
     expect(connections.getById(enrollment.receiverConnection.id)?.state).toBe(RECEIVER_CONNECTION_READY);
   });
 
-  it("does not promote older or equal health observations", () => {
+  it("does not promote older or equal centrally ordered health jobs", () => {
     const enrollment = enroll(issue().token);
     const auth = authenticated();
     const initialHealth = jobs.getById(enrollment.healthJobId as string);
@@ -869,6 +869,7 @@ describe("central receiver connector transport foundation", () => {
       lastHealthAt: firstObservationAt.toISOString(),
     });
 
+    now = new Date(START.getTime() + 30_000);
     const newerJob = jobs.createHealthJob(enrollment.receiverConnection.id);
     const newerLease = jobs.lease(newerJob.id, auth);
     jobs.complete(newerJob.id, auth, newerLease.leaseGeneration, {
@@ -880,6 +881,69 @@ describe("central receiver connector transport foundation", () => {
       state: RECEIVER_CONNECTION_UNHEALTHY,
       lastHealthStatus: "UNHEALTHY",
       lastHealthAt: new Date(START.getTime() + 30_000).toISOString(),
+    });
+  });
+
+  it("uses lease-time central ordering when an older health job completes after a newer one", () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+    const olderJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const newerJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+
+    now = new Date(START.getTime() + 1_000);
+    const olderLease = jobs.lease(olderJob.id, auth);
+    now = new Date(START.getTime() + 2_000);
+    const newerLease = jobs.lease(newerJob.id, auth);
+
+    const newer = jobs.complete(newerJob.id, auth, newerLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "UNHEALTHY",
+      observedAt: new Date(2099, 0, 1).toISOString(),
+    });
+    const older = jobs.complete(olderJob.id, auth, olderLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: new Date(1970, 0, 1).toISOString(),
+    });
+
+    expect(newer.state).toBe("SUCCEEDED");
+    expect(older.state).toBe("SUCCEEDED");
+    expect(connections.getById(enrollment.receiverConnection.id)).toMatchObject({
+      state: RECEIVER_CONNECTION_UNHEALTHY,
+      lastHealthStatus: "UNHEALTHY",
+      lastHealthAt: new Date(START.getTime() + 2_000).toISOString(),
+    });
+  });
+
+  it("ignores future and backward-skewed connector timestamps for health ordering", () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+
+    now = new Date(START.getTime() + 1_000);
+    const futureJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const futureLease = jobs.lease(futureJob.id, auth);
+    jobs.complete(futureJob.id, auth, futureLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: new Date(2099, 0, 1).toISOString(),
+    });
+
+    now = new Date(START.getTime() + 2_000);
+    const backwardJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const backwardLease = jobs.lease(backwardJob.id, auth);
+    jobs.complete(backwardJob.id, auth, backwardLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "UNHEALTHY",
+      observedAt: new Date(1970, 0, 1).toISOString(),
+    });
+
+    expect(connections.getById(enrollment.receiverConnection.id)).toMatchObject({
+      state: RECEIVER_CONNECTION_UNHEALTHY,
+      lastHealthStatus: "UNHEALTHY",
+      lastHealthAt: new Date(START.getTime() + 2_000).toISOString(),
+    });
+    expect(jobs.getById(backwardJob.id)?.result).toMatchObject({
+      observedAt: new Date(1970, 0, 1).toISOString(),
     });
   });
 

@@ -8,8 +8,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectorConfig } from "../src/config.js";
+import { TransportError } from "../src/errors.js";
 import { connectorIdentityPath } from "../src/identity.js";
 import {
+  CapabilityValidationError,
   RECEIVER_CAPABILITIES,
   RECEIVER_CAPABILITY_BUSINESS_STATE,
   RECEIVER_CAPABILITY_HEALTH,
@@ -443,6 +445,122 @@ describe("receiver connector worker", () => {
 
     await expect(connector.runOnce()).resolves.toEqual({ kind: "NO_WORK" });
     expect(dispatcher).not.toHaveBeenCalled();
+  });
+
+  it("continues polling after a fenced completion and processes the next job", async () => {
+    const stateDir = temporaryDirectory();
+    const controller = new AbortController();
+    let leaseCalls = 0;
+    let completionCalls = 0;
+    const firstJob: CapabilityJob = {
+      jobId: "expired-job",
+      capability: RECEIVER_CAPABILITY_HEALTH,
+      leaseGeneration: 1,
+      input: {},
+    };
+    const secondJob: CapabilityJob = {
+      jobId: "next-job",
+      capability: RECEIVER_CAPABILITY_HEALTH,
+      leaseGeneration: 1,
+      input: {},
+    };
+    const connectorTransport = transport({
+      lease: vi.fn(async () => {
+        leaseCalls += 1;
+        if (leaseCalls === 1) return firstJob;
+        if (leaseCalls === 2) return secondJob;
+        return null;
+      }),
+      complete: vi.fn(async () => {
+        completionCalls += 1;
+        if (completionCalls === 1) {
+          throw new TransportError(
+            "TRANSPORT_COMPLETION_FENCED",
+            "job expired",
+            false,
+          );
+        }
+        controller.abort();
+      }),
+    });
+    const connector = worker(stateDir, connectorTransport);
+
+    await expect(connector.run(controller.signal)).resolves.toBeUndefined();
+    expect(connectorTransport.lease).toHaveBeenCalledTimes(2);
+    expect(connectorTransport.complete).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps authentication rejection fatal", async () => {
+    const stateDir = temporaryDirectory();
+    const connectorTransport = transport({
+      lease: vi.fn(async () => ({
+        jobId: "auth-job",
+        capability: RECEIVER_CAPABILITY_HEALTH,
+        leaseGeneration: 1,
+        input: {},
+      })),
+      complete: vi.fn(async () => {
+        throw new TransportError(
+          "TRANSPORT_AUTHENTICATION",
+          "authentication rejected",
+          false,
+        );
+      }),
+    });
+    const connector = worker(stateDir, connectorTransport);
+
+    await expect(connector.run()).rejects.toMatchObject({
+      code: "TRANSPORT_AUTHENTICATION",
+      retryable: false,
+    });
+  });
+
+  it("keeps non-fenced completion rejection visible", async () => {
+    const stateDir = temporaryDirectory();
+    const connectorTransport = transport({
+      lease: vi.fn(async () => ({
+        jobId: "already-completed-job",
+        capability: RECEIVER_CAPABILITY_HEALTH,
+        leaseGeneration: 1,
+        input: {},
+      })),
+      complete: vi.fn(async () => {
+        throw new TransportError(
+          "TRANSPORT_REJECTED",
+          "central job is already completed",
+          false,
+        );
+      }),
+    });
+    const connector = worker(stateDir, connectorTransport);
+
+    await expect(connector.run()).rejects.toMatchObject({
+      code: "TRANSPORT_REJECTED",
+      retryable: false,
+    });
+  });
+
+  it("keeps malformed completion protocol failures fatal", async () => {
+    const stateDir = temporaryDirectory();
+    const connectorTransport = transport({
+      lease: vi.fn(async () => ({
+        jobId: "malformed-job",
+        capability: RECEIVER_CAPABILITY_HEALTH,
+        leaseGeneration: 1,
+        input: {},
+      })),
+      complete: vi.fn(async () => {
+        throw new CapabilityValidationError(
+          "INVALID_RESULT",
+          "malformed completion",
+        );
+      }),
+    });
+    const connector = worker(stateDir, connectorTransport);
+
+    await expect(connector.run()).rejects.toMatchObject({
+      code: "INVALID_RESULT",
+    });
   });
 
   it("bounds transient transport retries with backoff", async () => {
