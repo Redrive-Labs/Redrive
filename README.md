@@ -134,12 +134,19 @@ with mode `0600` on POSIX systems. Set `REDRIVE_SECRET_DIR` to an explicit
 absolute directory when required; its ownership, ancestor, symlink, and
 permission checks remain enforced. Set the required server-side
 `REDRIVE_TRUEFORGE_MODEL` to the configured TrueForge model/resource name.
-Connection-backed M2.6B incidents use
+Connection-backed M2.7B incidents use
 `REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME`, whose configured server must
 point at Redrive's strict `/api/mcp/github` endpoint. Set
 `REDRIVE_GITHUB_CONNECTION_MCP_TOKEN` to its server-side bearer secret.
+The receiver investigation uses the distinct
+`REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME` and
+`REDRIVE_RECEIVER_MCP_TOKEN` values for the strict `/api/mcp/receiver` endpoint.
 TrueForge Settings owns the MCP server URL and credentials. Redrive does not
 select or interpret a provider, and TrueForge credentials stay server-side.
+Provider and receiver turns are role-separated, independently authenticated
+evidence boundaries with deterministic fail-closed tool correlation. Per-child
+MCP resource visibility remains LIVE VALIDATION REQUIRED for the current
+TrueForge SDK/API.
 
 `externalDeliveryId` and normalized `providerDeliveryId` identify the exact
 GitHub delivery attempt (`id`). `deliveryGuid` is the separate logical webhook
@@ -155,7 +162,7 @@ reject transport responses larger than 64 MiB.
 
 `POST /api/incidents/:incidentId/provider-investigation` runs the recovery path
 through the incident's existing TrueForge session. Connection-backed incidents
-use `m2.6b-v1` and the strict connection MCP server. The route then requires a
+use `m2.7-v1` and the strict connection MCP server. The route then requires a
 dynamic `provider-investigator` thread and correlates its read-only
 `get_webhook_delivery` model tool call and `tool.response`. Only that response
 is normalized as provider evidence. The route returns product state, not a

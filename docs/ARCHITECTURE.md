@@ -352,6 +352,14 @@ receiver says BUSINESS MUTATION EXISTS
 
 which means blind replay may be unsafe.
 
+For M2.7, the GitHub MCP and Receiver MCP remain distinct resources with
+distinct credentials. The investigation boundary is role-separated,
+independently authenticated evidence boundaries with deterministic fail-closed
+tool correlation. The current static TrueForge SDK/API does not establish
+per-dynamic-subagent MCP resource filtering; per-child tool visibility is
+LIVE VALIDATION REQUIRED. Coordinator instructions prohibit cross-role calls,
+and any wrong-MCP call invalidates the investigation.
+
 ## Repair
 
 Repair begins only inside the Daytona working tree.

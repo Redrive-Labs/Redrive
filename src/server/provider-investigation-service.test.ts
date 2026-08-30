@@ -34,6 +34,8 @@ const environment = {
   REDRIVE_TRUEFORGE_MODEL: "configured-model",
   REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: connectionMcpServerName,
   REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
+  REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME: "redrive-receiver",
+  REDRIVE_RECEIVER_MCP_TOKEN: "test-receiver-mcp-token",
 } as const;
 
 function makeGithubResult(
@@ -306,7 +308,9 @@ function createClient(
 ) {
   return {
     createSession: vi.fn().mockResolvedValue("replacement-session"),
-    getSession: vi.fn().mockResolvedValue({ id: "existing-session" }),
+    getSession: vi
+      .fn()
+      .mockImplementation(async (sessionId: string) => ({ id: sessionId })),
     updateSession: vi.fn().mockResolvedValue(undefined),
     createTurnStream: vi.fn().mockResolvedValue(stream),
     listTurnEvents: vi.fn().mockResolvedValue(
@@ -438,6 +442,7 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).toHaveBeenCalledOnce();
     expect(client.createSession.mock.calls[0][0].mcpServers).toEqual([
       expect.objectContaining({ name: connectionMcpServerName }),
+      expect.objectContaining({ name: "redrive-receiver" }),
     ]);
     expect(client.listTurnEvents).toHaveBeenCalledWith(
       "replacement-session",
@@ -580,7 +585,7 @@ describe("TrueForge provider investigation", () => {
     });
   });
 
-  it("reuses and upgrades the existing session, then reobserves immutable evidence", async () => {
+  it("reuses the current existing session, then reobserves immutable evidence", async () => {
     const incident = createIncident();
     installActiveBinding(incident.id);
     const evidenceService = createProviderEvidenceService(database, () =>
@@ -609,7 +614,7 @@ describe("TrueForge provider investigation", () => {
       providerStatusCode: 500,
     });
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledTimes(1);
+    expect(client.updateSession).not.toHaveBeenCalled();
     expect(client.createTurnStream).toHaveBeenCalledWith(
       "existing-session",
       expect.objectContaining({
@@ -648,7 +653,7 @@ describe("TrueForge provider investigation", () => {
     expect(JSON.stringify(events)).not.toContain("receiver failed");
   });
 
-  it("reconciles the current v2 AgentSpec before using the existing session for a turn", async () => {
+  it("uses the current v2 AgentSpec binding without rewriting the existing session", async () => {
     const incident = createIncident();
     installActiveBinding(
       incident.id,
@@ -661,20 +666,7 @@ describe("TrueForge provider investigation", () => {
     await service.investigateProviderForIncident(incident.id);
 
     expect(client.createSession).not.toHaveBeenCalled();
-    expect(client.updateSession).toHaveBeenCalledWith(
-      "existing-v2-session",
-      expect.objectContaining({
-        model: { name: environment.REDRIVE_TRUEFORGE_MODEL },
-        mcpServers: [
-          expect.objectContaining({
-            name: environment.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME,
-          }),
-        ],
-      }),
-    );
-    expect(client.updateSession.mock.invocationCallOrder[0]).toBeLessThan(
-      client.createTurnStream.mock.invocationCallOrder[0],
-    );
+    expect(client.updateSession).not.toHaveBeenCalled();
   });
 
   it("uses one turn for a valid first attempt and does not retry", async () => {
@@ -925,12 +917,12 @@ describe("TrueForge provider investigation", () => {
     expect(client.createTurnStream).not.toHaveBeenCalled();
   });
 
-  it("does not start a turn when current v2 session reconciliation fails", async () => {
+  it("does not start a turn when prior session spec reconciliation fails", async () => {
     const incident = createIncident();
     installActiveBinding(
       incident.id,
       "v2-session",
-      CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION,
+      "m2.6b-v1",
     );
     const client = createClient(makeStream());
     client.updateSession.mockRejectedValue(new Error("TrueForge update failed"));
@@ -946,7 +938,7 @@ describe("TrueForge provider investigation", () => {
         "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
         [incident.id],
       ),
-    ).toEqual({ coordinator_spec_version: CONNECTION_RECOVERY_COORDINATOR_SPEC_VERSION });
+    ).toEqual({ coordinator_spec_version: "m2.6b-v1" });
   });
 
   it("rejects root-thread calls, wrong subagents, wrong MCP resources, and wrong IDs", async () => {
@@ -954,6 +946,7 @@ describe("TrueForge provider investigation", () => {
       { modelThreadId: "main" },
       { agentName: "other-investigator" },
       { toolInfoServerName: "other-server" },
+      { toolInfoServerName: "redrive-receiver" },
       { toolName: "redeliver_webhook_delivery", toolInfoName: "redeliver_webhook_delivery" },
       { connectionArgument: "wrong-connection" },
       { deliveryArgument: "wrong-delivery" },

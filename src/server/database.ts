@@ -136,6 +136,44 @@ const receiverConnectorTablesSql = `
     );
 `;
 
+const receiverObservationsTableSql = `
+  CREATE TABLE receiver_observations (
+    id TEXT PRIMARY KEY NOT NULL,
+    incident_id TEXT NOT NULL,
+    application_connection_id TEXT NOT NULL,
+    delivery_guid TEXT NOT NULL,
+    capability TEXT NOT NULL CHECK (capability = 'business_state:v1'),
+    tool TEXT NOT NULL CHECK (tool = 'get_business_state'),
+    mcp_server_name TEXT NOT NULL,
+    mutation_count INTEGER NOT NULL CHECK (mutation_count >= 0),
+    business_state TEXT NOT NULL CHECK (
+      business_state IN ('ABSENT', 'EXACTLY_ONE', 'MULTIPLE')
+    ),
+    observed_at TEXT NOT NULL,
+    trueforge_session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    receiver_investigator_thread_id TEXT NOT NULL,
+    thread_created_event_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_call_event_id TEXT NOT NULL,
+    tool_response_event_id TEXT NOT NULL,
+    tool_response_created_at TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (trueforge_session_id, turn_id),
+    FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE,
+    FOREIGN KEY (application_connection_id)
+      REFERENCES application_connections (id)
+      ON DELETE RESTRICT,
+    UNIQUE (trueforge_session_id, tool_response_event_id)
+  );
+
+  CREATE INDEX receiver_observations_incident_idx
+    ON receiver_observations (incident_id, created_at, id);
+  CREATE INDEX receiver_observations_delivery_idx
+    ON receiver_observations (delivery_guid);
+`;
+
 const migrations: Migration[] = [
   {
     version: 1,
@@ -332,6 +370,14 @@ const migrations: Migration[] = [
     version: 9,
     sql: receiverConnectorTablesSql,
   },
+  {
+    version: 10,
+    sql: receiverObservationsTableSql,
+  },
+  {
+    version: 11,
+    apply: migrateM27BProvenanceConstraints,
+  },
 ];
 
 export class SqliteDatabase {
@@ -515,6 +561,83 @@ function repairTrueForgeSessionBindings(database: SqliteDatabase): void {
     FROM ${quoteSqlIdentifier(legacyTableName)};
   `);
   database.exec(`DROP TABLE ${quoteSqlIdentifier(legacyTableName)};`);
+}
+
+function migrateM27BProvenanceConstraints(database: SqliteDatabase): void {
+  database.exec(`
+    ALTER TABLE provider_evidence
+      ADD COLUMN application_connection_id TEXT
+      REFERENCES application_connections (id)
+      ON DELETE RESTRICT;
+    CREATE INDEX provider_evidence_application_connection_idx
+      ON provider_evidence (application_connection_id);
+  `);
+
+  // Migration 10 briefly made tool_response_event_id globally unique. Rebuild
+  // the small append-only table so the identity is correctly scoped to a
+  // TrueForge session while preserving every existing observation.
+  const tableName = "receiver_observations";
+  const legacyTableName = "receiver_observations_v10_legacy";
+  if (hasTable(database, legacyTableName)) {
+    throw new Error(
+      "Cannot safely migrate receiver observations; a legacy migration table already exists.",
+    );
+  }
+
+  database.exec(`
+    DROP INDEX IF EXISTS receiver_observations_incident_idx;
+    DROP INDEX IF EXISTS receiver_observations_delivery_idx;
+    ALTER TABLE ${quoteSqlIdentifier(tableName)}
+      RENAME TO ${quoteSqlIdentifier(legacyTableName)};
+  `);
+  database.exec(receiverObservationsTableSql);
+  database.exec(`
+    INSERT INTO ${quoteSqlIdentifier(tableName)} (
+      id,
+      incident_id,
+      application_connection_id,
+      delivery_guid,
+      capability,
+      tool,
+      mcp_server_name,
+      mutation_count,
+      business_state,
+      observed_at,
+      trueforge_session_id,
+      turn_id,
+      receiver_investigator_thread_id,
+      thread_created_event_id,
+      tool_call_id,
+      tool_call_event_id,
+      tool_response_event_id,
+      tool_response_created_at,
+      observation_json,
+      created_at
+    )
+    SELECT
+      id,
+      incident_id,
+      application_connection_id,
+      delivery_guid,
+      capability,
+      tool,
+      mcp_server_name,
+      mutation_count,
+      business_state,
+      observed_at,
+      trueforge_session_id,
+      turn_id,
+      receiver_investigator_thread_id,
+      thread_created_event_id,
+      tool_call_id,
+      tool_call_event_id,
+      tool_response_event_id,
+      tool_response_created_at,
+      observation_json,
+      created_at
+    FROM ${quoteSqlIdentifier(legacyTableName)};
+    DROP TABLE ${quoteSqlIdentifier(legacyTableName)};
+  `);
 }
 
 export function initializeDatabase(database: SqliteDatabase): void {

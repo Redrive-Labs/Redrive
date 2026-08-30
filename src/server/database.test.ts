@@ -558,7 +558,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -649,7 +649,7 @@ describe("native SQLite persistence", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
-      { version: 7 }, { version: 8 }, { version: 9 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 },
     ]);
     expect(
       database.all<{
@@ -754,7 +754,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -888,18 +888,82 @@ describe("native SQLite persistence", () => {
         "SELECT version FROM schema_migrations ORDER BY version",
       )).toEqual([
         { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
-        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 },
+        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 },
       ]);
       expect(upgraded.get("SELECT * FROM incidents")).toEqual({
         ...before.incident,
         application_connection_id: null,
       });
-      expect(upgraded.get("SELECT * FROM provider_evidence")).toEqual(before.evidence);
+      expect(upgraded.get("SELECT * FROM provider_evidence")).toEqual({
+        ...before.evidence,
+        application_connection_id: null,
+      });
       expect(upgraded.get("SELECT * FROM trueforge_session_bindings")).toEqual(before.binding);
       expect(upgraded.get("SELECT * FROM incident_workflow_events")).toEqual(before.workflow);
     } finally {
       upgraded.close();
     }
+  });
+
+  it("upgrades a populated v9 database with migration 10 without rewriting existing rows", () => {
+    const incident = {
+      id: "v9-populated-incident",
+      provider: "github",
+      external_delivery_id: "v9-delivery",
+      repository_id: "octocat/receiver",
+      application_connection_id: null,
+      status: "OPEN",
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+    };
+    database.run(
+      `INSERT INTO incidents (
+        id, provider, external_delivery_id, repository_id,
+        application_connection_id, status, created_at, updated_at
+      ) VALUES (@id, @provider, @external_delivery_id, @repository_id,
+        @application_connection_id, @status, @created_at, @updated_at)`,
+      incident,
+    );
+    database.exec(
+      "DROP INDEX receiver_observations_incident_idx; DROP INDEX receiver_observations_delivery_idx; DROP TABLE receiver_observations;",
+    );
+    database.run("DELETE FROM schema_migrations WHERE version = 10");
+    const before = database.get("SELECT * FROM incidents WHERE id = ?", [incident.id]);
+
+    database.close();
+    database = openDatabase(databasePath);
+
+    expect(database.get("SELECT * FROM incidents WHERE id = ?", [incident.id])).toEqual(before);
+    expect(database.get<{ version: number }>(
+      "SELECT version FROM schema_migrations WHERE version = 10",
+    )).toEqual({ version: 10 });
+    expect(database.get<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM receiver_observations",
+    )).toEqual({ count: 0 });
+    expect(database.all<{ name: string }>(
+      "PRAGMA table_info('receiver_observations')",
+    ).map(({ name }) => name)).toEqual([
+      "id",
+      "incident_id",
+      "application_connection_id",
+      "delivery_guid",
+      "capability",
+      "tool",
+      "mcp_server_name",
+      "mutation_count",
+      "business_state",
+      "observed_at",
+      "trueforge_session_id",
+      "turn_id",
+      "receiver_investigator_thread_id",
+      "thread_created_event_id",
+      "tool_call_id",
+      "tool_call_event_id",
+      "tool_response_event_id",
+      "tool_response_created_at",
+      "observation_json",
+      "created_at",
+    ]);
   });
 
   it("serializes migration initialization across independent processes", async () => {
@@ -926,7 +990,7 @@ describe("native SQLite persistence", () => {
 
     expect(results.map(parseIndependentDatabaseOpenerResult)).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         incidentCount: 0,
       })),
     );
@@ -944,7 +1008,7 @@ describe("native SQLite persistence", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
-        { version: 7 }, { version: 8 }, { version: 9 },
+        { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(

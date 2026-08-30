@@ -4,26 +4,26 @@ import {
   ProviderEvidenceConflictError,
 } from "@/server/provider-evidence-service";
 import {
-  investigateProviderForIncident,
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
 } from "@/server/provider-investigation-service";
+import { investigateIncidentForRecovery } from "@/server/incident-investigation-service";
 import { TrueForgeSessionUnavailableError } from "@/server/trueforge-session-service";
 import { POST } from "@/app/api/incidents/[incidentId]/provider-investigation/route";
 import { RecoveryCoordinatorConfigurationError } from "@/agents/recovery-coordinator";
 import { TrueForgeSessionCreateError } from "@/server/trueforge-client";
 
-vi.mock("@/server/provider-investigation-service", async () => {
+vi.mock("@/server/incident-investigation-service", async () => {
   const actual = await vi.importActual<
-    typeof import("@/server/provider-investigation-service")
-  >("@/server/provider-investigation-service");
+    typeof import("@/server/incident-investigation-service")
+  >("@/server/incident-investigation-service");
   return {
     ...actual,
-    investigateProviderForIncident: vi.fn(),
+    investigateIncidentForRecovery: vi.fn(),
   };
 });
 
-const investigateMock = vi.mocked(investigateProviderForIncident);
+const investigateMock = vi.mocked(investigateIncidentForRecovery);
 
 function context(incidentId: string) {
   return { params: Promise.resolve({ incidentId }) };
@@ -64,6 +64,17 @@ describe("provider investigation API", () => {
       evidenceDisposition: "REOBSERVED",
       providerStatus: "Invalid HTTP Response: 500",
       providerStatusCode: 500,
+      receiverObservation: {
+        id: "observation-1",
+        turnId: "receiver-turn-1",
+        receiverInvestigatorThreadId: "receiver-thread-1",
+        deliveryGuid: "logical-guid-1",
+        mutationCount: 1,
+        businessState: "EXACTLY_ONE",
+        observedAt: "2026-08-25T10:00:05.000Z",
+      },
+      contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED",
+      recoveryState: "BLOCKED",
     });
 
     const response = await POST(new Request("http://localhost"), context("incident-1"));
@@ -77,6 +88,17 @@ describe("provider investigation API", () => {
       evidenceDisposition: "REOBSERVED",
       providerStatus: "Invalid HTTP Response: 500",
       providerStatusCode: 500,
+      receiverObservation: {
+        id: "observation-1",
+        turnId: "receiver-turn-1",
+        receiverInvestigatorThreadId: "receiver-thread-1",
+        deliveryGuid: "logical-guid-1",
+        mutationCount: 1,
+        businessState: "EXACTLY_ONE",
+        observedAt: "2026-08-25T10:00:05.000Z",
+      },
+      contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED",
+      recoveryState: "BLOCKED",
     });
   });
 

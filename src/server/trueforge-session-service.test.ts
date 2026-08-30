@@ -15,6 +15,7 @@ import {
   TRUEFORGE_SESSION_CREATION_STALE_AFTER_MS,
   TrueForgeIncidentNotFoundError,
   TrueForgeSessionSpecUpgradeError,
+  TrueForgeSessionUnavailableError,
   TrueForgeUnsupportedCoordinatorSpecError,
 } from "@/server/trueforge-session-service";
 import {
@@ -43,19 +44,27 @@ describe("TrueForge incident session spine", () => {
     REDRIVE_TRUEFORGE_MODEL: configuredModel,
     REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME: configuredConnectionMcpName,
     REDRIVE_GITHUB_CONNECTION_MCP_TOKEN: "test-connection-mcp-token",
+    REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME: "redrive-receiver",
+    REDRIVE_RECEIVER_MCP_TOKEN: "test-receiver-mcp-token",
   });
   let originalModel: string | undefined;
   let originalMcpName: string | undefined;
   let originalConnectionMcpName: string | undefined;
   let originalConnectionMcpToken: string | undefined;
+  let originalReceiverMcpName: string | undefined;
+  let originalReceiverMcpToken: string | undefined;
 
   beforeEach(() => {
     originalModel = process.env.REDRIVE_TRUEFORGE_MODEL;
     originalConnectionMcpName = process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME;
     originalConnectionMcpToken = process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
+    originalReceiverMcpName = process.env.REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME;
+    originalReceiverMcpToken = process.env.REDRIVE_RECEIVER_MCP_TOKEN;
     process.env.REDRIVE_TRUEFORGE_MODEL = configuredModel;
     process.env.REDRIVE_TRUEFORGE_CONNECTION_GITHUB_MCP_NAME = configuredConnectionMcpName;
     process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN = "test-connection-mcp-token";
+    process.env.REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME = "redrive-receiver";
+    process.env.REDRIVE_RECEIVER_MCP_TOKEN = "test-receiver-mcp-token";
     testDirectory = mkdtempSync(
       path.join(os.tmpdir(), "redrive-trueforge-session-"),
     );
@@ -80,6 +89,16 @@ describe("TrueForge incident session spine", () => {
       delete process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN;
     } else {
       process.env.REDRIVE_GITHUB_CONNECTION_MCP_TOKEN = originalConnectionMcpToken;
+    }
+    if (originalReceiverMcpName === undefined) {
+      delete process.env.REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME;
+    } else {
+      process.env.REDRIVE_TRUEFORGE_CONNECTION_RECEIVER_MCP_NAME = originalReceiverMcpName;
+    }
+    if (originalReceiverMcpToken === undefined) {
+      delete process.env.REDRIVE_RECEIVER_MCP_TOKEN;
+    } else {
+      process.env.REDRIVE_RECEIVER_MCP_TOKEN = originalReceiverMcpToken;
     }
 
     const resolvedDirectory = path.resolve(testDirectory);
@@ -788,7 +807,7 @@ describe("TrueForge incident session spine", () => {
     expect(service.getBindingByIncidentId(incident.id)?.state).toBe("ACTIVE");
   });
 
-  it("creates a connection-backed session with the m2.6b spec", async () => {
+  it("creates a connection-backed session with the m2.7 spec", async () => {
     const incident = createIncident();
     makeConnectionBacked(incident.id);
     const client = createFakeClient();
@@ -815,9 +834,44 @@ describe("TrueForge incident session spine", () => {
     );
   });
 
+  it("upgrades m2.6b-v1 to m2.7-v1 on the same ACTIVE session without creating", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(incident.id, "m2.6b-v1");
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+
+    const result = await service.ensureCoordinatorForIncident(incident.id);
+
+    expect(result).toMatchObject({
+      outcome: "REUSED",
+      state: "ACTIVE",
+      sessionId: "existing-session",
+      binding: { coordinatorSpecVersion: "m2.7-v1" },
+    });
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.getSession).toHaveBeenCalledWith("existing-session");
+    expect(client.updateSession).toHaveBeenCalledWith(
+      "existing-session",
+      getConnectionRecoveryCoordinatorAgentSpec(makeConnectionEnvironment()),
+    );
+    expect(
+      database.get<{ coordinator_spec_version: string }>(
+        "SELECT coordinator_spec_version FROM trueforge_session_bindings WHERE incident_id = ?",
+        [incident.id],
+      ),
+    ).toEqual({ coordinator_spec_version: "m2.7-v1" });
+  });
+
   it("never silently downgrades an unsupported newer Coordinator version", async () => {
     const incident = createIncident();
-    insertActiveBinding(incident.id, "m2.5-v9");
+    insertActiveBinding(incident.id, "m2.8-v1");
     const client = createFakeClient();
     client.getSession.mockResolvedValue({ id: "existing-session" });
     const service = createTrueForgeSessionService(database, client);
@@ -827,6 +881,120 @@ describe("TrueForge incident session spine", () => {
     );
     expect(client.createSession).not.toHaveBeenCalled();
     expect(client.updateSession).not.toHaveBeenCalled();
+  });
+
+  it("does not update a session or proceed from a concurrent ACTIVE to LOST transition", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(incident.id, "m2.6b-v1");
+    const contenderDatabase = openDatabase(databasePath);
+    const contenderRepository = createTrueForgeSessionBindingRepository(
+      contenderDatabase,
+    );
+    const client = createFakeClient();
+    client.getSession.mockImplementation(async () => {
+      expect(
+        contenderRepository.markLost(
+          incident.id,
+          "existing-session",
+          "2026-01-01T00:00:01.000Z",
+        ),
+      ).not.toBeNull();
+      return { id: "existing-session" };
+    });
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+
+    try {
+      const result = await service.ensureCoordinatorForIncident(incident.id);
+
+      expect(result).toMatchObject({ outcome: "LOST", state: "LOST" });
+      expect(client.updateSession).not.toHaveBeenCalled();
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("accepts a concurrent same-session upgrade only after rereading the current winner", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(incident.id, "m2.6b-v1");
+    const contenderDatabase = openDatabase(databasePath);
+    const client1 = createFakeClient();
+    const client2 = createFakeClient();
+    client1.getSession.mockResolvedValue({ id: "existing-session" });
+    client2.getSession.mockResolvedValue({ id: "existing-session" });
+    const service1 = createTrueForgeSessionService(
+      database,
+      client1,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+    const service2 = createTrueForgeSessionService(
+      contenderDatabase,
+      client2,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+
+    try {
+      const results = await Promise.all([
+        service1.ensureCoordinatorForIncident(incident.id),
+        service2.ensureCoordinatorForIncident(incident.id),
+      ]);
+
+      expect(results).toHaveLength(2);
+      expect(results).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            state: "ACTIVE",
+            sessionId: "existing-session",
+            binding: expect.objectContaining({
+              coordinatorSpecVersion: "m2.7-v1",
+            }),
+          }),
+        ]),
+      );
+      expect(client1.createSession).not.toHaveBeenCalled();
+      expect(client2.createSession).not.toHaveBeenCalled();
+      expect(client1.updateSession).toHaveBeenCalledOnce();
+      expect(client2.updateSession).toHaveBeenCalledOnce();
+    } finally {
+      contenderDatabase.close();
+    }
+  });
+
+  it("fails closed when a prior-version CAS loses to a concurrent LOST transition", async () => {
+    const incident = createIncident();
+    makeConnectionBacked(incident.id);
+    insertActiveBinding(incident.id, "m2.6b-v1");
+    const client = createFakeClient();
+    client.getSession.mockResolvedValue({ id: "existing-session" });
+    client.updateSession.mockImplementation(async () => {
+      database.run(
+        "UPDATE trueforge_session_bindings SET state = 'LOST' WHERE incident_id = ?",
+        [incident.id],
+      );
+    });
+    const service = createTrueForgeSessionService(
+      database,
+      client,
+      undefined,
+      makeConnectionEnvironment(),
+    );
+
+    await expect(service.ensureCoordinatorForIncident(incident.id)).rejects.toBeInstanceOf(
+      TrueForgeSessionUnavailableError,
+    );
+    expect(client.updateSession).toHaveBeenCalledOnce();
+    expect(service.getBindingByIncidentId(incident.id)).toMatchObject({
+      state: "LOST",
+      trueForgeSessionId: "existing-session",
+    });
   });
 
   it("does not contact TrueForge for an unknown incident", async () => {
