@@ -279,6 +279,58 @@ export function createGithubDeliveryService(options: {
     );
   }
 
+  /**
+   * The only GitHub write exposed by this service. Repository, webhook,
+   * installation, and token identity are all resolved from the durable
+   * ApplicationConnection; callers cannot provide any of them.
+   */
+  async function redeliverWebhookDelivery(
+    connectionId: unknown,
+    deliveryId: unknown,
+  ): Promise<number> {
+    if (
+      typeof deliveryId !== "string" ||
+      deliveryId.length === 0 ||
+      deliveryId.length > 1024
+    ) {
+      throw new GithubConnectionError("INVALID_INPUT", "Delivery ID is required.");
+    }
+    const { connection, token } = await getVerifiedConnection(connectionId);
+    return options.api.redeliverWebhookDelivery(
+      connection.repositoryFullName,
+      connection.webhookId,
+      deliveryId,
+      token,
+    );
+  }
+
+  /** Read-only delivery history used to prove the accepted redelivery. */
+  async function listWebhookDeliveryAttempts(
+    connectionId: unknown,
+  ): Promise<unknown[]> {
+    const { connection, token } = await getVerifiedConnection(connectionId);
+    let response: unknown;
+    try {
+      response = await options.api.listWebhookDeliveries(
+        connection.repositoryFullName,
+        connection.webhookId,
+        token,
+      );
+    } catch {
+      throw new GithubConnectionError(
+        "NOT_ACCESSIBLE",
+        "Webhook deliveries could not be read.",
+      );
+    }
+    if (!Array.isArray(response)) {
+      throw new GithubConnectionError(
+        "REMOTE_INVALID",
+        "GitHub webhook deliveries response is invalid.",
+      );
+    }
+    return response;
+  }
+
   async function createIncidentFromVerifiedConnectionDelivery(
     connectionId: unknown,
     deliveryId: unknown,
@@ -294,6 +346,8 @@ export function createGithubDeliveryService(options: {
     getFailedDelivery,
     getFullFailedDelivery,
     getVerifiedConnection,
+    redeliverWebhookDelivery,
+    listWebhookDeliveryAttempts,
     createIncidentFromVerifiedConnectionDelivery,
   };
 }

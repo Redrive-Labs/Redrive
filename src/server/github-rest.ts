@@ -442,6 +442,104 @@ export class GithubApi {
     }
   }
 
+  /**
+   * GitHub's webhook redelivery endpoint accepts a POST and normally returns
+   * HTTP 202 with no JSON document. Keep this path separate from requestJson:
+   * callers must not weaken JSON validation for the rest of the API.
+   */
+  private async requestEmptySuccess(
+    path: string,
+    options: GithubRestRequestOptions = {},
+  ): Promise<number> {
+    if (!path.startsWith("/") || path.includes("://") || path.includes("\\")) {
+      throw new GithubRestError(
+        "CONFIGURATION",
+        "GitHub REST paths must be constructed locally.",
+      );
+    }
+    if (options.token !== undefined && options.token.length === 0) {
+      throw new GithubRestError("CONFIGURATION", "GitHub credential is empty.");
+    }
+    if (options.body !== undefined) {
+      throw new GithubRestError(
+        "CONFIGURATION",
+        "GitHub empty-success requests cannot contain a body.",
+      );
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), GITHUB_REST_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchImplementation(
+        `${GITHUB_API_BASE_URL}${path}`,
+        {
+          method: options.method ?? "GET",
+          headers: {
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": "Redrive-GitHub-App-Connection",
+            ...(options.token === undefined
+              ? {}
+              : { Authorization: `Bearer ${options.token}` }),
+          },
+          redirect: "error",
+          signal: controller.signal,
+        },
+      );
+    } catch (error) {
+      clearTimeout(timeout);
+      if (isAbortError(error)) {
+        throw new GithubRestError(
+          "TIMEOUT",
+          "GitHub REST request timed out.",
+        );
+      }
+      throw new GithubRestError("NETWORK", "GitHub REST request failed.");
+    }
+
+    try {
+      if (!response.ok) {
+        const rateLimit = readGithubRateLimitMetadata(response.headers);
+        try {
+          await readGithubRestResponseText(response, controller.signal);
+        } catch (error) {
+          if (isAbortError(error)) {
+            throw new GithubRestError(
+              "TIMEOUT",
+              "GitHub REST request timed out.",
+            );
+          }
+        }
+        throw new GithubRestError(
+          "HTTP",
+          `GitHub REST request failed with HTTP ${response.status}.`,
+          response.status,
+          rateLimit,
+        );
+      }
+
+      try {
+        await readGithubRestResponseText(response, controller.signal);
+      } catch (error) {
+        if (isAbortError(error)) {
+          throw new GithubRestError(
+            "TIMEOUT",
+            "GitHub REST request timed out.",
+          );
+        }
+        throw new GithubRestError(
+          "INVALID_RESPONSE",
+          "GitHub REST returned an invalid empty-success response.",
+          response.status,
+        );
+      }
+      return response.status;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async listPaginated(
     path: string,
     description: string,
@@ -612,6 +710,18 @@ export class GithubApi {
     return this.requestJson(
       `${repositoryPath(repositoryFullName)}/hooks/${encodePathSegment(webhookId, "webhook ID")}/deliveries/${encodePathSegment(deliveryId, "delivery ID")}`,
       { token: installationToken },
+    );
+  }
+
+  redeliverWebhookDelivery(
+    repositoryFullName: string,
+    webhookId: string,
+    deliveryId: string,
+    installationToken: string,
+  ): Promise<number> {
+    return this.requestEmptySuccess(
+      `${repositoryPath(repositoryFullName)}/hooks/${encodePathSegment(webhookId, "webhook ID")}/deliveries/${encodePathSegment(deliveryId, "delivery ID")}/attempts`,
+      { method: "POST", token: installationToken },
     );
   }
 }
