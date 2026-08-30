@@ -38,11 +38,20 @@ interface ReceiverEventOptions {
   turnId?: string;
   persistedTurnId?: string;
   agentName?: string;
+  parentInput?: string;
+  childInput?: string;
   childThreadId?: string;
+  receiverToolShape?: "direct-mcp" | "truefoundry-system-wrapper";
   toolServerName?: string;
   toolName?: string;
   functionName?: string;
   toolArguments?: string;
+  wrapperMcpServer?: string;
+  wrapperToolName?: string;
+  wrapperConnectionId?: string;
+  wrapperDeliveryGuid?: string;
+  wrapperExtraOuterField?: boolean;
+  wrapperExtraInnerField?: boolean;
   responseThreadId?: string;
   responseToolCallId?: string;
   responseContent?: string;
@@ -86,6 +95,8 @@ function receiverEvents(options: ReceiverEventOptions = {}): unknown[] {
     applicationConnectionId,
     deliveryGuid,
   );
+  const parentInput = options.parentInput ?? task;
+  const childInput = options.childInput ?? parentInput;
   const rootToolCalls: Record<string, unknown>[] = [
     {
       id: spawnToolCallId,
@@ -94,7 +105,7 @@ function receiverEvents(options: ReceiverEventOptions = {}): unknown[] {
         name: "create_sub_agent",
         arguments: JSON.stringify({
           name: options.agentName ?? RECEIVER_INVESTIGATOR_NAME,
-          input: task,
+          input: parentInput,
         }),
       },
       toolInfo: {
@@ -139,22 +150,42 @@ function receiverEvents(options: ReceiverEventOptions = {}): unknown[] {
     });
   }
 
+  const directArguments = JSON.stringify({
+    connection_id: applicationConnectionId,
+    delivery_guid: deliveryGuid,
+  });
+  const wrapperInput: Record<string, unknown> = {
+    connection_id: options.wrapperConnectionId ?? applicationConnectionId,
+    delivery_guid: options.wrapperDeliveryGuid ?? deliveryGuid,
+  };
+  if (options.wrapperExtraInnerField) wrapperInput.extra = "not-allowed";
+  const wrapperArguments: Record<string, unknown> = {
+    mcp_server: options.wrapperMcpServer ?? receiverMcpServerName,
+    tool_name: options.wrapperToolName ?? "get_business_state",
+    input: wrapperInput,
+  };
+  if (options.wrapperExtraOuterField) wrapperArguments.extra = "not-allowed";
+  const isWrapper =
+    options.receiverToolShape === "truefoundry-system-wrapper";
   const receiverToolCall = {
     id: receiverToolCallId,
     type: "function",
     function: {
-      name: options.functionName ?? options.toolName ?? "get_business_state",
+      name: isWrapper
+        ? "call_tool"
+        : options.functionName ?? options.toolName ?? "get_business_state",
       arguments:
         options.toolArguments ??
-        JSON.stringify({
-          connection_id: applicationConnectionId,
-          delivery_guid: deliveryGuid,
-        }),
+        (isWrapper ? JSON.stringify(wrapperArguments) : directArguments),
     },
     toolInfo: {
-      type: "mcp",
-      name: options.toolName ?? "get_business_state",
-      serverName: options.toolServerName ?? receiverMcpServerName,
+      type: isWrapper ? "truefoundry-system" : "mcp",
+      name: isWrapper
+        ? "call_tool"
+        : options.toolName ?? "get_business_state",
+      ...(isWrapper
+        ? {}
+        : { serverName: options.toolServerName ?? receiverMcpServerName }),
     },
   };
 
@@ -184,7 +215,7 @@ function receiverEvents(options: ReceiverEventOptions = {}): unknown[] {
       agentInfo: {
         type: "dynamic",
         name: options.agentName ?? RECEIVER_INVESTIGATOR_NAME,
-        input: task,
+        input: childInput,
       },
     },
     {
@@ -440,6 +471,53 @@ describe("TrueForge receiver investigation", () => {
     ).toEqual({ count: 1 });
   });
 
+  it("accepts the live TrueForge call_tool receiver wrapper", async () => {
+    const incidentId = createIncident();
+    const client = createClient(
+      receiverEvents({ receiverToolShape: "truefoundry-system-wrapper" }),
+    );
+    const service = createReceiverInvestigationService(
+      database,
+      client,
+      environment,
+      () => observedAt,
+    );
+
+    const result = await service.investigateReceiverForIncident(incidentId, {
+      connectionId: applicationConnectionId,
+      deliveryGuid,
+      expectedSessionId: sessionId,
+    });
+
+    expect(result.observation.businessState).toBe("EXACTLY_ONE");
+    expect(result.observation.toolResponseEventId).toBe(
+      "receiver-tool-response-event",
+    );
+  });
+
+  it("accepts an expanded child task when parent and thread inputs match", async () => {
+    const incidentId = createIncident();
+    const expandedTask =
+      "Investigate this receiver delivery in a self-contained task and return the authoritative business-state evidence.";
+    const client = createClient(
+      receiverEvents({ parentInput: expandedTask, childInput: expandedTask }),
+    );
+    const service = createReceiverInvestigationService(
+      database,
+      client,
+      environment,
+      () => observedAt,
+    );
+
+    const result = await service.investigateReceiverForIncident(incidentId, {
+      connectionId: applicationConnectionId,
+      deliveryGuid,
+      expectedSessionId: sessionId,
+    });
+
+    expect(result.observation.businessState).toBe("EXACTLY_ONE");
+  });
+
   it("does not create a replacement session and does not create a turn on reconciliation failure", async () => {
     const incidentId = createIncident();
     database.run(
@@ -603,6 +681,10 @@ describe("TrueForge receiver investigation", () => {
   it.each([
     ["historical turn", { persistedTurnId: "old-turn" }],
     ["distractor thread", { extraThread: true }],
+    [
+      "parent/thread input mismatch",
+      { parentInput: "parent task", childInput: "different child task" },
+    ],
     ["wrong server", { toolServerName: "other-receiver" }],
     ["wrong tool", { toolName: "get_receiver_health" }],
     ["root receiver call", { includeRootReceiverCall: true }],
@@ -613,6 +695,48 @@ describe("TrueForge receiver investigation", () => {
     ["duplicate persisted event ID", { duplicateEventId: true }],
     ["duplicate dynamic thread ID", { extraThread: true, duplicateThreadId: true }],
     ["wrong MCP role", { toolServerName: "redrive-github" }],
+    [
+      "wrong wrapper mcp_server",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperMcpServer: "other-receiver",
+      },
+    ],
+    [
+      "wrong wrapper tool_name",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperToolName: "get_receiver_health",
+      },
+    ],
+    [
+      "extra wrapper outer field",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperExtraOuterField: true,
+      },
+    ],
+    [
+      "extra wrapper inner field",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperExtraInnerField: true,
+      },
+    ],
+    [
+      "wrong wrapper connection ID",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperConnectionId: "other-connection",
+      },
+    ],
+    [
+      "wrong wrapper delivery GUID",
+      {
+        receiverToolShape: "truefoundry-system-wrapper",
+        wrapperDeliveryGuid: "other-delivery-guid",
+      },
+    ],
     [
       "wrong response pair",
       { responseThreadId: "main", responseToolCallId: "root-receiver-call" },

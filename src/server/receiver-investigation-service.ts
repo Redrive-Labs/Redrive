@@ -139,19 +139,11 @@ function eventType(event: unknown): string {
   return event.type;
 }
 
-function parseExactJsonObject(
-  text: string,
+function parseExactObject(
+  parsed: unknown,
   description: string,
   expectedKeys: readonly string[],
 ): RecordValue {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text) as unknown;
-  } catch {
-    throw new ReceiverInvestigationTurnError(
-      `TrueForge ${description} arguments are not valid JSON.`,
-    );
-  }
   if (!isRecord(parsed)) {
     throw new ReceiverInvestigationTurnError(
       `TrueForge ${description} arguments must be an object.`,
@@ -171,16 +163,76 @@ function parseExactJsonObject(
   return parsed;
 }
 
+function parseExactJsonObject(
+  text: string,
+  description: string,
+  expectedKeys: readonly string[],
+): RecordValue {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new ReceiverInvestigationTurnError(
+      `TrueForge ${description} arguments are not valid JSON.`,
+    );
+  }
+  return parseExactObject(parsed, description, expectedKeys);
+}
+
 function parseReceiverToolArguments(
-  argumentsText: string,
+  toolCall: ObservedToolCall,
   expectedConnectionId: string,
   expectedDeliveryGuid: string,
+  expectedMcpServerName: string,
 ): ReceiverToolArguments {
-  const parsed = parseExactJsonObject(
-    argumentsText,
-    "Receiver Investigator MCP tool",
-    ["connection_id", "delivery_guid"],
-  );
+  let parsed: RecordValue;
+  if (toolCall.toolInfoType === "mcp") {
+    if (
+      toolCall.toolInfoServerName !== expectedMcpServerName ||
+      toolCall.toolInfoName !== RECEIVER_MCP_BUSINESS_STATE_TOOL ||
+      toolCall.functionName !== RECEIVER_MCP_BUSINESS_STATE_TOOL
+    ) {
+      throw new ReceiverInvestigationTurnError(
+        "Receiver Investigator did not call the configured read-only business-state MCP tool.",
+      );
+    }
+    parsed = parseExactJsonObject(
+      toolCall.argumentsText,
+      "Receiver Investigator MCP tool",
+      ["connection_id", "delivery_guid"],
+    );
+  } else if (toolCall.toolInfoType === "truefoundry-system") {
+    if (
+      toolCall.toolInfoName !== "call_tool" ||
+      toolCall.functionName !== "call_tool"
+    ) {
+      throw new ReceiverInvestigationTurnError(
+        "Receiver Investigator did not call the configured Receiver MCP tool through the TrueForge system wrapper.",
+      );
+    }
+    const wrapper = parseExactJsonObject(
+      toolCall.argumentsText,
+      "Receiver Investigator MCP wrapper",
+      ["mcp_server", "tool_name", "input"],
+    );
+    if (
+      wrapper.mcp_server !== expectedMcpServerName ||
+      wrapper.tool_name !== RECEIVER_MCP_BUSINESS_STATE_TOOL
+    ) {
+      throw new ReceiverInvestigationTurnError(
+        "Receiver Investigator TrueForge MCP wrapper did not identify the configured business-state tool.",
+      );
+    }
+    parsed = parseExactObject(
+      wrapper.input,
+      "Receiver Investigator MCP wrapper input",
+      ["connection_id", "delivery_guid"],
+    );
+  } else {
+    throw new ReceiverInvestigationTurnError(
+      "Receiver Investigator did not use a supported MCP tool event shape.",
+    );
+  }
   if (
     typeof parsed.connection_id !== "string" ||
     parsed.connection_id.length === 0 ||
@@ -207,8 +259,7 @@ function parseReceiverToolArguments(
 
 function parseCreateSubAgentArguments(
   argumentsText: string,
-  expectedInput: string,
-): void {
+): { input: string } {
   const parsed = parseExactJsonObject(
     argumentsText,
     "create_sub_agent",
@@ -216,12 +267,14 @@ function parseCreateSubAgentArguments(
   );
   if (
     parsed.name !== RECEIVER_INVESTIGATOR_NAME ||
-    parsed.input !== expectedInput
+    typeof parsed.input !== "string" ||
+    parsed.input.length === 0
   ) {
     throw new ReceiverInvestigationTurnError(
-      "TrueForge create_sub_agent did not carry the exact receiver investigator task.",
+      "TrueForge create_sub_agent did not carry a valid receiver investigator task.",
     );
   }
+  return { input: parsed.input };
 }
 
 /**
@@ -366,10 +419,6 @@ export async function collectReceiverTurn(
   expectedDeliveryGuid: string,
   expectedMcpServerName: string,
 ): Promise<CollectedReceiverTurn> {
-  const expectedTask = buildReceiverInvestigatorTask(
-    expectedConnectionId,
-    expectedDeliveryGuid,
-  );
   let turnId: string | null = null;
   let turnCreated = false;
   let turnDone = false;
@@ -583,11 +632,10 @@ export async function collectReceiverTurn(
   }
   if (
     threads.length !== 1 ||
-    threads[0].agentName !== RECEIVER_INVESTIGATOR_NAME ||
-    threads[0].input !== expectedTask
+    threads[0].agentName !== RECEIVER_INVESTIGATOR_NAME
   ) {
     throw new ReceiverInvestigationTurnError(
-      "TrueForge did not create exactly one receiver-investigator with the exact deterministic task.",
+      "TrueForge did not create exactly one receiver-investigator dynamic thread.",
     );
   }
   const thread = threads[0];
@@ -609,7 +657,14 @@ export async function collectReceiverTurn(
       "TrueForge did not correlate exactly one root create_sub_agent call to receiver-investigator.",
     );
   }
-  parseCreateSubAgentArguments(parentToolCalls[0].argumentsText, expectedTask);
+  const parentArguments = parseCreateSubAgentArguments(
+    parentToolCalls[0].argumentsText,
+  );
+  if (parentArguments.input !== thread.input) {
+    throw new ReceiverInvestigationTurnError(
+      "TrueForge create_sub_agent input did not match the receiver thread input.",
+    );
+  }
 
   const receiverToolCalls = observedToolCalls.filter(
     (toolCall) => toolCall.threadId === thread.threadId,
@@ -620,16 +675,12 @@ export async function collectReceiverTurn(
     );
   }
   const observedToolCall = receiverToolCalls[0];
-  if (
-    observedToolCall.toolInfoType !== "mcp" ||
-    observedToolCall.toolInfoServerName !== expectedMcpServerName ||
-    observedToolCall.toolInfoName !== RECEIVER_MCP_BUSINESS_STATE_TOOL ||
-    observedToolCall.functionName !== RECEIVER_MCP_BUSINESS_STATE_TOOL
-  ) {
-    throw new ReceiverInvestigationTurnError(
-      "Receiver Investigator did not call the configured read-only business-state MCP tool.",
-    );
-  }
+  const receiverArguments = parseReceiverToolArguments(
+    observedToolCall,
+    expectedConnectionId,
+    expectedDeliveryGuid,
+    expectedMcpServerName,
+  );
 
   const matchingResponses = toolResponses.filter(
     (response) =>
@@ -669,11 +720,7 @@ export async function collectReceiverTurn(
     thread,
     toolCall: {
       ...observedToolCall,
-      arguments: parseReceiverToolArguments(
-        observedToolCall.argumentsText,
-        expectedConnectionId,
-        expectedDeliveryGuid,
-      ),
+      arguments: receiverArguments,
     },
     toolResponse: matchingResponses[0],
   };
