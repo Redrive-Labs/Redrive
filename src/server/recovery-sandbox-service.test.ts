@@ -90,6 +90,48 @@ function persistedEvents(result: unknown, turnId = "recovery-turn-1") {
     },
     {
       type: "model.message",
+      id: `${turnId}-tool-message`,
+      turnId,
+      threadId: "main",
+      content: null,
+      toolCalls: [
+        {
+          id: `${turnId}-exec-call`,
+          type: "function",
+          function: { name: "exec", arguments: "{}" },
+          toolInfo: { type: "truefoundry-system", name: "exec" },
+        },
+        {
+          id: `${turnId}-datetime-call`,
+          type: "function",
+          function: { name: "get_current_datetime", arguments: "{}" },
+          toolInfo: { type: "truefoundry-system", name: "get_current_datetime" },
+        },
+      ],
+    },
+    {
+      type: "sandbox.created",
+      id: `${turnId}-sandbox-created`,
+      turnId,
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-exec-response`,
+      turnId,
+      threadId: "main",
+      toolCallId: `${turnId}-exec-call`,
+      content: "ok",
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-datetime-response`,
+      turnId,
+      threadId: "main",
+      toolCallId: `${turnId}-datetime-call`,
+      content: "2026-08-30T00:00:00.000Z",
+    },
+    {
+      type: "model.message",
       id: `${turnId}-message`,
       turnId,
       threadId: "main",

@@ -215,7 +215,7 @@ async function collectLiveTurnLifecycle(
   return turnId;
 }
 
-const SANDBOX_TOOL_NAMES = new Set([
+const SANDBOX_IO_TOOL_NAMES = new Set([
   "exec",
   "read_file",
   "write_file",
@@ -224,10 +224,15 @@ const SANDBOX_TOOL_NAMES = new Set([
   "list_directory",
   "search_files",
 ]);
+const ALLOWED_RECOVERY_TOOL_NAMES = new Set([
+  ...SANDBOX_IO_TOOL_NAMES,
+  "get_current_datetime",
+]);
 
 interface RecoveryToolCall {
   threadId: string;
   toolCallId: string;
+  toolName: string;
 }
 
 function validateSandboxToolCall(
@@ -252,7 +257,7 @@ function validateSandboxToolCall(
     (typeof toolInfo.serverName !== "undefined" &&
       toolInfo.serverName !== null) ||
     functionValue.name !== toolInfo.name ||
-    !SANDBOX_TOOL_NAMES.has(toolInfo.name)
+    !ALLOWED_RECOVERY_TOOL_NAMES.has(toolInfo.name)
   ) {
     throw new RecoverySandboxTurnError(
       "TrueForge recovery emitted a non-sandbox or malformed tool call.",
@@ -264,7 +269,7 @@ function validateSandboxToolCall(
     );
   }
   seenToolCallIds.add(rawToolCall.id);
-  return { threadId, toolCallId: rawToolCall.id };
+  return { threadId, toolCallId: rawToolCall.id, toolName: toolInfo.name };
 }
 
 export async function collectRecoveryTurn(
@@ -275,6 +280,7 @@ export async function collectRecoveryTurn(
 ): Promise<RecoverySandboxTurn> {
   let turnCreated = false;
   let turnDone = false;
+  let sandboxCreated = false;
   const eventIds = new Set<string>();
   const seenToolCallIds = new Set<string>();
   const toolCalls: RecoveryToolCall[] = [];
@@ -317,6 +323,16 @@ export async function collectRecoveryTurn(
       assertEventTurn(rawEvent, expectedTurnId, true);
       readTurnStatus(rawEvent, "done");
       turnDone = true;
+      continue;
+    }
+
+    if (type === "sandbox.created") {
+      if (!turnCreated || sandboxCreated) {
+        throw new RecoverySandboxTurnError(
+          "TrueForge recovery emitted an invalid sandbox.created lifecycle event.",
+        );
+      }
+      sandboxCreated = true;
       continue;
     }
 
@@ -385,6 +401,11 @@ export async function collectRecoveryTurn(
   if (finalResultText === null) {
     throw new RecoverySandboxTurnError(
       "TrueForge recovery turn did not contain a final JSON result message.",
+    );
+  }
+  if (!toolCalls.some((toolCall) => SANDBOX_IO_TOOL_NAMES.has(toolCall.toolName))) {
+    throw new RecoverySandboxTurnError(
+      "TrueForge recovery turn did not contain a sandbox execution tool call.",
     );
   }
 
@@ -624,6 +645,7 @@ function recoveryTurnInput(
         JSON.stringify(exactContext),
         "Clone the repository implied by repositoryFullName and checkout the exact originalRevision.",
         "Use a reconstructed sandbox request, never claim raw-wire replay, and never call a provider, receiver, deployment, redelivery, approval, or other external tool.",
+        "Before returning the artifact in this turn, you MUST call the sandbox exec tool to read /home/trueforge/evidence/artifact.json; this tool call is mandatory for sandbox attribution.",
         "Return only the required redrive.recovery.v1 JSON artifact after deterministic reproduction, minimum safe repair, and adversarial replay verification.",
       ].join("\n"),
     },
