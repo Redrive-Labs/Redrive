@@ -1,13 +1,21 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ConcreteRedriveHttpTransport } from "../../receiver-connector/src/http-transport.js";
+import { ReceiverConnectorWorker } from "../../receiver-connector/src/worker.js";
+import type { RedriveTransport } from "../../receiver-connector/src/transport.js";
+import type { CapabilityJob } from "../../receiver-connector/src/model.js";
 import { openDatabase, type SqliteDatabase } from "@/server/database";
 import {
   createReceiverConnectionService,
   type AuthenticatedReceiverConnector,
 } from "@/server/receiver-connection-service";
 import { createReceiverReadJobService } from "@/server/receiver-read-job-service";
+import {
+  toReceiverCompletedJob,
+  toReceiverLeasedJob,
+} from "@/server/receiver-route-utils";
 import {
   RECEIVER_CAPABILITIES,
   RECEIVER_CAPABILITY_BUSINESS_STATE,
@@ -278,9 +286,185 @@ describe("central receiver connector transport foundation", () => {
       observedAt: now.toISOString(),
     });
     expect(completed).toMatchObject({ state: "SUCCEEDED", result: { mutationCount: 0, businessState: "ABSENT" } });
-    expect(() => jobs.complete(job.id, auth, 2, completed.result)).toThrowError(
+    expect(jobs.complete(job.id, auth, 2, completed.result)).toEqual(completed);
+  });
+
+  it("accepts only exact terminal replays and keeps ownership checks ahead of replay", () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+    const result = {
+      schemaVersion: 1 as const,
+      deliveryGuid: "delivery-guid-1",
+      mutationCount: 0,
+      businessState: "ABSENT" as const,
+      observedAt: START.toISOString(),
+    };
+    const job = jobs.createBusinessStateJob(
+      enrollment.receiverConnection.id,
+      result.deliveryGuid,
+    );
+    const lease = jobs.lease(job.id, auth);
+    const completed = jobs.complete(job.id, auth, lease.leaseGeneration, result);
+    const terminalRow = database.get<Record<string, unknown>>(
+      "SELECT state, lease_generation, result_json, error_code, updated_at, completed_at FROM receiver_read_jobs WHERE id = ?",
+      [job.id],
+    );
+
+    now = new Date(START.getTime() + 60 * 1000 + 1);
+    expect(jobs.complete(job.id, auth, lease.leaseGeneration, result)).toEqual(completed);
+    expect(database.get<Record<string, unknown>>(
+      "SELECT state, lease_generation, result_json, error_code, updated_at, completed_at FROM receiver_read_jobs WHERE id = ?",
+      [job.id],
+    )).toEqual(terminalRow);
+
+    expect(() => jobs.complete(job.id, auth, lease.leaseGeneration + 1, result)).toThrowError(
       expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }),
     );
+    expect(() => jobs.fail(job.id, auth, lease.leaseGeneration, "CONNECTOR_ERROR"))
+      .toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+    expect(() => jobs.complete(job.id, auth, lease.leaseGeneration, {
+      ...result,
+      mutationCount: 1,
+      businessState: "EXACTLY_ONE",
+    })).toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+
+    const failedJob = jobs.createHealthJob(enrollment.receiverConnection.id);
+    const failedLease = jobs.lease(failedJob.id, auth);
+    const failed = jobs.fail(
+      failedJob.id,
+      auth,
+      failedLease.leaseGeneration,
+      "CONNECTOR_ERROR",
+    );
+    expect(jobs.fail(
+      failedJob.id,
+      auth,
+      failedLease.leaseGeneration,
+      "CONNECTOR_ERROR",
+    )).toEqual(failed);
+    expect(() => jobs.fail(
+      failedJob.id,
+      auth,
+      failedLease.leaseGeneration + 1,
+      "CONNECTOR_ERROR",
+    )).toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+    expect(() => jobs.complete(failedJob.id, auth, failedLease.leaseGeneration, {
+      schemaVersion: 1,
+      healthStatus: "HEALTHY",
+      observedAt: START.toISOString(),
+    })).toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+    expect(() => jobs.fail(
+      failedJob.id,
+      auth,
+      failedLease.leaseGeneration,
+      "OTHER_ERROR",
+    )).toThrowError(expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }));
+
+    expect(() => jobs.complete(job.id, {
+      receiverConnectionId: enrollment.receiverConnection.id,
+      connectorId: "wrong-connector",
+      receiverConnection: enrollment.receiverConnection,
+    } as AuthenticatedReceiverConnector, lease.leaseGeneration, result)).toThrowError(
+      expect.objectContaining({ code: "UNAUTHENTICATED" }),
+    );
+  });
+
+  it("recovers a lost completion response through exact HTTP replay", async () => {
+    const enrollment = enroll(issue().token);
+    const auth = authenticated();
+    const job = jobs.lease(
+      jobs.createBusinessStateJob(
+        enrollment.receiverConnection.id,
+        "delivery-guid-1",
+      ).id,
+      auth,
+    );
+    const leasedJob = toReceiverLeasedJob(job) as unknown as CapabilityJob;
+    const result = {
+      schemaVersion: 1 as const,
+      deliveryGuid: "delivery-guid-1",
+      mutationCount: 1,
+      businessState: "EXACTLY_ONE" as const,
+      observedAt: START.toISOString(),
+    };
+    let completionCalls = 0;
+    let firstTerminalRow: Record<string, unknown> | undefined;
+    const fetchImpl: typeof fetch = vi.fn(async (_url, init) => {
+      const headers = init?.headers as Record<string, string>;
+      const body = JSON.parse(String(init?.body)) as {
+        leaseGeneration: number;
+        outcome: "SUCCEEDED" | "FAILED";
+        result?: unknown;
+        errorCode?: unknown;
+      };
+      const authenticatedConnector = connections.authenticate({
+        connectorId: headers["X-Redrive-Connector-Id"],
+        connectorSecret: headers.Authorization.slice("Bearer ".length),
+      });
+      const completed = body.outcome === "SUCCEEDED"
+        ? jobs.complete(
+            job.id,
+            authenticatedConnector,
+            body.leaseGeneration,
+            body.result,
+          )
+        : jobs.fail(
+            job.id,
+            authenticatedConnector,
+            body.leaseGeneration,
+            body.errorCode,
+          );
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        firstTerminalRow = database.get<Record<string, unknown>>(
+          "SELECT state, lease_generation, result_json, error_code, updated_at, completed_at FROM receiver_read_jobs WHERE id = ?",
+          [job.id],
+        );
+        throw new Error("completion response lost after central commit");
+      }
+      return new Response(JSON.stringify({ job: toReceiverCompletedJob(completed) }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const httpTransport = new ConcreteRedriveHttpTransport({
+      redriveUrl: "http://redrive.test",
+      fetchImpl,
+    });
+    const transport: RedriveTransport = {
+      enroll: async () => ({ connectorId: CONNECTOR_ID }),
+      lease: async () => leasedJob,
+      complete: (request) => httpTransport.complete(request),
+      fail: (request) => httpTransport.fail(request),
+    };
+    const worker = new ReceiverConnectorWorker({
+      config: {
+        redriveUrl: "http://redrive.test",
+        enrollmentToken: "enrollment-token",
+        observerDatabaseUrl: "postgresql://observer.invalid/receiver",
+        receiverHealthUrl: "http://receiver.invalid/health",
+        connectorStateDir: directory,
+      },
+      transport,
+      dispatcher: async () => result,
+      identityGenerator: {
+        connectorId: () => CONNECTOR_ID,
+        connectorSecret: () => CONNECTOR_SECRET,
+      },
+      retryPolicy: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0 },
+      sleep: async () => undefined,
+    });
+
+    await expect(worker.runOnce()).resolves.toMatchObject({
+      kind: "COMPLETED",
+      job: { jobId: leasedJob.jobId, leaseGeneration: leasedJob.leaseGeneration },
+    });
+    expect(completionCalls).toBe(2);
+    expect(firstTerminalRow).toBeDefined();
+    expect(database.get<Record<string, unknown>>(
+      "SELECT state, lease_generation, result_json, error_code, updated_at, completed_at FROM receiver_read_jobs WHERE id = ?",
+      [job.id],
+    )).toEqual(firstTerminalRow);
   });
 
   it("requires an authenticated connector principal for every job mutation", () => {
@@ -443,6 +627,7 @@ describe("central receiver connector transport foundation", () => {
       errorCode: "CONNECTOR_ERROR",
       result: null,
     });
+    expect(jobs.fail(job.id, auth, lease.leaseGeneration, "CONNECTOR_ERROR")).toEqual(failed);
     expect(() => jobs.fail(job.id, auth, lease.leaseGeneration, "OTHER_ERROR")).toThrowError(
       expect.objectContaining({ code: "JOB_ALREADY_COMPLETED" }),
     );

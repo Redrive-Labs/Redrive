@@ -856,6 +856,82 @@ function parseCompletionResult(
   return parseHealthReadResult(value);
 }
 
+function matchingLeaseGeneration(value: unknown, current: number): boolean {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value === current
+  );
+}
+
+function sameTypedResult(
+  persisted: ReceiverReadJobResult | null,
+  incoming: ReceiverReadJobResult,
+): boolean {
+  if (persisted === null) return false;
+  if ("deliveryGuid" in persisted && "deliveryGuid" in incoming) {
+    return (
+      persisted.schemaVersion === incoming.schemaVersion &&
+      persisted.deliveryGuid === incoming.deliveryGuid &&
+      persisted.mutationCount === incoming.mutationCount &&
+      persisted.businessState === incoming.businessState &&
+      persisted.observedAt === incoming.observedAt
+    );
+  }
+  if ("healthStatus" in persisted && "healthStatus" in incoming) {
+    return (
+      persisted.schemaVersion === incoming.schemaVersion &&
+      persisted.healthStatus === incoming.healthStatus &&
+      persisted.observedAt === incoming.observedAt
+    );
+  }
+  return false;
+}
+
+function isExactSucceededReplay(
+  row: ReceiverReadJobRow,
+  leaseGeneration: unknown,
+  result: unknown,
+): boolean {
+  if (!matchingLeaseGeneration(leaseGeneration, readLeaseGeneration(row))) {
+    return false;
+  }
+  const capability = readCapability(row);
+  const input = readStoredInput(row, capability);
+  let parsedResult: ReceiverReadJobResult;
+  try {
+    parsedResult = parseCompletionResult(capability, input, result);
+  } catch (error) {
+    if (error instanceof ReceiverConnectorValidationError) return false;
+    throw error;
+  }
+  return sameTypedResult(readStoredResult(row, capability, input), parsedResult);
+}
+
+function isExactFailedReplay(
+  row: ReceiverReadJobRow,
+  leaseGeneration: unknown,
+  errorCode: unknown,
+): boolean {
+  if (!matchingLeaseGeneration(leaseGeneration, readLeaseGeneration(row))) {
+    return false;
+  }
+  let parsedErrorCode: string;
+  try {
+    parsedErrorCode = parseFailureCode(errorCode);
+  } catch (error) {
+    if (
+      error instanceof ReceiverReadJobError &&
+      error.code === "INVALID_INPUT"
+    ) {
+      return false;
+    }
+    throw error;
+  }
+  return readNullableText(row, "errorCode") === parsedErrorCode;
+}
+
 function assertLeaseGenerationMatches(
   supplied: unknown,
   current: number,
@@ -910,6 +986,21 @@ function createReceiverReadJobServiceWithCompletion(
         receiverConnectionId,
       );
       const state = readJobState(row);
+      if (
+        state === RECEIVER_READ_JOB_SUCCEEDED &&
+        isExactSucceededReplay(row, leaseGeneration, result)
+      ) {
+        return { kind: "idempotent" as const };
+      }
+      if (
+        state === RECEIVER_READ_JOB_SUCCEEDED ||
+        state === RECEIVER_READ_JOB_FAILED
+      ) {
+        throw new ReceiverReadJobError(
+          "JOB_ALREADY_COMPLETED",
+          "The receiver read job is already terminal.",
+        );
+      }
       assertTerminalState(state);
       const deadlineAt = readText(row, "deadlineAt");
       if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {
@@ -1067,6 +1158,21 @@ function createReceiverReadJobServiceWithCompletion(
         receiverConnectionId,
       );
       const state = readJobState(row);
+      if (
+        state === RECEIVER_READ_JOB_FAILED &&
+        isExactFailedReplay(row, leaseGeneration, errorCode)
+      ) {
+        return { kind: "idempotent" as const };
+      }
+      if (
+        state === RECEIVER_READ_JOB_SUCCEEDED ||
+        state === RECEIVER_READ_JOB_FAILED
+      ) {
+        throw new ReceiverReadJobError(
+          "JOB_ALREADY_COMPLETED",
+          "The receiver read job is already terminal.",
+        );
+      }
       assertTerminalState(state);
       const deadlineAt = readText(row, "deadlineAt");
       if (readDueDate(deadlineAt, "deadlineAt") <= now.getTime()) {

@@ -3,6 +3,7 @@ export * from "./config.js";
 export * from "./dispatcher.js";
 export * from "./errors.js";
 export * from "./health.js";
+export * from "./http-transport.js";
 export * from "./identity.js";
 export * from "./model.js";
 export * from "./runtime.js";

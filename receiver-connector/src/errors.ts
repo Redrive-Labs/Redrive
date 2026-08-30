@@ -21,6 +21,20 @@ export type ConnectorErrorCode =
   | "INVALID_JOB"
   | "INVALID_RESULT"
   | "TRANSPORT_INTEGRATION_PENDING"
+  | "TRANSPORT_TIMEOUT"
+  | "TRANSPORT_AUTHENTICATION"
+  | "TRANSPORT_REJECTED"
+  | "TRANSPORT_MALFORMED_RESPONSE"
+  | "TRANSPORT_REDIRECT"
+  | "TRANSPORT_ERROR";
+
+export type TransportErrorCode =
+  | "TRANSPORT_INTEGRATION_PENDING"
+  | "TRANSPORT_TIMEOUT"
+  | "TRANSPORT_AUTHENTICATION"
+  | "TRANSPORT_REJECTED"
+  | "TRANSPORT_MALFORMED_RESPONSE"
+  | "TRANSPORT_REDIRECT"
   | "TRANSPORT_ERROR";
 
 export class ConnectorError extends Error {
@@ -56,6 +70,11 @@ export class ObservationError extends ConnectorError {
       | "CONFIGURATION_ERROR"
       | "IDENTITY_STATE_ERROR"
       | "TRANSPORT_INTEGRATION_PENDING"
+      | "TRANSPORT_TIMEOUT"
+      | "TRANSPORT_AUTHENTICATION"
+      | "TRANSPORT_REJECTED"
+      | "TRANSPORT_MALFORMED_RESPONSE"
+      | "TRANSPORT_REDIRECT"
       | "TRANSPORT_ERROR"
     >,
     message: string,
@@ -67,7 +86,7 @@ export class ObservationError extends ConnectorError {
 }
 
 export class TransportError extends ConnectorError {
-  constructor(code: "TRANSPORT_ERROR" | "TRANSPORT_INTEGRATION_PENDING", message: string, retryable: boolean) {
+  constructor(code: TransportErrorCode, message: string, retryable: boolean) {
     super(code, message, retryable);
     this.name = "TransportError";
   }
