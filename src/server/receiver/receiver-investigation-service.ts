@@ -19,6 +19,7 @@ import { getConfiguredDatabase, type SqliteDatabase } from "@/server/infrastruct
 import { getServerConfig } from "@/server/infrastructure/config";
 import {
   createConfiguredTrueForgeClient,
+  TrueForgeTurnInProgressError,
   type TrueForgeIncidentClient,
 } from "@/server/trueforge/trueforge-client";
 import {
@@ -991,6 +992,7 @@ export function createReceiverInvestigationService(
         completedTurnId,
       );
     } catch (error) {
+      if (error instanceof TrueForgeTurnInProgressError) throw error;
       if (error instanceof ReceiverInvestigationTurnError) throw error;
       throw new ReceiverInvestigationTurnError(
         "TrueForge receiver investigation events could not be collected.",

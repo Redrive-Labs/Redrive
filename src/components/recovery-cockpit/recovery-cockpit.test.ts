@@ -73,6 +73,18 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).toContain("Recovery blocked");
     expect(html).toContain("PROVIDER_FAILED_RECEIVER_MUTATED");
     expect(html).toContain("Run isolated sandbox recovery");
+    expect(html).not.toContain("Investigate failure");
+  });
+
+  it("hands an investigated contradiction to the existing sandbox recovery action", () => {
+    const html = renderToStaticMarkup(
+      createElement(RecoveryCockpit, {
+        viewModel: model({ sandbox: { state: "NOT_STARTED" } }),
+      }),
+    );
+
+    expect(html).toContain("Start sandbox recovery");
+    expect(html).not.toContain("Investigate failure");
   });
 
   it("renders pending evidence without manufacturing permit surfaces", () => {
@@ -92,6 +104,7 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).not.toContain("Retry unsafe");
     expect(html).not.toContain("Deploy Permit");
     expect(html).not.toContain("Redrive Permit");
+    expect(html).toContain("Investigate failure");
   });
 
   it("formats the dossier timestamp in deterministic UTC", () => {
@@ -120,6 +133,24 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).not.toContain("Retry unsafe");
     expect(html).not.toContain("work already happened");
     expect(html).toContain("Receiver mutation state is absent.");
+  });
+
+  it("treats authoritative non-contradictory evidence as complete and unavailable for recovery", () => {
+    const html = renderToStaticMarkup(
+      createElement(RecoveryCockpit, {
+        viewModel: model({
+          provider: { ...provider, statusCode: 404, status: "Delivery unavailable" },
+          receiver: { ...receiver, mutationCount: 0, businessState: "ABSENT" },
+          assessment: { contradiction: null, recoveryState: "BLOCKED" },
+          sandbox: { state: "NOT_STARTED" },
+        }),
+      }),
+    );
+
+    expect(html).toContain("Authoritative investigation complete");
+    expect(html).toContain("No replay-safety contradiction was established.");
+    expect(html).not.toContain("Investigate failure");
+    expect(html).not.toContain("Start sandbox recovery");
   });
 
   it("renders Daytona reproduction and verified retry proof for a repaired candidate", () => {

@@ -27,6 +27,7 @@ import { getConfiguredDatabase, type SqliteDatabase } from "@/server/infrastruct
 import { getServerConfig } from "@/server/infrastructure/config";
 import {
   createConfiguredTrueForgeClient,
+  TrueForgeTurnInProgressError,
   type TrueForgeIncidentClient,
 } from "@/server/trueforge/trueforge-client";
 import {
@@ -1346,6 +1347,9 @@ export function createProviderInvestigationService(
         providerStatusCode: capture.evidence.outcome.statusCode,
       };
     } catch (error) {
+      if (error instanceof TrueForgeTurnInProgressError) {
+        throw error;
+      }
       appendFailure(
         workflowEvents.append,
         incidentId,

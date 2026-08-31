@@ -6,6 +6,8 @@ import {
   UnsupportedProviderEvidenceError,
 } from "@/server/incidents/provider-evidence-service";
 import {
+  IncidentInvestigationInProgressError,
+  IncidentInvestigationRetryableError,
   investigateIncidentForRecovery,
 } from "@/server/incidents/incident-investigation-service";
 import {
@@ -57,6 +59,19 @@ export async function POST(
 }
 
 function providerInvestigationErrorResponse(error: unknown): Response {
+  if (error instanceof IncidentInvestigationInProgressError) {
+    return NextResponse.json(
+      { error: "Investigation is already running or awaiting TrueForge reconciliation. Refresh shortly to reuse its persisted result." },
+      { status: 409 },
+    );
+  }
+
+  if (error instanceof IncidentInvestigationRetryableError) {
+    return NextResponse.json(
+      { error: "TrueForge did not retain the reserved turn. Retry to start a new serialized investigation attempt." },
+      { status: 503 },
+    );
+  }
   if (error instanceof IncidentNotFoundError) {
     return NextResponse.json({ error: "Incident not found." }, { status: 404 });
   }

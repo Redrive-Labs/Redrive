@@ -175,6 +175,29 @@ input:focus-visible {
   min-width: 0;
 }
 
+.investigation-action {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+  padding: 1.25rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.investigation-action h2 {
+  margin: 0.35rem 0 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(1.45rem, 3vw, 2rem);
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.investigation-action p:not(.section-kicker):not(.recovery-action-error) {
+  max-width: 48rem;
+  margin: 0.65rem 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .dossier-header {
   padding: 1.35rem 0 1.25rem;
   border-bottom: 1px solid var(--line);
