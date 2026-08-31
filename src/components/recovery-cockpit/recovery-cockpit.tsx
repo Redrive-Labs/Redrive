@@ -221,7 +221,10 @@ export function RecoveryCockpit({
     viewModel.receiver?.observed === true &&
     viewModel.receiver.mutationCount === 1 &&
     viewModel.receiver.businessState === "EXACTLY_ONE";
-  const investigationRequired = !contradictionEstablished;
+  const investigationComplete =
+    viewModel.provider?.observed === true &&
+    viewModel.receiver?.observed === true;
+  const investigationRequired = !investigationComplete;
   const canStart = contradictionEstablished && viewModel.sandbox?.state === "NOT_STARTED";
   const canDeploy = viewModel.deployment?.state === "APPROVED";
   const canRedrive = viewModel.redrive?.state === "APPROVED";
@@ -240,6 +243,15 @@ export function RecoveryCockpit({
             {investigationPending ? "Investigating through TrueForge…" : "Investigate failure"}
           </button>
           {investigationError ? <p className="recovery-action-error" role="alert">{investigationError}</p> : null}
+        </section>
+      ) : null}
+      {investigationComplete && !contradictionEstablished ? (
+        <section className="investigation-action" aria-labelledby="investigation-complete-title">
+          <div>
+            <p className="section-kicker">Authoritative investigation complete</p>
+            <h2 id="investigation-complete-title">No replay-safety contradiction was established.</h2>
+            <p>Persisted provider and receiver evidence is available below. Recovery remains unavailable unless the deterministic assessment permits it.</p>
+          </div>
         </section>
       ) : null}
       <ContradictionPanel assessment={viewModel.assessment} provider={viewModel.provider} receiver={viewModel.receiver} />

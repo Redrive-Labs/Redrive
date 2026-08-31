@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createLatestRequestOrchestrator,
+  createConnectionRequestFence,
+  createConnectionBoundIncidentController,
   createIncidentFromDelivery,
   fetchFailedDeliveries,
   incidentCockpitHref,
@@ -87,5 +89,44 @@ describe("incident investigation client", () => {
     resolveA("result-a");
     await expect(requestA).resolves.toEqual({ current: false });
     expect(loader.mock.calls[0]?.[1].aborted).toBe(true);
+  });
+
+  it("fences an old incident POST completion after the active connection changes", () => {
+    const fence = createConnectionRequestFence();
+    fence.activate("connection-a");
+    const requestA = fence.begin("connection-a");
+    fence.activate("connection-b");
+
+    expect(fence.isCurrent(requestA)).toBe(false);
+  });
+
+  it("does not let a stale connection A completion navigate or overwrite B pending/error state", async () => {
+    let resolveA!: (incidentId: string) => void;
+    const create = vi.fn((connectionId: string, _deliveryId: string) => new Promise<string>((resolve) => {
+      if (connectionId === "connection-a") resolveA = resolve;
+    }));
+    const navigate = vi.fn();
+    const errors: Array<string | null> = [];
+    const pending: Array<string | null> = [];
+    const controller = createConnectionBoundIncidentController({
+      create: (connectionId, deliveryId) => create(connectionId, deliveryId),
+      navigate,
+      setError: (value) => errors.push(value),
+      setPending: (value) => pending.push(value),
+    });
+
+    controller.activate("connection-a");
+    const openingA = controller.open("connection-a", "delivery-a");
+    controller.activate("connection-b");
+    // B's current UI stays clear while A is in flight.
+    expect(pending.at(-1)).toBeNull();
+    expect(errors.at(-1)).toBeNull();
+
+    resolveA("incident-a");
+    await openingA;
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(errors.at(-1)).toBeNull();
+    expect(pending.at(-1)).toBeNull();
   });
 });

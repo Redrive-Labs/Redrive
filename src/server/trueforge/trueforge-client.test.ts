@@ -90,6 +90,29 @@ describe("TrueForge SDK adapter", () => {
     );
   });
 
+  it("iterates every page when reconciling session turns", async () => {
+    const sdk = createSdkDouble();
+    const page = {
+      data: [{ id: "newest", state: { status: "done" } }],
+      async *[Symbol.asyncIterator]() {
+        yield { id: "newest", state: { status: "done" } };
+        yield { id: "older-marker-turn", state: { status: "done" } };
+      },
+    };
+    sdk.sessions.listTurns = vi.fn().mockResolvedValue(page);
+    const client = createTrueForgeClient(sdk);
+
+    await expect(client.listTurns?.("session-1")).resolves.toEqual([
+      { id: "newest", state: { status: "done" } },
+      { id: "older-marker-turn", state: { status: "done" } },
+    ]);
+    expect(sdk.sessions.listTurns).toHaveBeenCalledWith(
+      "session-1",
+      { limit: 100 },
+      { maxRetries: 0 },
+    );
+  });
+
   it("classifies server validation failures as definitive create failures", async () => {
     const sdk = createSdkDouble();
     sdk.sessions.create = vi.fn().mockRejectedValue(

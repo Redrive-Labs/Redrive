@@ -55,6 +55,57 @@ export function createLatestRequestOrchestrator<T>(loader: LatestRequestLoader<T
   };
 }
 
+/** Fences non-abortable connection-bound POST completions after a UI switch. */
+export function createConnectionRequestFence() {
+  let generation = 0;
+  let activeConnectionId: string | null = null;
+
+  return {
+    activate(connectionId: string | null): void {
+      generation += 1;
+      activeConnectionId = connectionId;
+    },
+    begin(connectionId: string): { connectionId: string; generation: number } {
+      generation += 1;
+      return { connectionId, generation };
+    },
+    isCurrent(request: { connectionId: string; generation: number }): boolean {
+      return request.generation === generation && request.connectionId === activeConnectionId;
+    },
+  };
+}
+
+export function createConnectionBoundIncidentController(input: {
+  create: (connectionId: string, deliveryId: string) => Promise<string>;
+  navigate: (incidentId: string) => void;
+  setError: (value: string | null) => void;
+  setPending: (value: string | null) => void;
+}) {
+  const fence = createConnectionRequestFence();
+  return {
+    activate(connectionId: string | null): void {
+      fence.activate(connectionId);
+      input.setError(null);
+      input.setPending(null);
+    },
+    async open(connectionId: string, deliveryId: string): Promise<void> {
+      const request = fence.begin(connectionId);
+      input.setPending(deliveryId);
+      input.setError(null);
+      try {
+        const incidentId = await input.create(connectionId, deliveryId);
+        if (fence.isCurrent(request)) input.navigate(incidentId);
+      } catch (reason) {
+        if (fence.isCurrent(request)) {
+          input.setError(reason instanceof Error ? reason.message : "The incident could not be recorded.");
+        }
+      } finally {
+        if (fence.isCurrent(request)) input.setPending(null);
+      }
+    },
+  };
+}
+
 function responseError(value: unknown, fallback: string): string {
   return value !== null && typeof value === "object" && "error" in value &&
     typeof value.error === "string" && value.error.length > 0

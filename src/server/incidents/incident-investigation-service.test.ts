@@ -7,6 +7,7 @@ import { openDatabase, type SqliteDatabase } from "@/server/infrastructure/datab
 import { createIncidentService } from "@/server/incidents/incident-service";
 import { createIncidentInvestigationService } from "@/server/incidents/incident-investigation-service";
 import { buildReceiverInvestigatorTask } from "@/server/receiver/receiver-investigation-service";
+import { TrueForgeTurnCreateError } from "@/server/trueforge/trueforge-client";
 
 const applicationConnectionId = "application-connection-1";
 const providerDeliveryId = "provider-delivery-1";
@@ -161,6 +162,31 @@ function providerEvents(): unknown[] {
       state: { status: "done" },
     },
   ];
+}
+
+function providerEventsForTurn(turnId: string, malformed = false): unknown[] {
+  const events = providerEvents();
+  for (const event of events) {
+    if (event !== null && typeof event === "object" && (event as { type?: unknown }).type === "turn.created") {
+      (event as { turnId: string }).turnId = turnId;
+    }
+  }
+  if (malformed) {
+    const message = events.find((event) =>
+      event !== null && typeof event === "object" &&
+      (event as { type?: unknown; threadId?: unknown }).type === "model.message" &&
+      (event as { threadId?: unknown }).threadId === "provider-thread-1",
+    ) as { toolCalls?: Array<{ function?: { arguments?: string } }> } | undefined;
+    const argumentsText = message?.toolCalls?.[0]?.function?.arguments;
+    if (argumentsText === undefined || message?.toolCalls?.[0]?.function === undefined) {
+      throw new Error("Provider test fixture is missing its investigator tool call.");
+    }
+    message.toolCalls[0].function.arguments = JSON.stringify({
+      ...JSON.parse(argumentsText) as Record<string, unknown>,
+      unexpected: true,
+    });
+  }
+  return events;
 }
 
 function receiverEvents(): unknown[] {
@@ -405,5 +431,323 @@ describe("incident provider and receiver investigation orchestration", () => {
         [incident.id],
       ),
     ).toEqual({ count: 1 });
+
+    await expect(
+      createIncidentInvestigationService(database, client, environment, () => observedAt)
+        .investigateProviderAndReceiverForIncident(incident.id),
+    )
+      .resolves.toMatchObject({
+        turnId: "provider-turn-1",
+        providerInvestigatorThreadId: "provider-thread-1",
+        receiverObservation: {
+          turnId: "receiver-turn-1",
+          receiverInvestigatorThreadId: "receiver-thread-1",
+        },
+        contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED",
+    });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+
+    // Legacy incidents may contain more than one receiver observation. The
+    // latest persisted observation is authoritative when v15 provenance is
+    // backfilled, including its exact TrueForge turn identity.
+    const latestObservationAt = "2026-08-30T00:00:04.000Z";
+    database.run(
+      `INSERT INTO receiver_observations (
+        id, incident_id, application_connection_id, delivery_guid, capability,
+        tool, mcp_server_name, mutation_count, business_state, observed_at,
+        trueforge_session_id, turn_id, receiver_investigator_thread_id,
+        thread_created_event_id, tool_call_id, tool_call_event_id,
+        tool_response_event_id, tool_response_created_at, observation_json,
+        created_at
+      ) SELECT 'receiver-observation-2', incident_id, application_connection_id,
+        delivery_guid, capability, tool, mcp_server_name, mutation_count,
+        business_state, observed_at, trueforge_session_id, 'receiver-turn-2',
+        'receiver-thread-2', 'receiver-thread-created-2', 'receiver-call-2',
+        'receiver-response-2', 'receiver-response-event-2', ?, observation_json, ?
+      FROM receiver_observations WHERE incident_id = ?`,
+      [latestObservationAt, latestObservationAt, incident.id],
+    );
+
+    // Migration compatibility: pre-v15 persisted evidence has no reservation
+    // row, but still carries exact workflow and receiver provenance.
+    database.run("DELETE FROM incident_investigations WHERE incident_id = ?", [incident.id]);
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({
+      turnId: "provider-turn-1",
+      providerInvestigatorThreadId: "provider-thread-1",
+      receiverObservation: { turnId: "receiver-turn-2" },
+    });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+    expect(database.get<{ state: string; providerTurnId: string; receiverTurnId: string }>(
+      "SELECT state, provider_turn_id AS providerTurnId, receiver_turn_id AS receiverTurnId FROM incident_investigations WHERE incident_id = ?",
+      [incident.id],
+    )).toEqual({ state: "COMPLETED", providerTurnId: "provider-turn-1", receiverTurnId: "receiver-turn-2" });
+  });
+
+  it("does not create a second Provider chain while a concurrent reservation is still creating", async () => {
+    const incident = createIncidentService(database).create({
+      provider: "github",
+      externalDeliveryId: providerDeliveryId,
+      repositoryId: "octocat/receiver",
+    }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(
+      `INSERT INTO trueforge_session_bindings
+        (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`,
+      [incident.id, sessionId, observedAt, observedAt],
+    );
+
+    let releaseProvider!: () => void;
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn()
+        .mockImplementationOnce(async () => {
+          await providerGate;
+          return lifecycle("provider-turn-1");
+        })
+        .mockResolvedValueOnce(lifecycle("receiver-turn-1")),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) =>
+        iterable(turnId === "provider-turn-1" ? providerEvents() : receiverEvents())),
+    };
+    const first = createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id);
+    await vi.waitFor(() => expect(client.createTurnStream).toHaveBeenCalledTimes(1));
+
+    await expect(
+      createIncidentInvestigationService(database, client, environment, () => observedAt)
+        .investigateProviderAndReceiverForIncident(incident.id),
+    ).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(1);
+    expect(database.get<{ state: string }>("SELECT state FROM incident_investigations WHERE incident_id = ?", [incident.id]))
+      .toEqual({ state: "PROVIDER_CREATING" });
+
+    releaseProvider();
+    await expect(first).resolves.toMatchObject({ contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the Provider corrective turn inside one fenced operation", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(`INSERT INTO trueforge_session_bindings (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at) VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`, [incident.id, sessionId, observedAt, observedAt]);
+
+    let turnNumber = 0;
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn().mockImplementation(async () => {
+        turnNumber += 1;
+        return lifecycle(turnNumber === 1 ? "provider-turn-1" : turnNumber === 2 ? "provider-turn-2" : "receiver-turn-1");
+      }),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) => {
+        if (turnId === "provider-turn-1") return iterable(providerEventsForTurn(turnId, true));
+        if (turnId === "provider-turn-2") return iterable(providerEventsForTurn(turnId));
+        return iterable(receiverEvents());
+      }),
+    };
+
+    const service = createIncidentInvestigationService(database, client, environment, () => observedAt);
+    await expect(service.investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({
+      contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED",
+      turnId: "provider-turn-2",
+      receiverObservation: { turnId: "receiver-turn-1" },
+    });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(3);
+
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({
+      turnId: "provider-turn-2",
+      contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED",
+    });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a known turn running after its stream is interrupted and does not recreate it on retry", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(`INSERT INTO trueforge_session_bindings (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at) VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`, [incident.id, sessionId, observedAt, observedAt]);
+    const interrupted = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: "turn.created", id: "provider-created", turnId: "provider-turn-1", state: { status: "running" } } as TrueForgeApi.TurnStreamingEvent;
+        throw new Error("stream interrupted");
+      },
+    };
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn().mockResolvedValue(interrupted),
+      listTurnEvents: vi.fn().mockResolvedValue(iterable([{
+        type: "turn.created", id: "provider-created", turnId: "provider-turn-1", state: { status: "running" },
+      }])),
+    };
+
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(1);
+    expect(database.get<{ state: string; providerTurnId: string }>("SELECT state, provider_turn_id AS providerTurnId FROM incident_investigations WHERE incident_id = ?", [incident.id]))
+      .toEqual({ state: "PROVIDER_RUNNING", providerTurnId: "provider-turn-1" });
+  });
+
+  it("does not let a stale preparation owner create a turn after another caller takes the reservation", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(`INSERT INTO trueforge_session_bindings (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at) VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`, [incident.id, sessionId, observedAt, observedAt]);
+
+    let releasePreparation!: () => void;
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    let clock = observedAt;
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn(async () => {
+        await preparation;
+        return { id: sessionId };
+      }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn().mockResolvedValue(lifecycle("provider-turn-1")),
+      listTurns: vi.fn().mockResolvedValue([]),
+      listTurnEvents: vi.fn().mockResolvedValue(iterable([])),
+    };
+
+    const first = createIncidentInvestigationService(database, client, environment, () => clock)
+      .investigateProviderAndReceiverForIncident(incident.id);
+    await vi.waitFor(() => expect(client.getSession).toHaveBeenCalledTimes(1));
+
+    clock = new Date(Date.parse(observedAt) + 61_000).toISOString();
+    await expect(createIncidentInvestigationService(database, client, environment, () => clock)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationRetryableError" });
+
+    releasePreparation();
+    await expect(first).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    expect(client.createTurnStream).not.toHaveBeenCalled();
+  });
+
+  it("treats a terminal cancelled turn as retryable before a serialized new attempt", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(`INSERT INTO trueforge_session_bindings (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at) VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`, [incident.id, sessionId, observedAt, observedAt]);
+    database.run(`INSERT INTO incident_investigations (incident_id, state, provider_operation_token, provider_turn_id, receiver_operation_token, receiver_turn_id, failure_stage, failure_code, created_at, updated_at, completed_at) VALUES (?, 'PROVIDER_RUNNING', 'provider-old-token', 'provider-terminal', NULL, NULL, NULL, NULL, ?, ?, NULL)`, [incident.id, observedAt, observedAt]);
+    let terminal = true;
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn().mockResolvedValueOnce(lifecycle("provider-turn-1")).mockResolvedValueOnce(lifecycle("receiver-turn-1")),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) => {
+        if (turnId === "provider-terminal" && terminal) return iterable([
+          { type: "turn.created", id: "terminal-created", turnId, state: { status: "running" } },
+          { type: "turn.done", id: "terminal-done", state: { status: "cancelled" } },
+        ]);
+        return iterable(turnId === "provider-turn-1" ? providerEvents() : receiverEvents());
+      }),
+    };
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationRetryableError" });
+    expect(client.createTurnStream).not.toHaveBeenCalled();
+    terminal = false;
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({ contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes at Receiver after a terminal receiver-start failure without rerunning Provider", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(
+      `INSERT INTO trueforge_session_bindings
+        (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`,
+      [incident.id, sessionId, observedAt, observedAt],
+    );
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn()
+        .mockResolvedValueOnce(lifecycle("provider-turn-1"))
+        .mockRejectedValueOnce(new TrueForgeTurnCreateError(sessionId, "receiver rejected", { statusCode: 400, kind: "DEFINITIVE" }))
+        .mockResolvedValueOnce(lifecycle("receiver-turn-1")),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) => iterable(turnId === "provider-turn-1" ? providerEvents() : receiverEvents())),
+    };
+
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toThrow("receiver investigation events could not be collected");
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+
+    // A provider-only pre-v15 incident resumes at Receiver from accepted
+    // workflow provenance instead of creating another Provider turn.
+    database.run("DELETE FROM incident_investigations WHERE incident_id = ?", [incident.id]);
+
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({ contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(3);
+  });
+
+  it("reconciles an ambiguous Provider POST by its durable marker instead of creating another turn", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(
+      `INSERT INTO trueforge_session_bindings
+        (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`,
+      [incident.id, sessionId, observedAt, observedAt],
+    );
+    let ambiguousInput: TrueForgeApi.TurnInputItem[] | undefined;
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn()
+        .mockImplementationOnce(async (_session: string, request: { input: TrueForgeApi.TurnInputItem[] }) => {
+          ambiguousInput = request.input;
+          throw new Error("response lost after remote create");
+        })
+        .mockResolvedValueOnce(lifecycle("receiver-turn-1")),
+      listTurns: vi.fn(async () => [{ id: "provider-turn-1", input: ambiguousInput, state: { status: "done" } }]),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) => iterable(turnId === "provider-turn-1" ? providerEvents() : receiverEvents())),
+    };
+
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({ contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED" });
+    // The retry adopts the original Provider turn and creates only Receiver.
+    expect(client.createTurnStream).toHaveBeenCalledTimes(2);
+  });
+
+  it("makes a conclusively absent ambiguous turn retryable without retaining a failed reservation forever", async () => {
+    const incident = createIncidentService(database).create({ provider: "github", externalDeliveryId: providerDeliveryId, repositoryId: "octocat/receiver" }).incident;
+    database.run("UPDATE incidents SET application_connection_id = ? WHERE id = ?", [applicationConnectionId, incident.id]);
+    database.run(
+      `INSERT INTO trueforge_session_bindings
+        (incident_id, state, trueforge_session_id, creation_token, coordinator_spec_version, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, NULL, 'm2.6b-v1', ?, ?)`,
+      [incident.id, sessionId, observedAt, observedAt],
+    );
+    const client = {
+      createSession: vi.fn().mockResolvedValue("replacement-session"),
+      getSession: vi.fn().mockResolvedValue({ id: sessionId }),
+      updateSession: vi.fn().mockResolvedValue(undefined),
+      createTurnStream: vi.fn()
+        .mockRejectedValueOnce(new Error("response lost"))
+        .mockResolvedValueOnce(lifecycle("provider-turn-1"))
+        .mockResolvedValueOnce(lifecycle("receiver-turn-1")),
+      listTurns: vi.fn(async () => []),
+      listTurnEvents: vi.fn().mockImplementation(async (_session: string, turnId: string) => iterable(turnId === "provider-turn-1" ? providerEvents() : receiverEvents())),
+    };
+    const firstService = createIncidentInvestigationService(database, client, environment, () => observedAt);
+    await expect(firstService.investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationInProgressError" });
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).rejects.toMatchObject({ name: "IncidentInvestigationRetryableError" });
+    await expect(createIncidentInvestigationService(database, client, environment, () => observedAt)
+      .investigateProviderAndReceiverForIncident(incident.id)).resolves.toMatchObject({ contradiction: "PROVIDER_FAILED_RECEIVER_MUTATED" });
+    expect(client.createTurnStream).toHaveBeenCalledTimes(3);
   });
 });

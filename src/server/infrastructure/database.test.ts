@@ -402,12 +402,12 @@ describe("native SQLite persistence", () => {
     expect(database.pragma("busy_timeout", { simple: true })).toBe(5000);
   });
 
-  it("applies recovery migrations 12, 13, and 14 in order", () => {
+  it("applies recovery migrations 12 through 15 in order", () => {
     expect(
       database.all<{ version: number }>(
         "SELECT version FROM schema_migrations ORDER BY version",
       ).map(({ version }) => version),
-    ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     expect(
       database.all<{ name: string }>(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('deploy_permits', 'recovery_deployments', 'recovery_attempts') ORDER BY name",
@@ -619,7 +619,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 },
     ]);
     expect(
       database.all<{ name: string }>(
@@ -710,7 +710,7 @@ describe("native SQLite persistence", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 },
     ]);
     expect(
       database.all<{
@@ -815,7 +815,7 @@ describe("native SQLite persistence", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
-      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
+      { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 },
     ]);
     expect(
       database.get<{ count: number }>(
@@ -949,7 +949,7 @@ describe("native SQLite persistence", () => {
         "SELECT version FROM schema_migrations ORDER BY version",
       )).toEqual([
         { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
-        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
+        { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 },
       ]);
       expect(upgraded.get("SELECT * FROM incidents")).toEqual({
         ...before.incident,
@@ -1051,7 +1051,7 @@ describe("native SQLite persistence", () => {
 
     expect(results.map(parseIndependentDatabaseOpenerResult)).toEqual(
       Array.from({ length: openerCount }, () => ({
-        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        migrationVersions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         incidentCount: 0,
       })),
     );
@@ -1069,7 +1069,7 @@ describe("native SQLite persistence", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
-        { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
+        { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 },
       ]);
       expect(
         verificationDatabase.get<{ count: number }>(

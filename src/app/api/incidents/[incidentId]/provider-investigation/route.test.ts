@@ -7,7 +7,7 @@ import {
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
 } from "@/server/incidents/provider-investigation-service";
-import { investigateIncidentForRecovery } from "@/server/incidents/incident-investigation-service";
+import { IncidentInvestigationInProgressError, IncidentInvestigationRetryableError, investigateIncidentForRecovery } from "@/server/incidents/incident-investigation-service";
 import { TrueForgeSessionUnavailableError } from "@/server/trueforge/trueforge-session-service";
 import { POST } from "@/app/api/incidents/[incidentId]/provider-investigation/route";
 import { RecoveryCoordinatorConfigurationError } from "@/agents/recovery-coordinator";
@@ -53,6 +53,28 @@ describe("provider investigation API", () => {
       expect(response.status).toBe(status);
       expect(await response.json()).not.toHaveProperty("transcript");
     }
+  });
+
+  it("reports an existing durable investigation without starting another one", async () => {
+    investigateMock.mockRejectedValueOnce(new IncidentInvestigationInProgressError("incident-active"));
+
+    const response = await POST(new Request("http://localhost"), context("incident-active"));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "Investigation is already running or awaiting TrueForge reconciliation. Refresh shortly to reuse its persisted result.",
+    });
+  });
+
+  it("reports a conclusively absent remote reservation as retryable", async () => {
+    investigateMock.mockRejectedValueOnce(new IncidentInvestigationRetryableError("incident-retry"));
+
+    const response = await POST(new Request("http://localhost"), context("incident-retry"));
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "TrueForge did not retain the reserved turn. Retry to start a new serialized investigation attempt.",
+    });
   });
 
   it("returns deterministic product state without transcript data", async () => {

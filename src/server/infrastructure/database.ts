@@ -568,6 +568,50 @@ const migrations: Migration[] = [
     version: 14,
     sql: redriveTablesSql,
   },
+  {
+    // A recovery incident has one durable, serialized Provider → Receiver
+    // investigation generation.  The operation markers are copied into the
+    // remote turn input so an ambiguous POST can be reconciled without issuing
+    // another turn creation request.
+    version: 15,
+    sql: `
+      CREATE TABLE incident_investigations (
+        incident_id TEXT PRIMARY KEY NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'PROVIDER_CREATING',
+          'PROVIDER_RUNNING',
+          'PROVIDER_UNCERTAIN',
+          'RECEIVER_CREATING',
+          'RECEIVER_RUNNING',
+          'RECEIVER_UNCERTAIN',
+          'COMPLETED',
+          'RETRYABLE_FAILURE'
+        )),
+        provider_operation_token TEXT,
+        provider_turn_id TEXT,
+        receiver_operation_token TEXT,
+        receiver_turn_id TEXT,
+        failure_stage TEXT CHECK (failure_stage IN ('PROVIDER', 'RECEIVER')),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        CHECK (
+          (state IN ('PROVIDER_CREATING', 'PROVIDER_RUNNING', 'PROVIDER_UNCERTAIN')
+            AND provider_operation_token IS NOT NULL
+            AND receiver_operation_token IS NULL)
+          OR (state IN ('RECEIVER_CREATING', 'RECEIVER_RUNNING', 'RECEIVER_UNCERTAIN')
+            AND provider_operation_token IS NOT NULL
+            AND receiver_operation_token IS NOT NULL)
+          OR state IN ('COMPLETED', 'RETRYABLE_FAILURE')
+        ),
+        FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX incident_investigations_state_idx
+        ON incident_investigations (state, updated_at, incident_id);
+    `,
+  },
 ];
 
 export class SqliteDatabase {

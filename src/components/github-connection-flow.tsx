@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createLatestRequestOrchestrator,
+  createConnectionBoundIncidentController,
   createIncidentFromDelivery,
   fetchFailedDeliveries,
   incidentCockpitHref,
@@ -138,6 +139,14 @@ export function GithubConnectionFlow() {
   const [deliveriesLoading, setDeliveriesLoading] = useState(false);
   const [deliveriesError, setDeliveriesError] = useState<string | null>(null);
   const [creatingIncidentFor, setCreatingIncidentFor] = useState<string | null>(null);
+  const incidentCreationController = useRef(
+    createConnectionBoundIncidentController({
+      create: (connectionId, deliveryId) => createIncidentFromDelivery(connectionId, deliveryId),
+      navigate: (incidentId) => window.location.assign(incidentCockpitHref(incidentId)),
+      setError: setDeliveriesError,
+      setPending: setCreatingIncidentFor,
+    }),
+  );
   const deliveryRequestOrchestrator = useRef(
     createLatestRequestOrchestrator<FailedDelivery[]>((connectionId, signal) =>
       fetchFailedDeliveries(connectionId, fetch, signal),
@@ -148,6 +157,11 @@ export function GithubConnectionFlow() {
     installationId: null,
     repositoryId: "",
   });
+
+  function activateConnection(connectionId: string | null): void {
+    incidentCreationController.current.activate(connectionId);
+    setActiveConnectionId(connectionId);
+  }
 
   const activeReceiverState =
     activeConnectionId === null
@@ -183,7 +197,11 @@ export function GithubConnectionFlow() {
     const nextConnections = result.connections;
     setConnections(nextConnections);
     setConnected((current) => current ?? nextConnections[0] ?? null);
-    setActiveConnectionId((current) => current ?? nextConnections[0]?.id ?? null);
+    setActiveConnectionId((current) => {
+      const next = current ?? nextConnections[0]?.id ?? null;
+      incidentCreationController.current.activate(next);
+      return next;
+    });
 
     const statuses = await Promise.all(
       nextConnections.map(async (connection) => {
@@ -311,7 +329,7 @@ export function GithubConnectionFlow() {
           recoveryReady: result.receiverConnection.state === "READY",
         },
       }));
-      setActiveConnectionId(connectionId);
+      activateConnection(connectionId);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Receiver enrollment could not be issued.");
     } finally {
@@ -378,7 +396,7 @@ export function GithubConnectionFlow() {
       }
       const connection = result.connection;
       setConnected(connection);
-      setActiveConnectionId(connection.id);
+      activateConnection(connection.id);
       setFailedDeliveries([]);
       setDeliveriesConnectionId(null);
       setDeliveriesError(null);
@@ -403,7 +421,7 @@ export function GithubConnectionFlow() {
 
   function selectConnection(connection: Connection): void {
     setConnected(connection);
-    setActiveConnectionId(connection.id);
+    activateConnection(connection.id);
     setEnrollmentToken(null);
     setEnrollmentExpiresAt(null);
     setError(null);
@@ -464,16 +482,8 @@ export function GithubConnectionFlow() {
 
   async function handleDeliverySelection(deliveryId: string): Promise<void> {
     if (activeConnectionId === null) return;
-    setCreatingIncidentFor(deliveryId);
-    setDeliveriesError(null);
-    try {
-      const incidentId = await createIncidentFromDelivery(activeConnectionId, deliveryId);
-      window.location.assign(incidentCockpitHref(incidentId));
-    } catch (reason) {
-      setDeliveriesError(reason instanceof Error ? reason.message : "The incident could not be recorded.");
-    } finally {
-      setCreatingIncidentFor(null);
-    }
+    const connectionId = activeConnectionId;
+    await incidentCreationController.current.open(connectionId, deliveryId);
   }
 
   return (

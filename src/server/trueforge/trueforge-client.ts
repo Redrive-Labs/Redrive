@@ -35,6 +35,15 @@ export interface TrueForgeTurnClient {
     sessionId: string,
     turnId: string,
   ): Promise<AsyncIterable<TrueForgeApi.SessionEvent>>;
+  listTurns?(
+    sessionId: string,
+  ): Promise<readonly TrueForgeTurnSummary[]>;
+}
+
+export interface TrueForgeTurnSummary {
+  id: string;
+  input?: TrueForgeApi.TurnInputItem[];
+  state: { status?: string } | unknown;
 }
 
 export type TrueForgeIncidentClient = TrueForgeSessionClient &
@@ -101,16 +110,26 @@ export class TrueForgeSessionUpdateError extends Error {
 }
 
 export class TrueForgeTurnCreateError extends Error {
+  readonly kind: TrueForgeCreateFailureKind;
   readonly statusCode: number | undefined;
 
   constructor(
     sessionId: string,
     message: string,
-    options?: ErrorOptions & { statusCode?: number },
+    options?: ErrorOptions & { statusCode?: number; kind?: TrueForgeCreateFailureKind },
   ) {
     super(`TrueForge turn for session ${sessionId} could not be created: ${message}`, options);
     this.name = "TrueForgeTurnCreateError";
+    this.kind = options?.kind ?? "AMBIGUOUS";
     this.statusCode = options?.statusCode;
+  }
+}
+
+/** A durable local reservation exists, but the remote turn is not terminal. */
+export class TrueForgeTurnInProgressError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TrueForgeTurnInProgressError";
   }
 }
 
@@ -210,6 +229,7 @@ function turnCreateErrorFromUnknown(
   return new TrueForgeTurnCreateError(sessionId, message, {
     cause: error,
     statusCode,
+    kind: createFailureKind(statusCode),
   });
 }
 
@@ -284,6 +304,21 @@ export function createTrueForgeClient(
         throw lookupErrorFromUnknown(sessionId, error);
       }
     },
+
+    async listTurns(sessionId) {
+      try {
+        const page = await sdk.sessions.listTurns(
+          sessionId,
+          { limit: 100 },
+          { maxRetries: 0 },
+        );
+        const turns: TrueForgeTurnSummary[] = [];
+        for await (const turn of page) turns.push(turn);
+        return turns;
+      } catch (error) {
+        throw lookupErrorFromUnknown(sessionId, error);
+      }
+    },
   };
 }
 
@@ -333,4 +368,3 @@ export function createConfiguredTrueForgeClient(
 
   return createTrueForgeClient(sdk);
 }
-

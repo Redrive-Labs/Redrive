@@ -135,6 +135,24 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).toContain("Receiver mutation state is absent.");
   });
 
+  it("treats authoritative non-contradictory evidence as complete and unavailable for recovery", () => {
+    const html = renderToStaticMarkup(
+      createElement(RecoveryCockpit, {
+        viewModel: model({
+          provider: { ...provider, statusCode: 404, status: "Delivery unavailable" },
+          receiver: { ...receiver, mutationCount: 0, businessState: "ABSENT" },
+          assessment: { contradiction: null, recoveryState: "BLOCKED" },
+          sandbox: { state: "NOT_STARTED" },
+        }),
+      }),
+    );
+
+    expect(html).toContain("Authoritative investigation complete");
+    expect(html).toContain("No replay-safety contradiction was established.");
+    expect(html).not.toContain("Investigate failure");
+    expect(html).not.toContain("Start sandbox recovery");
+  });
+
   it("renders Daytona reproduction and verified retry proof for a repaired candidate", () => {
     const html = renderToStaticMarkup(
       createElement(RecoveryCockpit, {
