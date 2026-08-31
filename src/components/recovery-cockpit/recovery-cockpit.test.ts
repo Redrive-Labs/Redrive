@@ -73,6 +73,18 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).toContain("Recovery blocked");
     expect(html).toContain("PROVIDER_FAILED_RECEIVER_MUTATED");
     expect(html).toContain("Run isolated sandbox recovery");
+    expect(html).not.toContain("Investigate failure");
+  });
+
+  it("hands an investigated contradiction to the existing sandbox recovery action", () => {
+    const html = renderToStaticMarkup(
+      createElement(RecoveryCockpit, {
+        viewModel: model({ sandbox: { state: "NOT_STARTED" } }),
+      }),
+    );
+
+    expect(html).toContain("Start sandbox recovery");
+    expect(html).not.toContain("Investigate failure");
   });
 
   it("renders pending evidence without manufacturing permit surfaces", () => {
@@ -92,6 +104,7 @@ describe("RecoveryCockpit presentation states", () => {
     expect(html).not.toContain("Retry unsafe");
     expect(html).not.toContain("Deploy Permit");
     expect(html).not.toContain("Redrive Permit");
+    expect(html).toContain("Investigate failure");
   });
 
   it("formats the dossier timestamp in deterministic UTC", () => {

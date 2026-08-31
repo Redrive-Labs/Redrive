@@ -17,6 +17,23 @@ function formatPayload(payload: unknown): string {
   return JSON.stringify(payload, null, 2);
 }
 
+export async function fetchProviderEvidence(
+  incidentId: string,
+  request: typeof fetch = fetch,
+): Promise<ProviderEvidence | null> {
+  const response = await request(
+    `/api/incidents/${encodeURIComponent(incidentId)}/provider-evidence`,
+    { method: "GET", cache: "no-store" },
+  );
+  const result = (await response.json().catch(() => null)) as
+    | ProviderEvidenceResponse
+    | null;
+  if (!response.ok || result?.evidence === undefined) {
+    throw new Error(result?.error ?? "Provider evidence could not be loaded.");
+  }
+  return result.evidence ?? null;
+}
+
 export function ProviderEvidencePanel({
   incidentId,
   initialCaptured = false,
@@ -31,23 +48,11 @@ export function ProviderEvidencePanel({
     setIsLoading(true);
 
     try {
-      const response = await fetch(
-        `/api/incidents/${encodeURIComponent(incidentId)}/provider-evidence`,
-        { method: hasCaptured ? "GET" : "POST", cache: "no-store" },
-      );
-      const result = (await response.json().catch(() => null)) as
-        | ProviderEvidenceResponse
-        | null;
-
-      if (!response.ok || result?.evidence === undefined) {
-        setError(result?.error ?? "Provider evidence could not be loaded.");
-        return;
-      }
-
-      setEvidence(result.evidence ?? null);
-      setHasCaptured(result.evidence !== null);
-    } catch {
-      setError("Provider evidence could not be loaded. Try again.");
+      const capturedEvidence = await fetchProviderEvidence(incidentId);
+      setEvidence(capturedEvidence);
+      setHasCaptured(capturedEvidence !== null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Provider evidence could not be loaded. Try again.");
     } finally {
       setIsLoading(false);
     }
@@ -55,20 +60,17 @@ export function ProviderEvidencePanel({
 
   return (
     <div className="mt-5 min-w-0 max-w-full border-t border-[var(--line)] pt-4">
-      <button
+      {hasCaptured ? <button
         className="inline-flex min-h-10 items-center border border-[var(--ink)] px-3 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--ink)] transition-colors hover:bg-[var(--ink)] hover:text-[var(--paper-bright)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-wait disabled:opacity-60"
         disabled={isLoading}
         onClick={loadEvidence}
         type="button"
       >
-        {isLoading
-          ? hasCaptured
-            ? "Loading…"
-            : "Inspecting…"
-          : hasCaptured
-            ? "View captured evidence"
-            : "Inspect provider delivery"}
+        {isLoading ? "Loading…" : "View captured evidence"}
       </button>
+      : (
+        <p className="text-sm text-[var(--muted)]">Provider evidence has not been captured. Open the incident cockpit to investigate through TrueForge.</p>
+      )}
 
       {error ? (
         <p className="mt-3 text-sm text-[var(--accent-deep)]" role="alert">

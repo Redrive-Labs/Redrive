@@ -8,6 +8,7 @@ import { IncidentDossierHeader } from "./incident-dossier-header";
 import { RedrivePermitPanel } from "./redrive-permit-panel";
 import { RecoveryReceipt } from "./recovery-receipt";
 import { RecoverySpine } from "./recovery-spine";
+import { investigateIncident } from "../incident-investigation-client";
 import type { RecoveryAction, RecoveryCockpitViewModel } from "./types";
 
 export interface RecoveryCockpitProps {
@@ -159,6 +160,8 @@ export function RecoveryCockpit({
 }: RecoveryCockpitProps) {
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [investigationPending, setInvestigationPending] = useState(false);
+  const [investigationError, setInvestigationError] = useState<string | null>(null);
   const basePath = `/api/incidents/${encodeURIComponent(viewModel.incident.id)}/recovery`;
 
   async function post(path: string, body?: Record<string, string>) {
@@ -181,6 +184,18 @@ export function RecoveryCockpit({
     }
   }
 
+  async function investigateProvider(): Promise<void> {
+    setInvestigationPending(true);
+    setInvestigationError(null);
+    try {
+      await investigateIncident(viewModel.incident.id, fetch, () => window.location.reload());
+    } catch (reason) {
+      setInvestigationError(reason instanceof Error ? reason.message : "Provider investigation failed. Try again.");
+    } finally {
+      setInvestigationPending(false);
+    }
+  }
+
   const startRecovery = onStartRecovery ?? (() => post("sandbox"));
   const approveDeployment = onApproveDeployment ?? (() => {
     if (!viewModel.deployment?.fingerprint) throw new Error("Deployment fingerprint is unavailable.");
@@ -200,7 +215,13 @@ export function RecoveryCockpit({
   });
 
   const contradictionEstablished =
-    viewModel.assessment?.contradiction === "PROVIDER_FAILED_RECEIVER_MUTATED";
+    viewModel.assessment?.contradiction === "PROVIDER_FAILED_RECEIVER_MUTATED" &&
+    viewModel.provider?.observed === true &&
+    viewModel.provider.statusCode === 500 &&
+    viewModel.receiver?.observed === true &&
+    viewModel.receiver.mutationCount === 1 &&
+    viewModel.receiver.businessState === "EXACTLY_ONE";
+  const investigationRequired = !contradictionEstablished;
   const canStart = contradictionEstablished && viewModel.sandbox?.state === "NOT_STARTED";
   const canDeploy = viewModel.deployment?.state === "APPROVED";
   const canRedrive = viewModel.redrive?.state === "APPROVED";
@@ -208,6 +229,19 @@ export function RecoveryCockpit({
   return (
     <article className="recovery-cockpit" id="incident-cockpit" aria-label="Recovery cockpit">
       <IncidentDossierHeader incident={viewModel.incident} status={currentStatus(viewModel)} />
+      {investigationRequired ? (
+        <section className="investigation-action" aria-labelledby="investigation-action-title">
+          <div>
+            <p className="section-kicker">Authoritative investigation</p>
+            <h2 id="investigation-action-title">Provider and receiver evidence required.</h2>
+            <p>Run the persisted incident through TrueForge to establish whether the failed delivery already mutated receiver state.</p>
+          </div>
+          <button className="stage-action" disabled={investigationPending} onClick={() => void investigateProvider()} type="button">
+            {investigationPending ? "Investigating through TrueForge…" : "Investigate failure"}
+          </button>
+          {investigationError ? <p className="recovery-action-error" role="alert">{investigationError}</p> : null}
+        </section>
+      ) : null}
       <ContradictionPanel assessment={viewModel.assessment} provider={viewModel.provider} receiver={viewModel.receiver} />
       <ActiveProofPanel viewModel={viewModel} />
       {actionError ? <p className="recovery-action-error" role="alert">{actionError}</p> : null}

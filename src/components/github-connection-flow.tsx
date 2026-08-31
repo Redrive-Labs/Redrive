@@ -1,6 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  createLatestRequestOrchestrator,
+  createIncidentFromDelivery,
+  fetchFailedDeliveries,
+  incidentCockpitHref,
+  type FailedDelivery,
+} from "./incident-investigation-client";
+import { FailedDeliveryList } from "./failed-delivery-list";
 
 interface RepositoryChoice {
   id: string;
@@ -125,6 +133,16 @@ export function GithubConnectionFlow() {
   // a status response after a refresh.
   const [enrollmentToken, setEnrollmentToken] = useState<string | null>(null);
   const [enrollmentExpiresAt, setEnrollmentExpiresAt] = useState<string | null>(null);
+  const [failedDeliveries, setFailedDeliveries] = useState<FailedDelivery[]>([]);
+  const [deliveriesConnectionId, setDeliveriesConnectionId] = useState<string | null>(null);
+  const [deliveriesLoading, setDeliveriesLoading] = useState(false);
+  const [deliveriesError, setDeliveriesError] = useState<string | null>(null);
+  const [creatingIncidentFor, setCreatingIncidentFor] = useState<string | null>(null);
+  const deliveryRequestOrchestrator = useRef(
+    createLatestRequestOrchestrator<FailedDelivery[]>((connectionId, signal) =>
+      fetchFailedDeliveries(connectionId, fetch, signal),
+    ),
+  );
   const webhookRequestGeneration = useRef(0);
   const activeWebhookSelection = useRef<{ installationId: string | null; repositoryId: string }>({
     installationId: null,
@@ -361,6 +379,10 @@ export function GithubConnectionFlow() {
       const connection = result.connection;
       setConnected(connection);
       setActiveConnectionId(connection.id);
+      setFailedDeliveries([]);
+      setDeliveriesConnectionId(null);
+      setDeliveriesError(null);
+      setCreatingIncidentFor(null);
       setEnrollmentToken(null);
       setEnrollmentExpiresAt(null);
       await loadConnections();
@@ -385,6 +407,10 @@ export function GithubConnectionFlow() {
     setEnrollmentToken(null);
     setEnrollmentExpiresAt(null);
     setError(null);
+    setFailedDeliveries([]);
+    setDeliveriesConnectionId(null);
+    setDeliveriesError(null);
+    setCreatingIncidentFor(null);
   }
 
   const activeConnection =
@@ -397,6 +423,58 @@ export function GithubConnectionFlow() {
   const receiverConnection = activeStatus?.receiverConnection ?? null;
   const githubReady = activeStatus?.githubReady ?? activeConnection?.state === "READY";
   const recoveryReady = activeStatus?.recoveryReady ?? false;
+
+  useEffect(() => {
+    const requestOrchestrator = deliveryRequestOrchestrator.current;
+    const connectionId = activeConnectionId;
+    if (connectionId === null || !githubReady || !recoveryReady) {
+      requestOrchestrator.invalidate();
+      return;
+    }
+
+    let disposed = false;
+    const loadDeliveries = async () => {
+      try {
+        const result = await requestOrchestrator.run(connectionId);
+        if (!disposed && result.current && result.value !== undefined) {
+          setFailedDeliveries(result.value);
+          setDeliveriesConnectionId(connectionId);
+        }
+      } catch (reason: unknown) {
+        if (disposed || (reason instanceof DOMException && reason.name === "AbortError")) return;
+        setDeliveriesError(reason instanceof Error ? reason.message : "Failed deliveries could not be loaded.");
+      } finally {
+        if (!disposed) setDeliveriesLoading(false);
+      }
+    };
+    queueMicrotask(() => {
+      if (disposed) return;
+      setDeliveriesLoading(true);
+      setDeliveriesError(null);
+      setFailedDeliveries([]);
+      setDeliveriesConnectionId(null);
+      void loadDeliveries();
+    });
+
+    return () => {
+      disposed = true;
+      requestOrchestrator.invalidate();
+    };
+  }, [activeConnectionId, githubReady, recoveryReady]);
+
+  async function handleDeliverySelection(deliveryId: string): Promise<void> {
+    if (activeConnectionId === null) return;
+    setCreatingIncidentFor(deliveryId);
+    setDeliveriesError(null);
+    try {
+      const incidentId = await createIncidentFromDelivery(activeConnectionId, deliveryId);
+      window.location.assign(incidentCockpitHref(incidentId));
+    } catch (reason) {
+      setDeliveriesError(reason instanceof Error ? reason.message : "The incident could not be recorded.");
+    } finally {
+      setCreatingIncidentFor(null);
+    }
+  }
 
   return (
     <section className="border-b border-[var(--line)] py-10" id="github-connection">
@@ -490,10 +568,21 @@ export function GithubConnectionFlow() {
           {receiverConnection?.state === "WAITING_FOR_RECEIVER" && enrollmentToken !== null ? (
             <div className="mt-5 border border-[var(--accent)] bg-[var(--accent-wash)] p-4">
               <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--accent-deep)]">One-time enrollment token</p>
-              <p className="mt-2 text-sm leading-6">Run the Redrive connector with this token. The connector package and final command are not published in this slice.</p>
-              <code className="mt-3 block overflow-x-auto border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs text-[var(--ink)]">{enrollmentToken}</code>
+              <p className="mt-2 text-sm leading-6">Copy this token into the connector command below. It is shown only from the issuance response and only for this browser session.</p>
+              <code className="mt-3 block max-w-full overflow-x-auto border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5 text-[var(--ink)]">{enrollmentToken}</code>
+              <p className="mt-4 text-sm leading-6">From the Redrive repository, run the receiver connector with the copied token:</p>
+              <pre className="mt-3 max-w-full overflow-x-auto border border-[var(--line)] bg-[var(--paper-bright)] p-3 text-xs leading-5 text-[var(--ink)]"><code>{[
+                "cd receiver-connector",
+                "npm ci",
+                "export REDRIVE_URL=http://127.0.0.1:3001",
+                "export REDRIVE_ENROLLMENT_TOKEN=<one-time-token-from-redrive>",
+                "export REDRIVE_OBSERVER_DATABASE_URL=postgresql://receiver:receiver_dev_password@127.0.0.1:5434/receiver",
+                "export REDRIVE_RECEIVER_HEALTH_URL=http://127.0.0.1:3000/health",
+                'export REDRIVE_CONNECTOR_STATE_DIR="$PWD/.local/state"',
+                "npm run receiver-connector",
+              ].join("\n")}</code></pre>
               <p className="mt-3 text-xs text-[var(--muted)]">
-                Shown only from the issuance response and only for this browser session. Refreshing will not recover it.
+                Refreshing will not recover the token.
                 {enrollmentExpiresAt ? ` Expires ${new Date(enrollmentExpiresAt).toLocaleString()}.` : ""}
               </p>
             </div>
@@ -520,6 +609,30 @@ export function GithubConnectionFlow() {
             >
               {enrollmentAction === "ISSUE" ? "Issuing enrollment…" : enrollmentAction === "REISSUE" ? "Reissuing enrollment…" : receiverConnection === null ? "Issue enrollment" : "Reissue enrollment"}
             </button>
+          ) : null}
+
+          {recoveryReady ? (
+            <section className="mt-8 border-t border-[var(--line)] pt-6" aria-labelledby="failed-deliveries-title">
+              <div className="flex flex-wrap items-baseline justify-between gap-3">
+                <div>
+                  <p className="mono-type text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">Failed deliveries</p>
+                  <h4 className="display-type mt-1 text-2xl leading-none" id="failed-deliveries-title">Choose a delivery to investigate.</h4>
+                </div>
+                <span className="mono-type text-xs text-[var(--muted)]">GitHub MCP</span>
+              </div>
+              {deliveriesLoading ? <p className="mt-4 text-sm text-[var(--muted)]" role="status">Loading failed deliveries…</p> : null}
+              {deliveriesError ? <p className="mt-4 text-sm text-[var(--accent-deep)]" role="alert">{deliveriesError}</p> : null}
+              {deliveriesConnectionId === activeConnectionId && !deliveriesLoading && deliveriesError === null && failedDeliveries.length === 0 ? (
+                <p className="mt-4 text-sm text-[var(--muted)]">No failed deliveries are available for this connection.</p>
+              ) : null}
+              {deliveriesConnectionId === activeConnectionId && !deliveriesLoading && deliveriesError === null && failedDeliveries.length > 0 ? (
+                <FailedDeliveryList
+                  creatingIncidentFor={creatingIncidentFor}
+                  deliveries={failedDeliveries}
+                  onSelect={(deliveryId) => void handleDeliverySelection(deliveryId)}
+                />
+              ) : null}
+            </section>
           ) : null}
         </div>
       ) : null}
