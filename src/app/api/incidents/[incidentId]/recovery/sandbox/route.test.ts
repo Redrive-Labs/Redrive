@@ -3,13 +3,13 @@ import {
   RecoverySandboxAttemptStateError,
   RecoverySandboxPrerequisiteError,
   startSandboxRecovery,
-} from "@/server/recovery-sandbox-service";
+} from "@/server/recovery/recovery-sandbox-service";
 import { POST } from "@/app/api/incidents/[incidentId]/recovery/sandbox/route";
 
-vi.mock("@/server/recovery-sandbox-service", async () => {
+vi.mock("@/server/recovery/recovery-sandbox-service", async () => {
   const actual = await vi.importActual<
-    typeof import("@/server/recovery-sandbox-service")
-  >("@/server/recovery-sandbox-service");
+    typeof import("@/server/recovery/recovery-sandbox-service")
+  >("@/server/recovery/recovery-sandbox-service");
   return { ...actual, startSandboxRecovery: vi.fn() };
 });
 

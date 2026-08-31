@@ -8,13 +8,13 @@ const mocks = vi.hoisted(() => ({
   buildRecoveryCockpitViewModel: vi.fn(),
 }));
 
-vi.mock("@/server/incident-service", () => ({
+vi.mock("@/server/incidents/incident-service", () => ({
   listIncidents: mocks.listIncidents,
 }));
-vi.mock("@/server/provider-evidence-service", () => ({
+vi.mock("@/server/incidents/provider-evidence-service", () => ({
   getProviderEvidenceCaptureStatus: mocks.getProviderEvidenceCaptureStatus,
 }));
-vi.mock("@/server/recovery-cockpit-view-model", () => ({
+vi.mock("@/server/recovery/recovery-cockpit-view-model", () => ({
   buildRecoveryCockpitViewModel: mocks.buildRecoveryCockpitViewModel,
 }));
 
@@ -41,20 +41,22 @@ const incidents = [
   },
 ];
 
-function findPanels(value: unknown): Array<Record<string, unknown>> {
+function findElements(
+  value: unknown,
+  type: ReactElement["type"],
+): Array<Record<string, unknown>> {
   if (Array.isArray(value)) {
-    return value.flatMap(findPanels);
+    return value.flatMap((child) => findElements(child, type));
   }
   if (value === null || typeof value !== "object") {
     return [];
   }
 
   const element = value as ReactElement<{ children?: unknown }>;
-  if (element.type === ProviderEvidencePanel) {
-    return [element.props as Record<string, unknown>];
-  }
-
-  return findPanels(element.props?.children);
+  const matches = element.type === type
+    ? [element.props as Record<string, unknown>]
+    : [];
+  return [...matches, ...findElements(element.props?.children, type)];
 }
 
 describe("homepage evidence loading", () => {
@@ -85,9 +87,25 @@ describe("homepage evidence loading", () => {
     ]);
     expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledTimes(1);
     expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledWith(incidents[0]);
-    expect(findPanels(page).map((props) => props.initialCaptured)).toEqual([
-      true,
-      false,
+    expect(
+      findElements(page, ProviderEvidencePanel).map((props) => props.initialCaptured),
+    ).toEqual([true, false]);
+    expect(
+      findElements(page, "a")
+        .map((props) => props.href)
+        .filter((href) => typeof href === "string" && href.includes("incidentId=")),
+    ).toEqual([
+      "/?incidentId=incident-1#incident-cockpit",
+      "/?incidentId=incident-2#incident-cockpit",
     ]);
+  });
+
+  it("builds the primary cockpit for the incident selected through the index", async () => {
+    await Home({
+      searchParams: Promise.resolve({ incidentId: "incident-2" }),
+    });
+
+    expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledTimes(1);
+    expect(mocks.buildRecoveryCockpitViewModel).toHaveBeenCalledWith(incidents[1]);
   });
 });

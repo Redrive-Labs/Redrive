@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getServerConfig, getRequiredRedrivePublicUrl, ServerConfigurationError } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { getGithubAppRegistration, createInstallationAttempt } from "@/server/github-app-service";
+import { getServerConfig, getRequiredRedrivePublicUrl, ServerConfigurationError } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { getGithubAppRegistration, createInstallationAttempt } from "@/server/github/github-app-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

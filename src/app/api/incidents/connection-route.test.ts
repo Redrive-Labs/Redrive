@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { closeConfiguredDatabase, openDatabase } from "@/server/database";
+import { closeConfiguredDatabase, openDatabase } from "@/server/infrastructure/database";
 import { POST } from "./route";
 
 describe("legacy incident route", () => {

@@ -1,18 +1,18 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createReceiverConnectorAuthService } from "@/server/receiver-connection-service";
-import { createReceiverReadJobTransportService } from "@/server/receiver-read-job-service";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createReceiverConnectorAuthService } from "@/server/receiver/receiver-connection-service";
+import { createReceiverReadJobTransportService } from "@/server/receiver/receiver-read-job-service";
 import {
   boundedPoll,
   RECEIVER_CONNECTOR_LONG_POLL_INTERVAL_MS,
   RECEIVER_CONNECTOR_LONG_POLL_MAX_MS,
-} from "@/server/receiver-bounded-poll";
+} from "@/server/receiver/receiver-bounded-poll";
 import {
   readReceiverConnectorCredentials,
   receiverErrorResponse,
   toReceiverLeasedJob,
-} from "@/server/receiver-route-utils";
+} from "@/server/receiver/receiver-route-utils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

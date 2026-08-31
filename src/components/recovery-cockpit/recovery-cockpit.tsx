@@ -206,7 +206,7 @@ export function RecoveryCockpit({
   const canRedrive = viewModel.redrive?.state === "APPROVED";
 
   return (
-    <article className="recovery-cockpit" aria-label="Recovery cockpit">
+    <article className="recovery-cockpit" id="incident-cockpit" aria-label="Recovery cockpit">
       <IncidentDossierHeader incident={viewModel.incident} status={currentStatus(viewModel)} />
       <ContradictionPanel assessment={viewModel.assessment} provider={viewModel.provider} receiver={viewModel.receiver} />
       <ActiveProofPanel viewModel={viewModel} />

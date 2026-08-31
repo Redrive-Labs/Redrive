@@ -3,7 +3,7 @@ import { NextRequest } from "next/server";
 import {
   createOperatorSession,
   OPERATOR_SESSION_COOKIE,
-} from "@/server/operator-auth";
+} from "@/server/auth/operator-auth";
 import proxy from "./proxy";
 
 

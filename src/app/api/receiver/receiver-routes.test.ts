@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOperatorSession } from "@/server/operator-auth";
+import { createOperatorSession } from "@/server/auth/operator-auth";
 import {
   RECEIVER_CAPABILITIES,
   RECEIVER_CAPABILITY_BUSINESS_STATE,
@@ -33,18 +33,18 @@ const mocks = vi.hoisted(() => ({
   createJobsService: vi.fn(),
 }));
 
-vi.mock("@/server/config", async () => {
-  const actual = await vi.importActual<typeof import("@/server/config")>("@/server/config");
+vi.mock("@/server/infrastructure/config", async () => {
+  const actual = await vi.importActual<typeof import("@/server/infrastructure/config")>("@/server/infrastructure/config");
   return { ...actual, getServerConfig: mocks.config };
 });
-vi.mock("@/server/database", () => ({
+vi.mock("@/server/infrastructure/database", () => ({
   getConfiguredDatabase: vi.fn(() => mocks.database),
 }));
-vi.mock("@/server/github-connection-service", () => ({
+vi.mock("@/server/github/github-connection-service", () => ({
   getApplicationConnection: mocks.applicationConnection,
 }));
-vi.mock("@/server/receiver-connection-service", async () => {
-  const actual = await vi.importActual<typeof import("@/server/receiver-connection-service")>("@/server/receiver-connection-service");
+vi.mock("@/server/receiver/receiver-connection-service", async () => {
+  const actual = await vi.importActual<typeof import("@/server/receiver/receiver-connection-service")>("@/server/receiver/receiver-connection-service");
   return {
     ...actual,
     getReceiverConnectionForApplication: mocks.receiverForApplication,
@@ -52,8 +52,8 @@ vi.mock("@/server/receiver-connection-service", async () => {
     createReceiverConnectorAuthService: mocks.createAuthService,
   };
 });
-vi.mock("@/server/receiver-read-job-service", async () => {
-  const actual = await vi.importActual<typeof import("@/server/receiver-read-job-service")>("@/server/receiver-read-job-service");
+vi.mock("@/server/receiver/receiver-read-job-service", async () => {
+  const actual = await vi.importActual<typeof import("@/server/receiver/receiver-read-job-service")>("@/server/receiver/receiver-read-job-service");
   return {
     ...actual,
     createReceiverReadJobTransportService: mocks.createJobsService,
@@ -68,10 +68,10 @@ import { POST as postComplete } from "@/app/api/receiver/jobs/[jobId]/complete/r
 import {
   ReceiverConnectionError,
   ReceiverConnectorAuthenticationError,
-} from "@/server/receiver-connection-service";
+} from "@/server/receiver/receiver-connection-service";
 import {
   ReceiverReadJobError,
-} from "@/server/receiver-read-job-service";
+} from "@/server/receiver/receiver-read-job-service";
 import { ReceiverConnectorValidationError } from "@/domain/receiver-connector";
 
 const operatorToken = "operator-token-that-is-at-least-32-characters";

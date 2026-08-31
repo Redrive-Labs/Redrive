@@ -3,19 +3,27 @@ import { formatUtcTimestamp } from "@/components/recovery-cockpit/format-utc";
 import { GithubConnectionFlow } from "@/components/github-connection-flow";
 import { ProviderEvidencePanel } from "@/components/provider-evidence-panel";
 import { RecoveryCockpit } from "@/components/recovery-cockpit/recovery-cockpit";
-import { buildRecoveryCockpitViewModel } from "@/server/recovery-cockpit-view-model";
-import { listIncidents } from "@/server/incident-service";
-import { getProviderEvidenceCaptureStatus } from "@/server/provider-evidence-service";
+import { buildRecoveryCockpitViewModel } from "@/server/recovery/recovery-cockpit-view-model";
+import { listIncidents } from "@/server/incidents/incident-service";
+import { getProviderEvidenceCaptureStatus } from "@/server/incidents/provider-evidence-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export default async function Home() {
+interface HomeProps {
+  searchParams?: Promise<{ incidentId?: string | string[] }>;
+}
+
+export default async function Home({ searchParams }: HomeProps = {}) {
   const incidents = await listIncidents();
   const capturedIncidentIds = await getProviderEvidenceCaptureStatus(
     incidents.map((incident) => incident.id),
   );
-  const selectedIncident = incidents[0];
+  const requestedIncidentId = (await searchParams)?.incidentId;
+  const selectedIncident =
+    (typeof requestedIncidentId === "string"
+      ? incidents.find((incident) => incident.id === requestedIncidentId)
+      : undefined) ?? incidents[0];
   const selectedViewModel = selectedIncident
     ? await buildRecoveryCockpitViewModel(selectedIncident)
     : null;
@@ -78,6 +86,14 @@ export default async function Home() {
                     {capturedIncidentIds.has(incident.id) ? "Evidence captured" : "Evidence pending"}
                     <span aria-hidden="true"> · </span>Recovery pending
                   </p>
+                  <a
+                    aria-current={selectedIncident?.id === incident.id ? "true" : undefined}
+                    className="incident-row__open"
+                    href={`/?incidentId=${encodeURIComponent(incident.id)}#incident-cockpit`}
+                  >
+                    {selectedIncident?.id === incident.id ? "Cockpit open" : "Open cockpit"}
+                    <span aria-hidden="true"> →</span>
+                  </a>
                   <ProviderEvidencePanel
                     incidentId={incident.id}
                     initialCaptured={capturedIncidentIds.has(incident.id)}

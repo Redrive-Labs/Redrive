@@ -2,21 +2,21 @@ import { describe, expect, it, vi } from "vitest";
 import {
   IncidentNotFoundError,
   ProviderEvidenceConflictError,
-} from "@/server/provider-evidence-service";
+} from "@/server/incidents/provider-evidence-service";
 import {
   ProviderInvestigationEvidenceError,
   ProviderInvestigationTurnError,
-} from "@/server/provider-investigation-service";
-import { investigateIncidentForRecovery } from "@/server/incident-investigation-service";
-import { TrueForgeSessionUnavailableError } from "@/server/trueforge-session-service";
+} from "@/server/incidents/provider-investigation-service";
+import { investigateIncidentForRecovery } from "@/server/incidents/incident-investigation-service";
+import { TrueForgeSessionUnavailableError } from "@/server/trueforge/trueforge-session-service";
 import { POST } from "@/app/api/incidents/[incidentId]/provider-investigation/route";
 import { RecoveryCoordinatorConfigurationError } from "@/agents/recovery-coordinator";
-import { TrueForgeSessionCreateError } from "@/server/trueforge-client";
+import { TrueForgeSessionCreateError } from "@/server/trueforge/trueforge-client";
 
-vi.mock("@/server/incident-investigation-service", async () => {
+vi.mock("@/server/incidents/incident-investigation-service", async () => {
   const actual = await vi.importActual<
-    typeof import("@/server/incident-investigation-service")
-  >("@/server/incident-investigation-service");
+    typeof import("@/server/incidents/incident-investigation-service")
+  >("@/server/incidents/incident-investigation-service");
   return {
     ...actual,
     investigateIncidentForRecovery: vi.fn(),

@@ -2,18 +2,18 @@ import { NextResponse } from "next/server";
 import { GithubIntegrationValidationError } from "@/domain/github-integration";
 import {
   createManifestAttempt,
-} from "@/server/github-app-service";
+} from "@/server/github/github-app-service";
 import {
   getRequiredRedrivePublicUrl,
   getServerConfig,
   ServerConfigurationError,
-} from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
+} from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
 import {
   GithubRouteBodyError,
   readBoundedBody,
-} from "@/server/github-route-utils";
-import { MAX_MANIFEST_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
+} from "@/server/github/github-route-utils";
+import { MAX_MANIFEST_REQUEST_BODY_BYTES } from "@/server/infrastructure/request-body-limits";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

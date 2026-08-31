@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   isValidOperatorSession,
   OPERATOR_SESSION_COOKIE,
-} from "@/server/operator-auth";
+} from "@/server/auth/operator-auth";
 
 const PUBLIC_PATHS = new Set([
   "/login",

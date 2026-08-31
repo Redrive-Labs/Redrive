@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import {
   OPERATOR_SESSION_COOKIE,
   shouldUseSecureOperatorCookie,
-} from "@/server/operator-auth";
+} from "@/server/auth/operator-auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

@@ -8,8 +8,8 @@ import {
 import {
   GithubDeliveryNormalizationError,
   normalizeGithubWebhookDelivery,
-} from "@/server/github-provider-evidence";
-import type { GithubWebhookDeliveryLookup } from "@/server/github-mcp";
+} from "@/server/github/github-provider-evidence";
+import type { GithubWebhookDeliveryLookup } from "@/server/github/github-mcp";
 
 const lookup: GithubWebhookDeliveryLookup = {
   repositoryId: "example/receiver",

@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   closeConfiguredDatabase,
   openDatabase,
-} from "@/server/database";
+} from "@/server/infrastructure/database";
 import { POST } from "./route";
-import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
+import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/infrastructure/request-body-limits";
 import { GET as GETProviderEvidence } from "./[incidentId]/provider-evidence/route";
 
 describe("incident route", () => {

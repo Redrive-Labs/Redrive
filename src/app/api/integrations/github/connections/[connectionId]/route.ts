@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
-import { getServerConfig } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { getApplicationConnection } from "@/server/github-connection-service";
-import { getInstallation } from "@/server/github-app-service";
+import { getServerConfig } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { getApplicationConnection } from "@/server/github/github-connection-service";
+import { getInstallation } from "@/server/github/github-app-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

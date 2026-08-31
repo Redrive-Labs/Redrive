@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/operator-auth";
+import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/auth/operator-auth";
 
 const mocks = vi.hoisted(() => ({
   config: vi.fn(() => ({ databasePath: "/tmp/redrive-receiver-mcp.sqlite" })),
@@ -12,15 +12,15 @@ const mocks = vi.hoisted(() => ({
   getApplicationConnection: vi.fn(),
 }));
 
-vi.mock("@/server/config", () => ({ getServerConfig: mocks.config }));
-vi.mock("@/server/database", () => ({ getConfiguredDatabase: mocks.getConfiguredDatabase }));
-vi.mock("@/server/github-connection-service", () => ({
+vi.mock("@/server/infrastructure/config", () => ({ getServerConfig: mocks.config }));
+vi.mock("@/server/infrastructure/database", () => ({ getConfiguredDatabase: mocks.getConfiguredDatabase }));
+vi.mock("@/server/github/github-connection-service", () => ({
   getApplicationConnection: mocks.getApplicationConnection,
 }));
-vi.mock("@/server/receiver-connection-service", () => ({
+vi.mock("@/server/receiver/receiver-connection-service", () => ({
   createReceiverConnectionService: mocks.createConnectionService,
 }));
-vi.mock("@/server/receiver-read-job-service", () => ({
+vi.mock("@/server/receiver/receiver-read-job-service", () => ({
   createReceiverReadJobTransportService: mocks.createJobService,
 }));
 

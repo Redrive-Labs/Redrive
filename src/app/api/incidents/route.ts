@@ -3,8 +3,8 @@ import { IncidentValidationError } from "@/domain/incident";
 import {
   createIncident,
   listIncidents,
-} from "@/server/incident-service";
-import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/request-body-limits";
+} from "@/server/incidents/incident-service";
+import { MAX_INCIDENT_REQUEST_BODY_BYTES } from "@/server/infrastructure/request-body-limits";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

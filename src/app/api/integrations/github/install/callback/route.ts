@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
-import { getRequiredRedrivePublicUrl, getServerConfig, ServerConfigurationError } from "@/server/config";
-import { getConfiguredDatabase } from "@/server/database";
-import { createGithubApi } from "@/server/github-rest";
+import { getRequiredRedrivePublicUrl, getServerConfig, ServerConfigurationError } from "@/server/infrastructure/config";
+import { getConfiguredDatabase } from "@/server/infrastructure/database";
+import { createGithubApi } from "@/server/github/github-rest";
 import {
   FilesystemSecretStore,
-} from "@/server/secret-store";
+} from "@/server/infrastructure/secret-store";
 import {
   GithubInstallationVerificationError,
   verifyAndPersistGithubInstallation,
-} from "@/server/github-installation-service";
+} from "@/server/github/github-installation-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/operator-auth";
+import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/auth/operator-auth";
 
 const mocks = vi.hoisted(() => ({
   deliveryService: {
@@ -12,13 +12,13 @@ const mocks = vi.hoisted(() => ({
   secretStore: vi.fn(),
 }));
 
-vi.mock("@/server/config", () => ({ getServerConfig: mocks.getServerConfig }));
-vi.mock("@/server/database", () => ({ getConfiguredDatabase: mocks.getConfiguredDatabase }));
-vi.mock("@/server/github-rest", () => ({ createGithubApi: mocks.createGithubApi }));
-vi.mock("@/server/github-delivery-service", () => ({
+vi.mock("@/server/infrastructure/config", () => ({ getServerConfig: mocks.getServerConfig }));
+vi.mock("@/server/infrastructure/database", () => ({ getConfiguredDatabase: mocks.getConfiguredDatabase }));
+vi.mock("@/server/github/github-rest", () => ({ createGithubApi: mocks.createGithubApi }));
+vi.mock("@/server/github/github-delivery-service", () => ({
   createGithubDeliveryService: mocks.createGithubDeliveryService,
 }));
-vi.mock("@/server/secret-store", () => ({
+vi.mock("@/server/infrastructure/secret-store", () => ({
   FilesystemSecretStore: mocks.secretStore,
 }));
 

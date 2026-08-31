@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/operator-auth";
+import { createOperatorSession, OPERATOR_SESSION_COOKIE } from "@/server/auth/operator-auth";
 const mocks = vi.hoisted(() => ({
   getStatus: vi.fn(),
   approve: vi.fn(),
   deploy: vi.fn(),
 }));
 
-vi.mock("@/server/recovery-deployment-service", async () => {
-  const actual = await vi.importActual<typeof import("@/server/recovery-deployment-service")>(
-    "@/server/recovery-deployment-service",
+vi.mock("@/server/recovery/recovery-deployment-service", async () => {
+  const actual = await vi.importActual<typeof import("@/server/recovery/recovery-deployment-service")>(
+    "@/server/recovery/recovery-deployment-service",
   );
   return {
     ...actual,

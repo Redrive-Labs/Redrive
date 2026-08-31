@@ -7,11 +7,11 @@ import {
   RecoverySandboxSessionError,
   RecoverySandboxTurnError,
   startSandboxRecovery,
-} from "@/server/recovery-sandbox-service";
+} from "@/server/recovery/recovery-sandbox-service";
 import {
   TrueForgeConfigurationError,
   TrueForgeSessionCreateError,
-} from "@/server/trueforge-client";
+} from "@/server/trueforge/trueforge-client";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
