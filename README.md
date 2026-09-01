@@ -4,9 +4,9 @@
 
 Redrive is a proof-gated recovery control plane for ambiguous webhook failures.
 
-When GitHub reports a failed delivery, Redrive does not jump straight to replay. It asks two independent questions first: what did GitHub observe, and what did the receiver actually do? TrueForge investigators collect those facts through narrow MCP boundaries. Redrive then compares them with deterministic code. If the receiver already mutated business state, replay stays blocked.
+When GitHub reports a failed delivery, Redrive first asks two separate questions: what did GitHub observe, and what did the receiver actually do? TrueForge investigators collect those observations through narrow MCP boundaries. Redrive compares them with deterministic code. If the receiver already mutated business state, replay stays blocked.
 
-If repair is needed, Redrive reproduces the failure at the exact failing revision in an isolated Daytona sandbox, verifies the candidate against the business invariant, and keeps deployment and redelivery behind separate human permits.
+If repair is needed, Redrive reproduces the failure at the exact failing revision in a Daytona sandbox, verifies the repair against the business invariant, and keeps deployment and redelivery behind separate human permits.
 
 **[Watch the demo](https://youtu.be/DMn5PX3MuEs)** · **[Demo receiver](https://github.com/Redrive-Labs/redrive-demo-receiver)** · **[Architecture notes](docs/ARCHITECTURE.md)**
 
@@ -25,9 +25,7 @@ GitHub sees:     HTTP 500
 Receiver state: mutationCount = 1 / EXACTLY_ONE
 ```
 
-Retrying that delivery blindly can duplicate the mutation.
-
-Redrive's rule is simple:
+Blindly retrying that delivery can duplicate the mutation.
 
 > **No proof, no retry.**
 
@@ -64,9 +62,56 @@ The investigators collect observations. The contradiction itself is not an LLM j
 
 ---
 
-## What stands apart
+## The product flow
 
-Redrive is deliberately not a generic incident chatbot.
+Once setup is complete, the whole incident path runs through the Redrive UI:
+
+```text
+GitHub READY
+Receiver READY
+Application RECOVERY READY
+        ↓
+failed GitHub delivery appears
+        ↓
+Investigate delivery
+        ↓
+persisted incident cockpit
+        ↓
+Investigate failure
+        ↓
+TrueForge Coordinator
+  ├─ Provider Investigator → GitHub MCP
+  └─ Receiver Investigator → Receiver MCP
+        ↓
+HTTP 500 + EXACTLY_ONE
+        ↓
+PROVIDER_FAILED_RECEIVER_MUTATED
+RETRY UNSAFE / BLOCKED
+        ↓
+Start sandbox recovery
+        ↓
+Daytona reproduce → repair → verify
+        ↓
+REPAIR_VERIFIED
+        ↓
+DeployPermit + human approval
+        ↓
+Execute approved deployment
+        ↓
+independent deployment verification
+        ↓
+RedrivePermit + human approval
+        ↓
+Execute one GitHub redelivery
+        ↓
+independent final observation
+```
+
+The shell helpers under `scripts/` are development conveniences. They are not required to run the product flow above.
+
+---
+
+## What Redrive does differently
 
 | Question | Redrive's answer |
 |---|---|
@@ -77,30 +122,27 @@ Redrive is deliberately not a generic incident chatbot.
 | Is HTTP `2xx` enough after replay? | No. The business mutation must still exist exactly once. |
 | Can the repair agent deploy its own patch? | No. Deployment needs a separate permit and human approval. |
 | Does deployment approval authorize redelivery? | No. Redelivery has its own permit. |
-| What if a consequential action has an ambiguous result? | Redrive fences it instead of blindly repeating it. |
-
-The split is intentional:
+| What if an external action has an ambiguous result? | Redrive fences it instead of blindly repeating it. |
 
 > **AI reasons. Integrations observe. Deterministic code proves. Humans authorize.**
 
 ---
 
-## TrueForge is the runtime spine
+## TrueForge is the runtime
 
-TrueForge is not a decorative chat layer around Redrive. It runs the agent side of the system.
+TrueForge runs the agent side of Redrive. It owns the persistent incident session, dynamic investigators, MCP execution, Skills, persisted tool events, and the separate recovery session.
 
 | TrueForge capability | How Redrive uses it |
 |---|---|
-| **Persistent sessions** | One incident-bound Coordinator session survives investigation turns and Redrive restarts. |
-| **Dynamic subagents** | The Coordinator creates specialized Provider and Receiver Investigators. |
-| **MCP tools** | Investigators obtain real GitHub and receiver measurements through separate read-only boundaries. |
-| **Skills** | Investigation procedures are versioned as git-backed TrueForge Skills. |
-| **Persisted events** | Redrive correlates the exact child thread, tool call, `tool.response`, turn and session that produced evidence. |
-| **Sandbox support** | Agent work runs without handing production credentials to generated code. |
-| **Separate recovery session** | Repair work is isolated from the persistent incident-investigation session. |
-| **Execution provenance** | Session and turn identities are stored and surfaced in the cockpit. |
+| Persistent sessions | One incident-bound Coordinator session survives investigation turns and Redrive restarts. |
+| Dynamic subagents | The Coordinator creates Provider and Receiver Investigators. |
+| MCP tools | Investigators read real GitHub and receiver evidence through separate boundaries. |
+| Skills | Investigation procedures are versioned as git-backed TrueForge Skills. |
+| Persisted events | Redrive correlates the child thread, tool call, `tool.response`, turn, and session that produced evidence. |
+| Sandbox | Recovery runs in Daytona without provider, receiver, deployment, redelivery, or approval tools. |
+| Separate recovery session | Repair work is isolated from the persistent investigation session. |
 
-A key rule is that **agent prose is never evidence**.
+Agent prose is never accepted as evidence:
 
 ```text
 dynamic investigator
@@ -114,9 +156,15 @@ strict deterministic parser
 durable evidence
 ```
 
-If the intended thread, MCP server, tool, arguments or response cannot be correlated, the investigation fails closed.
+If the expected thread, MCP server, tool, arguments, or response cannot be correlated, the investigation fails closed.
 
-### The two MCP evidence boundaries
+### Durable investigation retries
+
+The UI action `Investigate failure` is protected by a durable SQLite investigation record. Provider and Receiver stages use persisted operation markers and TrueForge turn attribution.
+
+That means a refresh, concurrent request, lost HTTP response, or Redrive restart does not blindly create a second investigation chain. Redrive reuses completed evidence, reports in-progress work, reconciles ambiguous turn creation, and can resume the Receiver stage after a completed Provider stage.
+
+### MCP evidence boundaries
 
 TrueForge sees two separately authenticated Redrive MCP resources:
 
@@ -129,9 +177,9 @@ redrive-receiver
   get_receiver_health
 ```
 
-The Provider Investigator is expected to call only `get_webhook_delivery` for the supplied connection and delivery identity. The Receiver Investigator independently calls `get_business_state` for the supplied connection and delivery GUID.
+The Provider Investigator reads one delivery through the persisted GitHub ApplicationConnection. The Receiver Investigator independently reads business state for the same delivery GUID.
 
-This is role-separated evidence collection with deterministic attribution. Redrive does not rely on the model to remember which facts came from which side.
+The model does not choose arbitrary repositories, webhook IDs, SQL queries, shell commands, or production credentials.
 
 ---
 
@@ -174,29 +222,11 @@ flowchart TD
     REDRIVE --> FINAL["Independent final observation"]
 ```
 
-The important part is where trust changes hands, not how many agents appear in the diagram.
+The useful boundary is where trust changes hands. Agents collect and reason. Redrive decides from persisted evidence. Humans authorize production-changing actions.
 
 ---
 
-## Provider evidence
-
-The GitHub side exposes one narrow read operation:
-
-```text
-get_webhook_delivery(connection_id, delivery_id)
-```
-
-`connection_id` resolves the persisted GitHub App installation, repository and webhook inside Redrive. The model does not choose arbitrary repositories, hook IDs, API URLs or credentials.
-
-For the real contradiction run, GitHub reported:
-
-```text
-HTTP 500
-```
-
----
-
-## Receiver evidence
+## Receiver evidence stays narrow
 
 Receiver truth comes through a separately deployed outbound connector:
 
@@ -212,14 +242,14 @@ Receiver Connector
 Customer system
 ```
 
-The initial capability surface is intentionally small:
+The connector exposes only:
 
 ```text
 get_business_state(connection_id, delivery_guid)
 get_receiver_health(connection_id)
 ```
 
-The connector does not expose generic SQL, shell, SSH or arbitrary URL execution. Database credentials remain in the receiver environment.
+It does not expose generic SQL, shell, SSH, or arbitrary URL execution. The receiver database credentials stay in the receiver environment.
 
 For the canonical live observation:
 
@@ -228,7 +258,7 @@ mutationCount = 1
 businessState = EXACTLY_ONE
 ```
 
-The underlying business-row count stayed unchanged while Redrive observed it:
+The underlying row count stayed unchanged while Redrive observed it:
 
 ```text
 PRE   = 1
@@ -236,68 +266,25 @@ POST  = 1
 FINAL = 1
 ```
 
-Observation itself did not create another mutation.
-
 ---
 
-## The contradiction is deterministic
+## Recovery proves the repair
 
-The assessor combines the two accepted observations:
-
-```text
-provider failed
-+
-receiver mutationCount >= 1
-=
-PROVIDER_FAILED_RECEIVER_MUTATED
-```
-
-For our incident:
-
-```text
-Provider:  HTTP 500
-Receiver:  mutationCount = 1 / EXACTLY_ONE
-Result:    PROVIDER_FAILED_RECEIVER_MUTATED
-Recovery:  BLOCKED
-```
-
-At this point Redrive has repaired nothing. It has simply established enough reality to know that blind replay is unsafe.
-
----
-
-## Recovery starts from the exact failure
-
-Recovery runs in a separate TrueForge session backed by a Daytona sandbox.
-
-The recovery agent starts at the exact failing revision:
-
-```text
-5bfadf93d5233e4e6cfe0fdb19ad1b78328a5d79
-```
-
-Before changing code, it reproduces the incident:
+Recovery runs in a separate TrueForge session backed by Daytona. The recovery agent starts at the exact failing revision and first reproduces the incident:
 
 ```text
 0 → HTTP 500 → 1
 ```
 
-That means the sandbox began with zero matching business rows, the request failed, and one mutation nevertheless appeared.
+The demo receiver persists the event and then calls a downstream service with the wrong delivery field. The downstream contract expects `deliveryId`. The bad request fails after the database write, so GitHub sees `500` even though the mutation exists.
 
-The real bug was simple but dangerous: the receiver persisted the event and then called a downstream service with the wrong delivery field. The downstream contract expected `deliveryId`; the receiver sent the wrong key. The downstream call failed after the database write, so GitHub saw `500` even though the mutation already existed.
-
-The recovery agent diagnosed that path in the sandbox. It was not handed a canned patch.
-
-### Verification
-
-A candidate is not accepted because it compiles. Redrive sends the same logical delivery against the already-mutated sandbox state and checks the invariant again:
+A patch is not accepted just because it compiles. Redrive verifies the same logical delivery against the already-mutated sandbox state:
 
 ```text
 1 → HTTP 201 → 1
 ```
 
-The request now succeeds without increasing the mutation count.
-
-The accepted artifact recorded:
+The accepted recovery artifact from our validated run recorded:
 
 ```text
 State:        REPAIR_VERIFIED
@@ -312,17 +299,13 @@ Calling the recovery path again returned the same accepted TrueForge turn and pa
 
 ---
 
-## Human gates are separate on purpose
+## Deployment and redelivery need separate permits
 
-A verified repair is still not permission to mutate production.
+A verified repair is not permission to mutate the receiver.
 
-### DeployPermit
+A DeployPermit binds approval to one exact recovery candidate and fingerprint. After deployment, Redrive independently verifies receiver state and health before a RedrivePermit can become eligible.
 
-A DeployPermit authorizes one exact verified repair against one exact recovery state. Relevant state drift invalidates eligibility.
-
-### RedrivePermit
-
-Deployment approval does not authorize replay. Redrive first verifies the deployed receiver, then creates a separate RedrivePermit for the original delivery.
+A RedrivePermit authorizes exactly one GitHub redelivery of the original delivery.
 
 ```text
 repair verified
@@ -335,36 +318,22 @@ deploy + verify
     ↓
 RedrivePermit
     ↓
-second human approval
+human approval
     ↓
-one redelivery
+one GitHub redelivery
 ```
 
-The two permits exist because the two actions carry different risks.
+If the outcome of deployment or redelivery becomes ambiguous, Redrive does not issue an automatic retry.
 
----
-
-## When the result is ambiguous, Redrive stops
-
-Our final external redelivery test did not end in a neat success screen. The single permitted GitHub redelivery returned:
-
-```text
-HTTP 504
-```
-
-That is ambiguous. Redrive did not reinterpret it as success, and it did not issue another blind redelivery.
-
-We therefore do **not** claim that incident reached `RECOVERY_COMPLETE`.
-
-That is an important part of the product: when reality gets less certain, the automation becomes more conservative.
+Our final external redelivery validation returned `HTTP 504`. Redrive preserved the ambiguity and stopped, so we do not claim that incident reached `RECOVERY_COMPLETE`.
 
 ---
 
 ## Fidelity is explicit
 
-GitHub's delivery API does not guarantee the original raw request bytes, yet webhook signatures authenticate those bytes. Redrive does not pretend that a reconstructed sandbox request is an exact raw-wire replay.
+GitHub's delivery API does not guarantee the original raw webhook request bytes, while webhook signatures authenticate those bytes. Redrive does not describe a reconstructed sandbox request as an exact raw-wire replay.
 
-The recovery path records what kind of evidence it actually has:
+The recovery path records the fidelity of each input:
 
 ```text
 EXACT
@@ -376,7 +345,7 @@ DERIVED
 UNRESOLVED
 ```
 
-Example:
+For example:
 
 ```text
 Application revision       EXACT
@@ -392,126 +361,28 @@ If a causally required dependency remains `UNRESOLVED`, recovery stays blocked.
 
 ---
 
-## The cockpit is a proof surface
+## Qodo review changed the implementation
 
-Redrive's primary UI is an incident cockpit, not a chat transcript. It projects durable backend state:
+Qodo was used as a code review loop throughout the build. Its findings led to fixes around TrueForge session recovery, provenance consistency, GitHub control-plane authorization, sandbox artifact binding, stale recovery state, deployment TOCTOU, and the final UI investigation path.
 
-- provider observation;
-- receiver cardinality;
-- deterministic contradiction;
-- retry-safety state;
-- TrueForge provenance;
-- recovery stages;
-- repair verification;
-- deployment state;
-- DeployPermit and RedrivePermit;
-- redelivery and final verification state.
-
-The frontend does not invent a parallel workflow. It renders the state Redrive has actually persisted.
-
----
-
-## What we live-validated
-
-### Persistent TrueForge investigation
-
-A Redrive incident created a TrueForge session, persisted the binding, and reused the same remote session after a Redrive restart.
-
-### Dynamic investigators
-
-Persisted TrueForge events showed the real provider chain:
-
-```text
-Coordinator
-    ↓
-create_sub_agent
-    ↓
-provider-investigator
-    ↓
-redrive-github MCP
-    ↓
-get_webhook_delivery
-    ↓
-tool.response
-```
-
-The receiver side followed the same pattern through its independent MCP boundary.
-
-### Outbound receiver connector
-
-The connector was exercised through enrollment, durable connector identity, health, typed business-state jobs and restart. Restarting without the one-time enrollment token reused the same enrolled identity.
-
-### Contradiction
-
-```text
-GitHub HTTP 500
-+
-Receiver mutationCount = 1 / EXACTLY_ONE
-=
-PROVIDER_FAILED_RECEIVER_MUTATED
-→ BLOCKED
-```
-
-### Recovery
-
-```text
-exact failing revision
-→ 0 → HTTP 500 → 1
-→ generate repair
-→ 1 → HTTP 201 → 1
-→ REPAIR_VERIFIED
-```
-
----
-
-## Qodo changed the implementation
-
-Qodo was used as a real review loop rather than a submission checkbox. It surfaced correctness and safety issues around persistent TrueForge session recovery, evidence/provenance consistency, GitHub control-plane authorization, sandbox artifact provenance, stale recovery state and deployment time-of-check/time-of-use behavior.
-
-The loop was straightforward:
-
-```text
-implementation
-    ↓
-Qodo review
-    ↓
-accepted finding
-    ↓
-targeted fix
-    ↓
-regression test
-    ↓
-follow-up review
-```
+PR #10 is a good example. Qodo found that the new `Investigate failure` action could create duplicate TrueForge turns after a lost response or concurrent retry. The fix added durable investigation serialization, stage markers, turn reconciliation, restart recovery, and regression coverage before the PR was merged.
 
 Useful review trails:
 
 - [PR #3: persistent TrueForge provider investigation spine](https://github.com/Redrive-Labs/Redrive/pull/3)
 - [PR #4: production GitHub App and provider investigation](https://github.com/Redrive-Labs/Redrive/pull/4)
 - [PR #7: proof-gated recovery loop](https://github.com/Redrive-Labs/Redrive/pull/7)
-
-PR #7 was especially useful: review findings materially hardened sandbox artifact provenance, stale candidate binding and deployment TOCTOU behavior.
-
----
-
-## Deliberately narrow
-
-For this build we chose one provider, one failure class and one hard invariant:
-
-```text
-Provider:      GitHub
-Failure class: ambiguous webhook failure
-Invariant:     do not duplicate the business mutation
-Loop:          investigate → reproduce → repair → verify → authorize → recover
-```
-
-A broader agent could demo more categories. Redrive goes deeper on one consequential workflow where "probably safe" is not enough.
+- [PR #10: product-native incident investigation flow](https://github.com/Redrive-Labs/Redrive/pull/10)
 
 ---
 
-# Run it
+# Run the complete flow
 
-The quickest reproducible path uses separate local ports for the two applications:
+This path exercises setup, real GitHub delivery evidence, Receiver evidence, TrueForge investigation, Daytona recovery, deployment approval, deployment, redelivery approval, and one GitHub redelivery.
+
+Use a fork of the demo receiver. Do not point this walkthrough at a production application.
+
+The examples use:
 
 ```text
 Redrive control plane   http://127.0.0.1:3001
@@ -524,13 +395,15 @@ Demo PostgreSQL         127.0.0.1:5434
 
 - Node.js 22+
 - npm
-- git, curl and OpenSSL
-- Docker Engine + Docker Compose for the demo receiver
-- TrueForge with one configured model provider
-- a public HTTPS URL for Redrive when creating the GitHub App
-- a public HTTPS URL for the demo receiver so GitHub can deliver the webhook
+- git, curl, and OpenSSL
+- Docker Engine and Docker Compose
+- TrueForge
+- a configured TrueForge model provider
+- a configured Daytona sandbox provider in TrueForge
+- a GitHub account that can create and install a GitHub App on the demo receiver fork
+- public HTTPS endpoints for Redrive and the demo receiver
 
-Daytona is only required for the sandbox repair stage. The full provider + receiver contradiction can be reproduced without starting recovery.
+TrueForge currently uses Daytona as its sandbox provider. Configure the model and Daytona in TrueForge before starting the recovery flow.
 
 ---
 
@@ -540,13 +413,60 @@ Daytona is only required for the sandbox repair stage. The full provider + recei
 npx @truefoundry/trueforge@latest --port 8790
 ```
 
-Open TrueForge and configure one model provider. Note the exact model resource name you want Redrive to use.
+Open TrueForge. Configure the model resource Redrive should use and configure the Daytona sandbox provider. Keep TrueForge running and note the exact model resource name.
 
 ---
 
-## 2. Clone Redrive
+## 2. Fork and clone the demo receiver
+
+Fork:
+
+https://github.com/Redrive-Labs/redrive-demo-receiver
+
+Then clone your fork:
 
 ```bash
+cd ~
+git clone https://github.com/<your-user>/redrive-demo-receiver.git
+cd redrive-demo-receiver
+```
+
+The walkthrough uses this local clone as both the intentionally broken receiver and the deployment target after Redrive verifies a repair.
+
+---
+
+## 3. Start the broken receiver
+
+Choose a webhook secret and keep it for the GitHub webhook configuration:
+
+```bash
+export WEBHOOK_SECRET="$(openssl rand -hex 32)"
+docker compose up --build
+```
+
+The stack starts the receiver on `127.0.0.1:3000` and PostgreSQL on `127.0.0.1:5434`.
+
+Expose port `3000` over public HTTPS. With Tailscale Funnel, for example:
+
+```bash
+sudo tailscale funnel --https=8443 --bg 3000
+sudo tailscale funnel status
+```
+
+GitHub must be able to reach:
+
+```text
+https://<receiver-public-host>/webhooks/github
+```
+
+---
+
+## 4. Clone and configure Redrive
+
+In another terminal:
+
+```bash
+cd ~
 git clone https://github.com/Redrive-Labs/Redrive.git
 cd Redrive
 npm ci
@@ -559,7 +479,7 @@ Create an operator token:
 openssl rand -hex 32
 ```
 
-Put the token, your public Redrive URL and your TrueForge model in `.env.local`:
+Put the base configuration in `.env.local`:
 
 ```env
 REDRIVE_DATABASE_PATH=.local/redrive.sqlite
@@ -567,27 +487,25 @@ REDRIVE_OPERATOR_TOKEN=<64-hex-character-token>
 REDRIVE_PUBLIC_URL=https://<your-public-redrive-host>
 REDRIVE_TRUEFORGE_URL=http://127.0.0.1:8790
 REDRIVE_TRUEFORGE_MODEL=<your-trueforge-model-resource>
+REDRIVE_DEMO_RECEIVER_REPO_PATH=/absolute/path/to/your/redrive-demo-receiver
 ```
 
-`REDRIVE_PUBLIC_URL` and the MCP URL solve different problems:
+`REDRIVE_DEMO_RECEIVER_REPO_PATH` must be the absolute path to the local demo receiver fork from step 2. Redrive checks that this path is the Git repository root, that its `HEAD` matches the failing revision, and that the worktree is clean before applying a verified patch.
 
-- `REDRIVE_PUBLIC_URL` must be public HTTPS for the GitHub App flow.
-- TrueForge can talk to Redrive locally through `http://127.0.0.1:3001` when both run on the same machine.
-
-Any public HTTPS tunnel works. For example, with Tailscale Funnel:
+Expose Redrive on public HTTPS as well. With Tailscale Funnel:
 
 ```bash
 sudo tailscale funnel --bg 3001
 sudo tailscale funnel status
 ```
 
-Use the HTTPS hostname reported by Funnel as `REDRIVE_PUBLIC_URL`. Tailscale documents Funnel as a public HTTPS reverse proxy for a local port.
+Use the reported HTTPS origin as `REDRIVE_PUBLIC_URL`.
 
 ---
 
-## 3. Bootstrap the TrueForge resources
+## 5. Bootstrap Redrive's TrueForge resources
 
-Redrive includes a helper that registers the two MCP resources, registers the two git-backed investigation Skills, pins the Skills to the current Redrive commit, generates distinct MCP credentials when needed, and updates `.env.local` without printing the secrets.
+From the Redrive repository:
 
 ```bash
 export REDRIVE_TRUEFORGE_MODEL=<your-trueforge-model-resource>
@@ -595,7 +513,7 @@ export REDRIVE_MCP_BASE_URL=http://127.0.0.1:3001
 bash scripts/setup-trueforge.sh
 ```
 
-It creates or updates:
+The helper registers:
 
 ```text
 MCP:   redrive-github
@@ -604,19 +522,21 @@ Skill: redrive-connection-provider-investigation
 Skill: redrive-connection-receiver-investigation
 ```
 
-Now start Redrive with the env that contains those generated credentials:
+It also writes distinct MCP credentials into `.env.local` without printing them.
+
+Start Redrive after the helper has written those credentials:
 
 ```bash
 npm run dev -- --port 3001
 ```
 
-In another terminal, verify that TrueForge can actually enumerate the expected MCP tools:
+In another terminal, verify the MCP resources:
 
 ```bash
 bash scripts/setup-trueforge.sh --verify
 ```
 
-Expected result:
+Expected tools:
 
 ```text
 redrive-github
@@ -627,69 +547,11 @@ redrive-receiver
   get_receiver_health
 ```
 
-If Redrive was already running before the bootstrap wrote `.env.local`, restart it before running `--verify`.
-
 ---
 
-# Reproduce the real ambiguous failure
+## 6. Add the GitHub webhook to your receiver fork
 
-Use the intentionally broken demo receiver so you do not need to touch an existing application.
-
-## 4. Fork the demo receiver
-
-Fork:
-
-**https://github.com/Redrive-Labs/redrive-demo-receiver**
-
-Then clone **your fork**:
-
-```bash
-git clone https://github.com/<your-user>/redrive-demo-receiver.git
-cd redrive-demo-receiver
-```
-
-A fork matters here because you need permission to install a GitHub App and create a repository webhook.
-
----
-
-## 5. Start the broken receiver
-
-Choose a webhook secret and keep it for the GitHub webhook configuration:
-
-```bash
-export WEBHOOK_SECRET="$(openssl rand -hex 32)"
-docker compose up --build
-```
-
-The stack starts:
-
-```text
-receiver      http://127.0.0.1:3000
-PostgreSQL    127.0.0.1:5434
-```
-
-The receiver intentionally persists the business event and then fails its downstream operation, producing the ambiguous `500 after mutation` shape.
-
-Expose port `3000` over public HTTPS. If Redrive and the receiver are on the same Tailscale node, one simple option is to expose the receiver on Funnel's alternate HTTPS port:
-
-```bash
-sudo tailscale funnel --https=8443 --bg 3000
-sudo tailscale funnel status
-```
-
-That gives the receiver a URL similar to:
-
-```text
-https://<your-funnel-host>:8443
-```
-
-You can use another tunnel provider instead; the only requirement is that GitHub can reach `/webhooks/github` over HTTPS.
-
----
-
-## 6. Add the repository webhook
-
-In **your fork** open:
+In the fork, open:
 
 ```text
 Settings → Webhooks → Add webhook
@@ -700,35 +562,37 @@ Use:
 ```text
 Payload URL:  https://<receiver-public-host>/webhooks/github
 Content type: application/json
-Secret:       the same WEBHOOK_SECRET from step 5
+Secret:       the same WEBHOOK_SECRET from step 3
 Events:       Push events
 Active:       enabled
 ```
 
-Redrive protects an **existing** repository webhook. It does not create this receiver webhook for you.
+Redrive protects an existing repository webhook. It does not create the receiver webhook itself.
 
 ---
 
-## 7. Create the Redrive GitHub App
+## 7. Create the GitHub App from Redrive
 
-Open Redrive at your public URL, log in with `REDRIVE_OPERATOR_TOKEN`, then open the setup section.
+Open Redrive at `REDRIVE_PUBLIC_URL` and log in with `REDRIVE_OPERATOR_TOKEN`.
 
-1. Click **Create GitHub App**.
-2. Continue through the branded GitHub handoff.
+In the setup section:
+
+1. Click `Create GitHub App`.
+2. Continue through the GitHub handoff.
 3. Create the app on your account or organization.
-4. Install it only on your demo-receiver fork.
-5. Back in Redrive, choose the fork and the webhook you created above.
-6. Save the connection.
+4. Install it only on the demo receiver fork.
+5. Back in Redrive, choose the fork and the webhook from step 6.
+6. Click `Save connection`.
 
-Redrive now has a durable GitHub `ApplicationConnection` bound to the installation, repository and webhook.
+Redrive now has a durable ApplicationConnection bound to the GitHub App installation, repository, and existing webhook.
 
 ---
 
-## 8. Enroll the outbound Receiver Connector
+## 8. Enroll the Receiver Connector
 
-When the GitHub connection is saved, Redrive issues a one-time receiver enrollment token. Copy it while it is visible.
+After the connection is saved, Redrive shows a one-time enrollment token and the connector command directly in the UI.
 
-From the **Redrive repository**:
+From the Redrive repository, run the same command shown there:
 
 ```bash
 cd receiver-connector
@@ -743,7 +607,7 @@ export REDRIVE_CONNECTOR_STATE_DIR="$PWD/.local/state"
 npm run receiver-connector
 ```
 
-Keep the connector running. Redrive should move through receiver verification to:
+Keep the connector running. Redrive should reach:
 
 ```text
 GitHub      READY
@@ -751,58 +615,62 @@ Receiver    READY
 Application RECOVERY READY
 ```
 
-The enrollment token is one-time. The connector persists its durable identity in `REDRIVE_CONNECTOR_STATE_DIR`, so later restarts do not need the original token.
+The enrollment token is one-time. The connector persists its identity under `REDRIVE_CONNECTOR_STATE_DIR`, so later restarts do not need the original token.
 
 ---
 
-## 9. Trigger the failed delivery
+## 9. Trigger the ambiguous failure
 
-Push any small commit to your receiver fork:
+In the demo receiver fork:
 
 ```bash
 git commit --allow-empty -m "test: trigger webhook"
 git push
 ```
 
-GitHub sends the push webhook to the intentionally broken receiver. The receiver writes one business row and then returns `500` after the downstream failure.
+GitHub sends the push webhook to the broken receiver. The receiver persists one business row and then returns `500` after the downstream failure.
+
+Leave the local receiver repository at this exact pushed `HEAD` and keep its worktree clean. Redrive later verifies that identity before deployment.
 
 ---
 
-## 10. Capture and investigate it
+## 10. Investigate the failed delivery in Redrive
 
-Back in the Redrive repository:
+Return to the Redrive UI.
 
-```bash
-bash scripts/capture-failed-delivery.sh --investigate
-```
+When the ApplicationConnection is `RECOVERY READY`, the `Failed deliveries` section loads GitHub's failed deliveries for that bound webhook.
 
-If there is exactly one configured GitHub connection and one failed delivery, the helper selects them automatically. If there are several, it prints the available IDs and asks you to rerun with `REDRIVE_CONNECTION_ID` or `REDRIVE_DELIVERY_ID`.
+1. Find the `HTTP 500` delivery you just triggered.
+2. Click `Investigate delivery`.
+3. Redrive creates or reopens the connection-bound incident and opens its cockpit.
+4. Click `Investigate failure`.
+5. Wait for the TrueForge Provider and Receiver investigation to finish.
 
-The script logs in to Redrive without printing the operator token, creates the connection-bound incident, and then runs the **read-only** Provider + Receiver investigation through TrueForge.
-
-It never starts sandbox recovery, deploys, approves, or redelivers anything.
-
-The result should resolve to the same contradiction used in the demo:
+The cockpit should then show the persisted evidence and deterministic assessment:
 
 ```text
-providerStatusCode:    500
-receiverMutationCount: 1
-receiverBusinessState: EXACTLY_ONE
-contradiction:          PROVIDER_FAILED_RECEIVER_MUTATED
-recoveryState:          BLOCKED
+Provider                 HTTP 500
+Receiver mutation count  1
+Receiver business state  EXACTLY_ONE
+Contradiction             PROVIDER_FAILED_RECEIVER_MUTATED
+Retry                     UNSAFE / BLOCKED
 ```
 
-Open the incident in the Redrive cockpit to inspect the provider evidence, receiver cardinality, TrueForge provenance and recovery spine.
+The investigation action is durable. Retrying or refreshing does not intentionally create a second Provider and Receiver turn chain for the same completed investigation.
 
 ---
 
-## Optional: run sandbox repair
+## 11. Run sandbox recovery
 
-The investigation path above is enough to prove Redrive's core safety decision.
+In the same incident cockpit, click:
 
-To reproduce the repair stage as well, configure TrueForge with a working Daytona sandbox and use the cockpit's sandbox recovery action for the blocked incident. The recovery agent is constrained to the exact repository, revision and delivery identity and has no provider, receiver, deployment, redelivery or approval tools.
+```text
+Start sandbox recovery
+```
 
-The expected verified shape is:
+Redrive creates the separate TrueForge recovery session with Daytona enabled. The recovery agent checks out the exact failing repository revision, reproduces the failure, diagnoses the bug, produces a candidate patch, and verifies the same logical delivery against the already-mutated sandbox state.
+
+The expected proof shape is:
 
 ```text
 reproduction: 0 → HTTP 500 → 1
@@ -810,13 +678,41 @@ verification: 1 → HTTP 2xx → 1
 state:        REPAIR_VERIFIED
 ```
 
-Deployment and GitHub redelivery remain separate, human-gated actions after that point.
+Do not move to deployment unless the cockpit reaches `REPAIR_VERIFIED` and shows the patch provenance.
+
+---
+
+## 12. Approve and execute deployment
+
+Once the repair is verified, the Deploy Permit panel becomes eligible.
+
+1. Review the candidate fingerprint and patch digest.
+2. Click `Review & approve deployment`.
+3. Click `Execute approved deployment`.
+
+Redrive checks that `REDRIVE_DEMO_RECEIVER_REPO_PATH` points to the clean local repository at the exact failing revision before it applies the verified patch. It then verifies the receiver after deployment.
+
+Continue only when the cockpit reports the deployment as verified.
+
+---
+
+## 13. Approve one GitHub redelivery
+
+After deployment verification, the Redrive Permit panel becomes eligible.
+
+1. Review the original delivery identity, verified deployment, receiver count, and fingerprint.
+2. Click `Approve exactly one GitHub redelivery`.
+3. Click `Execute one GitHub redelivery`.
+
+Redrive consumes the permit for one delivery attempt and performs an independent final observation afterward.
+
+If the result is ambiguous, the cockpit moves to `OUTCOME UNKNOWN` and automatic retry stays disabled. Do not manually repeat the action just to force a green result.
 
 ---
 
 ## Validation
 
-Core repository checks:
+Repository checks:
 
 ```bash
 npm run lint
@@ -825,7 +721,9 @@ npm run typecheck
 npm run build
 ```
 
-The recovery work has also been exercised with live GitHub delivery evidence, a real outbound receiver connector, persisted TrueForge sessions and turns, deterministic contradiction proof, and the Daytona repair flow described above.
+The final incident-investigation integration passed 592 tests, lint, typecheck, and `git diff --check` before merge. In the development VPS used for the project, the Next.js Turbopack production build remained blocked by an environment-specific helper-process port `EPERM` error.
+
+The recovery path has also been exercised with live GitHub delivery evidence, the outbound Receiver Connector, persisted TrueForge sessions and turns, deterministic contradiction proof, Daytona repair verification, human permits, deployment verification, and a single permitted GitHub redelivery.
 
 ---
 
@@ -849,8 +747,6 @@ The recovery work has also been exercised with live GitHub delivery evidence, a 
 
 ## Invariants
 
-These rules matter more than any individual prompt:
-
 ```text
 A provider failure does not prove receiver absence.
 
@@ -866,7 +762,7 @@ A verified repair is not permission to deploy.
 
 Permission to deploy is not permission to redeliver.
 
-An ambiguous consequential action must not be blindly repeated.
+An ambiguous external action must not be blindly repeated.
 ```
 
 The final recovery condition is stricter than transport success:
@@ -879,7 +775,7 @@ AND
 required downstream operation succeeds
 ```
 
-Until those facts can be established for the same logical delivery, Redrive should not claim recovery is complete.
+Until those facts can be established for the same logical delivery, Redrive does not claim recovery is complete.
 
 ---
 
